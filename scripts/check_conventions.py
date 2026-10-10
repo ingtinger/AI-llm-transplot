@@ -206,13 +206,20 @@ def main():
                     f"{locate(line)}: CROSSING: {caller}() calls "
                     f"{called}(); {cb} and {tb} teardown/IO are not interchangeable")
 
-    # 2. unprefixed methods reachable from only one backend
+    # 2. unprefixed methods reachable from only one backend. Transitively: once the
+    # lifecycle is shared, a backend reaches most shared methods through other shared
+    # ones, never by a direct call.
     reached_by = {name: set() for name in spans}
-    for caller, calls in callees.items():
-        cb = backend_reach(caller)
-        for called, _ in calls:
-            if cb:
-                reached_by[called].add(cb)
+    for side in ("ep", "ur"):
+        todo = [n for n in spans if backend_reach(n) == side]
+        seen = set(todo)
+        while todo:
+            for called, _ in callees[todo.pop()]:
+                if called in seen or backend_reach(called):
+                    continue
+                seen.add(called)
+                reached_by[called].add(side)
+                todo.append(called)
     for name, (decl_line, _, _) in sorted(spans.items()):
         if backend_reach(name) or name in UNPREFIXED_ALLOWED:
             continue
@@ -338,7 +345,7 @@ def main():
     # Constant backend prefixes, the same claim the ep_/ur_ method prefixes make:
     # kEp* is epoll's, kUr* is io_uring's, bare means shared. Worth enforcing because
     # the two backends bound memory by different means (epoll pauses reads, io_uring
-    # drops past kUrStreamBufCap), so a constant read as shared invites a fix on the
+    # drops past kStreamBufCap), so a constant read as shared invites a fix on the
     # wrong side, which is this codebase's most likely defect.
     #
     # Only contradictions are reported: a prefixed constant used from the other

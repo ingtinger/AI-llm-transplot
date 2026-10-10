@@ -230,13 +230,6 @@ namespace llmbridge
         void ep_on_upstream_writable(Connection* c) noexcept;
         void ep_on_upstream_readable(Connection* c) noexcept;
 
-        void ep_finish_client(Connection* c) noexcept;
-
-        // Streaming pump, epoll.
-        void ep_pause_read(Connection* c) noexcept;   // drop EPOLLIN (backpressure)
-        void ep_resume_read(Connection* c) noexcept;  // restore EPOLLIN
-        void ep_stream_pump(Connection* u) noexcept;      // decode+translate new upstream body bytes
-        void ep_stream_flush(Connection* client) noexcept;      // write buffered SSE, apply backpressure
 
         // The shared lifecycle, run on either backend through `_ops`. GATEWAY-INTERNALS.md 3d.
         class EpollIo;
@@ -255,7 +248,23 @@ namespace llmbridge
         void gate_client_reads(Connection* c) noexcept; // the pipelining cap pauses, never closes
         void client_gone(Connection* c) noexcept;       // EOF or a socket error on a client
         void send_continue(Connection* c) noexcept;     // the interim 100, staged like any reply
+        void finish(Connection* client) noexcept; // a staged reply is on the wire
+        /// New bytes in an upstream's rbuf: the response, framed once, or stream body.
+        void on_upstream_bytes(Connection* u) noexcept;
+        void on_response(Connection* u, const net::http::ResponseHead& h, std::string_view body,
+                         size_t total_len) noexcept; // a whole response: relay or translate
+        enum class UpFail : uint8_t
+        {
+            Eof,
+            Tls,
+            Write,
+        };
+        /// The upstream failed before a response: retry, fail over, else a 502.
+        void upstream_lost(Connection* u, UpFail f) noexcept;
+        void on_upstream_eof(Connection* u, bool tls_failed) noexcept; // EOF or a read error
         void begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept; // enter streaming
+        void stream_pump(Connection* u) noexcept;         // translate new upstream body bytes
+        void stream_flush(Connection* client) noexcept;   // write them; pause, or cap, a slow client
         void stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
         void finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
         /// A new upstream to `slot`, not yet open.
@@ -429,13 +438,6 @@ namespace llmbridge
         void ur_on_send(Connection* c, int res) noexcept;
         void ur_on_connect(Connection* u, int res) noexcept;
         [[nodiscard]] bool ur_cancel_recv(Connection* c) noexcept; // ends its multishot recv
-        void ur_on_response(Connection* u, const net::http::ResponseHead& h,
-                           std::string_view body_buf, size_t total_len) noexcept;
-        void ur_finish_client(Connection* c) noexcept;
-        // Streaming pump, io_uring: serialized sends (one send SQE in flight) and a
-        // bounded buffer.
-        void ur_stream_pump(Connection* u) noexcept;
-        void ur_stream_flush(Connection* client) noexcept; // send pending bytes, or finalize
         void ur_close(Connection* c) noexcept;
         void ur_maybe_free(Connection* c) noexcept;
 

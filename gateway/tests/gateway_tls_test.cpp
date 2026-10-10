@@ -1661,7 +1661,7 @@ TEST_P(GatewayTls, TheFloodControlActuallyDelivers)
     ASSERT_TRUE(c.send(make_req(kStreamBody)));
 
     // Target 4 MiB, deliberately below the 8 MiB io_uring drop cap
-    // (kUrStreamBufCap).
+    // (kStreamBufCap).
     size_t total = 0;
     char tmp[65536];
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);

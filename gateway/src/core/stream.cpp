@@ -56,7 +56,8 @@ namespace llmbridge
     {
         Connection* client = u->peer;
         client->req.f.streaming = true;
-        client->req.f.stream_chunked = h.chunked;
+        client->req.f.stream_body = h.body; // it alone says where the body ends
+        client->req.f.stream_left = h.content_length;
         client->req.f.stream_keep_alive = h.keep_alive; // decides poolability at stream end
         stream_warn_if_encoded(client, h);
         // Only a request that needs translating gets a translator.
@@ -85,7 +86,58 @@ namespace llmbridge
         client->req.f.phase = Phase::Streaming;
 
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
-        _ops->stream_pump(*u);           // translate any initial body, flush the head
+        stream_pump(u);                  // translate any initial body, flush the head
+    }
+
+    // New body bytes in `u->rbuf`: translate or forward them into the client's buffer.
+    void Gateway::stream_pump(Connection* u) noexcept
+    {
+        Connection* client = u->peer;
+        if (!client) return _ops->close(*u);
+        const StreamStep st = stream_step(client, u->rbuf, client->out.stage(), /*at_eof=*/false);
+        // Truncate honestly: flush what was translated, with no fabricated [DONE].
+        if (st == StreamStep::Corrupt || st == StreamStep::Failed) stream_truncate(client);
+        else if (!_stream_backpressure && client->out.unsent() > kStreamBufCap)
+        {
+            // Without a pause, this cap is the only bound on a slow client's stream.
+            LB_WARN("CAP stream buffer exceeded, dropping the stream ", *client,
+                    " buffered=", client->out.unsent(), " limit=", static_cast<uint64_t>(kStreamBufCap),
+                    " (the client is slower than the provider)");
+            return abort_pair(client);
+        }
+        stream_flush(client);
+    }
+
+    // Write what the stream owes the client. Behind a slow client a backend that can
+    // pauses the upstream's reads (GATEWAY-INTERNALS.md 6c); a stream that ended and
+    // drained finalizes.
+    void Gateway::stream_flush(Connection* client) noexcept
+    {
+        const uint64_t sent = client->sent_bytes;
+        const Sent s = _ops->send(*client);
+        // A client draining a paused stream is progress, though the upstream is silent.
+        if (client->sent_bytes != sent) client->req.f.ts_progress = now_ns();
+        if (s == Sent::Failed) return abort_pair(client);
+        Connection* u = client->peer;
+        const bool pausable = _stream_backpressure && u && !u->doomed;
+        if (s == Sent::Queued)
+        {
+            if (pausable && !u->read_paused)
+            {
+                _ops->set_read(*u, false);
+                ++_stats.stream_pauses;
+                LB_WARN("CAP backpressure, pausing upstream reads ", *u,
+                        " (the client is slower than the provider)");
+            }
+            return;
+        }
+        client->out.clear();
+        if (client->req.f.stream_ended) return finalize_stream(client);
+        if (pausable && u->read_paused)
+        {
+            _ops->set_read(*u, true);
+            LB_WARN("CAP backpressure cleared, resuming upstream reads ", *u);
+        }
     }
 
     // The upstream closed: translate what remains, emit the terminal [DONE] if the
@@ -103,7 +155,7 @@ namespace llmbridge
         // Ended either way, so the upstream is done. Kept while its reads were paused,
         // the dead fd raised EPOLLHUP on every wait.
         _ops->close(*u);
-        _ops->stream_flush(*client);
+        stream_flush(client);
     }
 
     void Gateway::finalize_stream(Connection* client) noexcept

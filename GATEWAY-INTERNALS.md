@@ -170,8 +170,8 @@ written once and runs on both.
 A send that completes at once is a return value (`Sent::Done`), never a callback, so
 no handler runs re-entered. `IoCaps::stream_backpressure` says whether the backend
 pauses a stream's upstream for a slow client (epoll) or bounds it by its buffer cap
-(io_uring). The handlers each backend still writes itself (`finish`, `stream_pump`,
-`stream_flush`) are reached through the same interface until they are shared.
+(io_uring). Nothing else of the lifecycle is written per backend: each loop reads or
+learns of a completion and calls a shared handler.
 
 The request side is shared outright. Bytes a backend reads go to `on_client_bytes`:
 `try_frame` stamps t0, frames one request from `rbuf` and hands it to `dispatch`, and
@@ -201,7 +201,7 @@ Level-triggered epoll with optimistic writes. The loop owns the syscalls.
       |                                read() -> rbuf -> try_frame() -> dispatch()
       |
       +-- client fd writable ------> ep_on_client_writable()
-      |                                drain out, or ep_stream_flush()
+      |                                respond(), or stream_flush()
       |
       +-- upstream fd readable ----> ep_on_upstream_readable()
       |                                read() -> rbuf -> frame -> respond
@@ -221,7 +221,7 @@ only on `EAGAIN`, so the common case costs one syscall. Arming unconditionally
 would cost two `epoll_ctl` calls and an extra wakeup per request.
 
 **Back-pressure.** When a client cannot keep up mid-stream, epoll **pauses the
-upstream's `EPOLLIN`** (`ep_pause_read`), so the provider stops sending and the
+upstream's `EPOLLIN`** (`stream_flush` through `set_read`), so the provider stops sending and the
 kernel applies flow control for us. `read_paused` tracks it, and the
 `ep_` prefix is what keeps io_uring from touching it.
 
@@ -267,14 +267,14 @@ pinned.
 | **read** | by anyone deciding whether to submit now or let the completion do it |
 
 Callers must never pin. Two of them used to set the old flag, under different
-rules, and `ur_stream_flush()` setting it before calling into `ur_tls_flush()`,
+rules, and the io_uring stream flush setting it before calling into `ur_tls_flush()`,
 whose first line refuses to run when it is already set, meant the first SSE flush
 on a TLS connection did nothing and the stream hung forever, on io_uring only.
 
 ### Streaming output stages behind the pin
 
 New stream output goes to `stage()`, the back half while a send reads the front, and
-goes out with the next send. Past `kUrStreamBufCap` (8 MiB unsent) the stream is
+goes out with the next send. Past `kStreamBufCap` (8 MiB unsent) the stream is
 dropped.
 
 **This is the one place the two backends deliberately differ.** Under a slow
@@ -318,8 +318,9 @@ translate Anthropic events to OpenAI chunks, write to the client.
                         stream_step()            shared by both backends
                        decode chunk -> translate
                                 |
-             epoll:  -> c->out.stage() -> ep_stream_flush()
-             uring:  -> c->out.stage() -> ur_stream_flush() -> SEND (pins the front)
+                     -> c->out.stage() -> stream_flush() -> IoOps::send
+             epoll:  write now; Queued pauses the upstream
+             uring:  SEND (pins the front); past kStreamBufCap the stream is dropped
                                 |
                                 v
                           client sees chunks
@@ -370,9 +371,10 @@ on our side nobody can answer "did my stream complete?" afterwards.
 ### 6c. The one place the backends deliberately differ
 
 Under a slow client, **epoll** pauses upstream `EPOLLIN` and applies
-back-pressure. **io_uring** instead bounds the unsent `out` with `kUrStreamBufCap` and
-drops the stream past the cap. Know which you are reasoning about before quoting
-streaming behaviour to a customer.
+back-pressure. **io_uring** instead bounds the unsent `out` with `kStreamBufCap` and
+drops the stream past the cap. One branch decides, in `stream_pump` and
+`stream_flush`: `IoCaps::stream_backpressure`. Know which you are reasoning about
+before quoting streaming behaviour to a customer.
 
 Either way the idle deadline (`--upstream-timeout`) measures `ts_progress`, which both
 legs advance: a response byte read, a request byte sent, a byte the client took. A
@@ -381,9 +383,9 @@ stream reads nothing while its client catches up; neither is idle. When neither 
 moves and bytes are still owed to the client, the sweep logs `client stalled` and counts
 `client_idle_timeouts`, not `upstream_timeouts`.
 
-`read_paused` is epoll's half and is owned entirely by `ep_pause_read` /
-`ep_resume_read`, the only writers, both guarding on the current value. io_uring
-never touches it, and the `ep_` prefix is what keeps that true.
+`read_paused` is written only by a backend's `set_read`, which both guard on the
+current value. A stream pauses its upstream only where `stream_backpressure` holds;
+io_uring uses `set_read` only for the pipelining cap on a client (3d).
 
 ## 7. Connection lifetime, and why the two backends free differently
 
@@ -527,7 +529,7 @@ problem, so release does two different things for two different reasons:
         |   refuses                otherwise be read as the head of the NEXT
         |                          client's response: a cross-client desync
         |
-        +-- u->rdec.reset()        chunked-decode state from the last response
+        +-- u->framer.reset()      the cached head and chunked-decode state
         |
         +-- u->out.scrub()         CREDENTIAL. out held the rebuilt request
         |                          including the customer's API key

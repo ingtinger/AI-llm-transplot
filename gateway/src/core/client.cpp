@@ -250,19 +250,54 @@ namespace llmbridge
         {
             case Sent::Done: c->req.f.ts_up_sent = now_ns(); return;
             case Sent::Queued: return;
-            case Sent::Failed:
-                if (!retry_upstream(u) && !upstream_failed(c, 502, "upstream write failed"))
-                    error_respond(c, 502, "upstream write failed, retry exhausted");
-                return;
+            case Sent::Failed: return upstream_lost(u, UpFail::Write);
         }
+    }
+
+    // The staged reply is on the wire: account for it and take the next request.
+    void Gateway::finish(Connection* c) noexcept
+    {
+        // Only a staged reply finishes. A drained interim 100 Continue, or a write event
+        // with nothing owed, is no request: counting one wiped the real one's state.
+        if (c->req.f.phase != Phase::Replying) return;
+        // An error reply is counted in errors; its stamps are unset, so not in a histogram.
+        if (!c->close_after_resp)
+        {
+            const int64_t ts_resp_sent = now_ns(); // t6
+            if (ts_resp_sent - _t_start >= _warmup_ns)
+            {
+                // The split the timing headers use, so the two cannot disagree; t5 does
+                // not enter it, so t4 stands in.
+                const TimingSplit sp = timing_split(c->req.f.ts_req_recvd, c->req.f.ts_req_built,
+                                                    c->req.f.ts_wire_ready, c->req.f.ts_up_sent,
+                                                    c->req.f.ts_up_recvd, c->req.f.ts_up_recvd);
+                const int64_t resp_ns = ts_resp_sent - c->req.f.ts_up_recvd;
+                if (sp.req_path_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(sp.req_path_ns));
+                if (sp.connect_ns >= 0) _stats.connect.record(static_cast<uint64_t>(sp.connect_ns));
+                if (resp_ns >= 0) _stats.resp_path.record(static_cast<uint64_t>(resp_ns));
+                if (sp.req_path_ns >= 0 && resp_ns >= 0)
+                    _stats.overhead.record(static_cast<uint64_t>(sp.req_path_ns + resp_ns));
+                ++_stats.requests;
+            }
+        }
+        if (_sink) sink_emit(c, status_of(c->out.bytes()), /*streamed=*/false);
+        LB_DEBUG(ReqId{c->req.f.req_seq}, " status=", status_of(c->out.bytes()),
+                 " bytes=", c->out.bytes().size(), " tokens_in=", c->req.f.tok.in,
+                 " tokens_out=", c->req.f.tok.out, " keep_alive=", c->msg.keep_alive, " on ", *c);
+        c->out.clear();
+        c->req.f.phase = Phase::Idle;
+        const bool close_now = c->close_after_resp || !c->msg.keep_alive;
+        c->msg = net::http::Message{};
+        if (close_now) return _ops->close(*c);
+        on_client_bytes(c); // a pipelined next request is framed from rbuf, with no read
     }
 
     void Gateway::respond(Connection* client) noexcept
     {
         switch (_ops->send(*client))
         {
-            case Sent::Done: _ops->finish(*client); return;
-            case Sent::Failed: abort_pair(client); return;
+            case Sent::Done: finish(client); return;
+            case Sent::Failed: client_gone(client); return;
             case Sent::Queued: return; // the completion finishes it
         }
     }

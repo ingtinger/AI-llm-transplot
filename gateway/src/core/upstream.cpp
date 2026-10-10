@@ -5,8 +5,8 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// What a venue said about a response (limits, its own id, its name for a failure),
-// and where a request goes after its venue failed. Shared by both backends.
+// The upstream leg on both backends: opening, pooling and retrying a connection, the
+// response and what a venue said in it, and where a request goes after a failure.
 
 #include "gateway/gateway.hpp"
 
@@ -14,7 +14,10 @@
 #include "core/limits.hpp"
 #include "core/registry.hpp"
 #include "net/socket_util.hpp" // tcp_rtt
+#include "request.hpp"
+#include "response.hpp"
 #include "scan.hpp"
+#include "stream.hpp"
 
 #include <cstring>
 #include <string_view>
@@ -90,10 +93,16 @@ namespace llmbridge
 
     Connection* Gateway::new_upstream(int slot) noexcept
     {
+        // The venue's address now, never a cached one: the ip may have rotated. One
+        // that does not parse fails the acquire, on both backends.
+        const Upstream& up = _upstreams[static_cast<size_t>(slot)];
+        sockaddr_in addr{};
+        if (!net::resolve_ipv4(up.ip.c_str(), up.port, addr)) return nullptr;
         Connection* u = new Connection();
         u->is_client = false;
         u->upstream_slot = slot;   // the pool, the venue and the TLS name all index this
         u->ts_accepted = now_ns(); // the connect deadline counts from here
+        u->up_addr = addr;
         u->rbuf.reserve(kInitialBuf);
         return u;
     }
@@ -112,6 +121,7 @@ namespace llmbridge
             return u;
         }
         Connection* u = new_upstream(slot);
+        if (!u) return nullptr;
         adopt_warm(u);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (upstream_of(u).tls && !tls_attach_upstream(u))
@@ -144,6 +154,7 @@ namespace llmbridge
         // The same venue: a retry that lands elsewhere is a silent reroute, and the
         // request was translated for this dialect and carries its credential.
         Connection* uf = new_upstream(u->upstream_slot);
+        if (!uf) return false;
         uf->retried = true; // this request's one allowed retry is now spent
 #ifdef LLMBRIDGE_HAVE_TLS
         if (upstream_of(uf).tls && !tls_attach_upstream(uf))
@@ -181,6 +192,132 @@ namespace llmbridge
         // A slow client may have paused this upstream's reads, and a pooled connection
         // must be readable or the next response is never seen. The pool's only door.
         if (_stream_backpressure) _ops->set_read(*u, true);
+    }
+
+    // One decision and one log text per cause, on both backends.
+    void Gateway::upstream_lost(Connection* u, UpFail f) noexcept
+    {
+        static constexpr const char* kWhy[] = {"upstream EOF", "upstream TLS failed", "upstream write failed"};
+        static constexpr const char* kExhausted[] = {"upstream EOF, retry exhausted",
+                                                     "upstream TLS failed, retry exhausted",
+                                                     "upstream write failed, retry exhausted"};
+        const auto i = static_cast<size_t>(f);
+        Connection* client = u->peer;
+        if (!client) return _ops->close(*u); // an idle pooled connection the venue dropped
+        if (retry_upstream(u)) return;
+        if (!upstream_failed(client, 502, kWhy[i])) error_respond(client, 502, kExhausted[i]);
+    }
+
+    void Gateway::on_upstream_eof(Connection* u, bool tls_failed) noexcept
+    {
+        u->peer_eof = true; // never pooled now, whatever finishes the exchange
+        Connection* client = u->peer;
+        if (client && client->req.f.streaming)
+        {
+            // Only a real EOF may end a close-delimited stream: a corrupt one that ends
+            // in a well-formed [DONE] would hide the corruption from the client.
+            if (tls_failed) return abort_pair(client);
+            return stream_on_upstream_eof(u);
+        }
+        upstream_lost(u, tls_failed ? UpFail::Tls : UpFail::Eof);
+    }
+
+    // New bytes in `u->rbuf`. The head is parsed once, by the framer; its Body kind
+    // frames the rest, streamed or whole.
+    void Gateway::on_upstream_bytes(Connection* u) noexcept
+    {
+        Connection* client = u->peer;
+        // Stray bytes on an idle pooled upstream are the tail of an exchange that is
+        // over; kept, they would be the next client's response.
+        if (!client) return _ops->close(*u);
+        client->req.f.ts_progress = now_ns();
+        if (client->req.f.streaming) return stream_pump(u);
+
+        const int64_t t4 = now_ns(); // before the parse, so it counts in the response path
+        const net::http::FrameStatus hs = u->framer.head(u->rbuf, sent_head(*client));
+        if (hs == net::http::FrameStatus::NeedMore) return;
+        if (hs == net::http::FrameStatus::Error) return error_respond(client, 502, "upstream response head framing");
+        const net::http::ResponseHead& h = u->framer.h();
+        // Only a 200 is a real stream; a provider error is relayed with its own status.
+        // Gemini and Cohere do not stream here: their translators do not exist.
+        const UpstreamDialect d = client->req.f.effective_dialect;
+        if (h.event_stream && h.status == 200 && h.body != net::http::Body::None &&
+            (!client->req.f.translate_body || d == UpstreamDialect::Anthropic || d == UpstreamDialect::Azure))
+        {
+            // t4 for a stream is the head, not the first token: LATENCY.md 3.
+            client->req.f.ts_up_recvd = now_ns();
+            note_quota(client, h);
+            note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
+            return begin_stream(u, h);
+        }
+
+        const net::http::ParsedResponse r = u->framer.message(u->rbuf);
+        if (r.failed()) return error_respond(client, 502, "upstream response framing");
+        if (!r.complete()) return;
+        client->req.f.ts_up_recvd = t4;
+        note_quota(client, h);
+        note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
+        note_upstream_error(client, h, r.body);
+        note_served_tier(client, r.body, /*tail=*/true);
+        note_served_model(client, r.body, /*streamed=*/false);
+        on_response(u, h, r.body, r.total_len);
+    }
+
+    void Gateway::on_response(Connection* u, const net::http::ResponseHead& h,
+                              std::string_view body, size_t total_len) noexcept
+    {
+        Connection* client = u->peer;
+        // Pooled only if it stays open: the response says keep-alive and, for a
+        // byte-forward that relayed the client's Connection header, the client did too.
+        const bool keep_alive = h.keep_alive && (client->req.f.translate_body || client->msg.keep_alive);
+        if (client->req.f.translate_body && h.status != 0 && h.status != 200)
+        {
+            // A provider failure keeps its status and message: a 429 or 529 translated
+            // as a completion would fail and reach the client as a generic 502.
+            append_http_status(client->out.stage(), h.status, reason_for(h.status),
+                               provider::upstream_error_to_openai(body, "upstream_error"));
+            ++_stats.errors;
+        }
+        else if (client->req.f.translate_body)
+        {
+            if (!xlate_resp(client->req.f.effective_dialect, body, client->xlate_scratch, client->req.f.tok))
+            {
+                unpair(u);
+                u->rbuf.erase(0, total_len); // framing was valid; the connection is reusable
+                release_upstream(u, h.keep_alive, true);
+                return error_respond(client, 502, "response translate");
+            }
+            std::string timing;
+            if (_timing_headers)
+            {
+                const int64_t ts_resp_built = now_ns(); // t5: built here, written next
+                const TimingSplit sp = timing_split(
+                    client->req.f.ts_req_recvd, client->req.f.ts_req_built, client->req.f.ts_wire_ready,
+                    client->req.f.ts_up_sent, client->req.f.ts_up_recvd, ts_resp_built);
+                append_timing_headers(timing, client->req.f.ts_req_recvd, sp.compute_ns / 1000,
+                                      sp.connect_ns / 1000, sp.upwrite_ns / 1000,
+                                      sp.upstream_ns / 1000, "x-llmbridge-upstream-us",
+                                      client->req.f.req_seq, client->req.f.client_upload_ns / 1000);
+                append_usage_headers(timing, client->req.f.tok);
+            }
+            append_http(client->out.stage(), "HTTP/1.1 200 OK", client->xlate_scratch, timing);
+        }
+        else
+        {
+            // A decoded chunked body is re-framed with Content-Length, keeping the
+            // upstream's own status; anything else is relayed verbatim.
+            if (h.body == net::http::Body::Chunked)
+                append_http_status(client->out.stage(), h.status ? h.status : 200,
+                                   reason_for(h.status ? h.status : 200), body);
+            else client->out.stage().append(u->rbuf.data(), total_len);
+            client->req.f.tok = scan_usage(body); // a byte-forward reports its counts too
+        }
+        client->req.f.phase = Phase::Replying;
+        unpair(u);
+        // Anything past the message is a second response, and keeps it out of the pool.
+        u->rbuf.erase(0, total_len);
+        release_upstream(u, keep_alive, true);
+        respond(client);
     }
 
     bool Gateway::upstream_failed(Connection* client, int status, const char* why) noexcept
