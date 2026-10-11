@@ -95,8 +95,9 @@ namespace llmbridge
         bool from_pool = false;
         bool retried = false;
 
-        /// Epoll back-pressure, written only by ep_pause/resume_read. GATEWAY-INTERNALS.md 6c.
+        /// Reads paused, written only by a backend's set_read. GATEWAY-INTERNALS.md 6c.
         bool read_paused = false;
+        bool recv_armed = false; ///< io_uring: a multishot recv is live on this fd
 
         /// The SSE translator, reset per stream; by value, so a stream allocates none.
         provider::AnthropicToOpenAiSse sse_xlate;

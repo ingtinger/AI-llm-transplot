@@ -10,6 +10,7 @@
 
 #include "core/conn.hpp"
 #include "core/io.hpp"
+#include "core/limits.hpp"
 #include "core/pool.hpp"
 #include "core/registry.hpp"
 #include "gateway/gateway.hpp"
@@ -89,6 +90,8 @@ namespace llmbridge
         void upstream_eof(Connection* u) { g.stream_on_upstream_eof(u); }
         void finalize(Connection* c) { g.finalize_stream(c); }
         void abort_pair(Connection* c) { g.abort_pair(c); }
+        void bytes(Connection* c) { g.on_client_bytes(c); }
+        void gone(Connection* c) { g.client_gone(c); }
         const Stats& stats() const { return g.stats(); }
         size_t pooled() const { return g.pooled_upstream_count(); }
     };
@@ -136,8 +139,6 @@ namespace
             calls.push_back(c.is_client ? "close client" : "close upstream");
             _t.forget(c);
         }
-        void forward(Connection&) noexcept override { calls.push_back("forward"); }
-        void reframe(Connection&) noexcept override { calls.push_back("reframe"); }
         void finish(Connection&) noexcept override { calls.push_back("finish"); }
         void stream_pump(Connection&) noexcept override { calls.push_back("stream_pump"); }
         void stream_flush(Connection&) noexcept override { calls.push_back("stream_flush"); }
@@ -311,12 +312,16 @@ namespace
         Connection* c = t.client();
         Connection* u = t.upstream();
         t.dispatch(c, u);
-        c->req.saved = "POST / HTTP/1.1\r\n\r\n";
+        c->req.saved = "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+        ASSERT_EQ(llmbridge::net::http::parse_request(c->req.saved, c->msg),
+                  llmbridge::net::http::FrameStatus::Complete);
         ASSERT_TRUE(t.failover(c));
-        EXPECT_EQ(c->upstream_slot, 1);
-        EXPECT_EQ(c->rbuf, c->req.saved);
         EXPECT_TRUE(u->doomed);
-        EXPECT_EQ(io.calls, (std::vector<std::string>{"close upstream", "forward"}));
+        ASSERT_NE(c->peer, nullptr);
+        EXPECT_EQ(c->peer->upstream_slot, 1) << "the request is dispatched again, to venue 1";
+        EXPECT_EQ(c->peer->out.bytes().rfind("POST /v1/chat/completions", 0), 0u);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"close upstream", "connect"}));
+        EXPECT_EQ(t.stats().upstream_failovers, 1u);
 
         c->req.f.phase = Phase::Responding;
         EXPECT_FALSE(t.failover(c)) << "the venue may have acted";
@@ -381,7 +386,7 @@ namespace
         EXPECT_EQ(t.pooled(), 1u);
         EXPECT_EQ(c->req.f.phase, Phase::Idle);
         EXPECT_EQ(t.stats().requests, 1u);
-        EXPECT_EQ(io.calls, (std::vector<std::string>{"resume upstream", "reframe"}));
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"resume upstream"}));
     }
 
     TEST_F(Core, ATruncatedStreamClosesTheClient)
@@ -395,7 +400,6 @@ namespace
         EXPECT_TRUE(c->doomed);
         EXPECT_TRUE(u->doomed) << "an aborted exchange is never pooled";
         EXPECT_EQ(t.stats().requests, 0u);
-        EXPECT_FALSE(io.called("reframe"));
     }
 
     TEST_F(Core, AbortClosesBothLegsAndCountsOneError)
@@ -409,5 +413,80 @@ namespace
         EXPECT_EQ(t.stats().errors, 1u);
         t.abort_pair(nullptr);
         EXPECT_EQ(t.stats().errors, 1u);
+    }
+    // A client pipelining past the cap behind a request in flight is paused, not
+    // closed, and resumes once its request finishes and the buffer drains.
+    TEST_F(Core, PipeliningPastTheCapPausesReadsInsteadOfClosing)
+    {
+        Connection* c = t.client();
+        Connection* u = t.upstream();
+        t.dispatch(c, u);
+        c->rbuf.assign(llmbridge::detail::kMaxClientBuffered + 1, 'x');
+        t.bytes(c);
+        EXPECT_FALSE(c->doomed);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"pause client"}));
+        EXPECT_EQ(t.stats().client_read_pauses, 1u);
+        c->read_paused = true; // what the backend's set_read records
+        t.bytes(c);
+        EXPECT_EQ(io.calls.size(), 1u) << "one pause per episode";
+
+        unpair(c);
+        c->req.f.phase = Phase::Idle;
+        c->rbuf.clear();
+        t.bytes(c);
+        EXPECT_EQ(io.calls.back(), "resume client");
+        EXPECT_EQ(t.stats().errors, 0u);
+    }
+
+    TEST_F(Core, AnIdleClientIsNeverPausedWhateverItBuffered)
+    {
+        Connection* c = t.client();
+        c->rbuf = "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n";
+        t.bytes(c);
+        EXPECT_FALSE(io.called("pause client"));
+    }
+
+    // Interim 100 Continue goes out as a staged reply through the backend's send; it
+    // finishes nothing, because the request is not framed yet.
+    TEST_F(Core, AnInterimContinueIsStagedAndSentAndFinishesNothing)
+    {
+        Connection* c = t.client();
+        io.next_send = Sent::Queued;
+        c->rbuf = "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n";
+        t.bytes(c);
+        EXPECT_EQ(c->out.bytes(), "HTTP/1.1 100 Continue\r\n\r\n");
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"send client"}));
+        EXPECT_EQ(c->req.f.phase, Phase::Idle);
+        t.bytes(c);
+        EXPECT_EQ(io.calls.size(), 1u) << "sent once per request";
+    }
+
+    // A client that goes away mid-request is an error on both backends, wherever
+    // its request stood; one that leaves between requests is not.
+    TEST_F(Core, AClientGoneMidReplyIsAnErrorAndAnIdleOneIsNot)
+    {
+        Connection* idle = t.client();
+        t.gone(idle);
+        EXPECT_TRUE(idle->doomed);
+        EXPECT_EQ(t.stats().errors, 0u);
+
+        Connection* c = t.client();
+        c->req.f.phase = Phase::Replying; // reply staged, upstream already released
+        t.gone(c);
+        EXPECT_TRUE(c->doomed);
+        EXPECT_EQ(t.stats().errors, 1u);
+    }
+
+    TEST_F(Core, AFramedRequestIsDispatchedWithT0StampedBeforeTheParse)
+    {
+        Connection* c = t.client();
+        c->rbuf = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
+        t.bytes(c);
+        ASSERT_NE(c->peer, nullptr);
+        EXPECT_EQ(c->req.f.phase, Phase::Dispatched);
+        EXPECT_GT(c->req.f.ts_req_recvd, 0);
+        EXPECT_LE(c->req.f.ts_req_recvd, c->req.f.ts_req_built);
+        EXPECT_TRUE(c->rbuf.empty());
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"connect"})) << "a cold upstream sends on connect";
     }
 } // namespace

@@ -164,15 +164,28 @@ written once and runs on both.
 |---|---|---|
 | `send` | write now; `Queued` arms `EPOLLOUT` | one send SQE; always `Queued` unless nothing is owed |
 | `connect` | non-blocking `connect()`, `EPOLLIN` and `EPOLLOUT` | socket, resolve, a connect SQE |
-| `set_read` | `EPOLLIN` off or on | nothing yet: streams are capped (`IoCaps`) |
+| `set_read` | `EPOLLIN` off or on | cancel the multishot recv; re-arm it on resume |
 | `close` | `ep_close_client` / `ep_close_upstream` | `ur_close` |
 
 A send that completes at once is a return value (`Sent::Done`), never a callback, so
 no handler runs re-entered. `IoCaps::stream_backpressure` says whether the backend
 pauses a stream's upstream for a slow client (epoll) or bounds it by its buffer cap
-(io_uring). The handlers each backend still writes itself (`forward`, `reframe`,
-`finish`, `stream_pump`, `stream_flush`) are reached through the same interface
-until they are shared. `gateway/tests/core_test.cpp` drives the shared methods with
+(io_uring). The handlers each backend still writes itself (`finish`, `stream_pump`,
+`stream_flush`) are reached through the same interface until they are shared.
+
+The request side is shared outright. Bytes a backend reads go to `on_client_bytes`:
+`try_frame` stamps t0, frames one request from `rbuf` and hands it to `dispatch`, and
+a finished request re-frames whatever was pipelined from the same buffer, never
+with another read. An `Expect: 100-continue` is answered by staging the interim line
+in `out` and sending it like any reply; it finishes nothing, because no request is
+framed yet. Reading continues while a request is in flight, so a client may pipeline
+behind it, up to `kMaxClientBuffered` (no legal request is larger); past that its
+reads are paused through `set_read` (counted in `client_read_pauses`) until the
+requests drain the buffer. On io_uring a pause cancels the multishot recv, whose
+`-ECANCELED` completion re-arms it if the client was resumed meanwhile; bytes the
+kernel had already placed still arrive, bounded by the shared buffer ring. A client
+that disconnects with a request, reply or stream still owed counts as an error on
+either backend (`client_gone`). `gateway/tests/core_test.cpp` drives the shared methods with
 a `FakeIo`, so a send that does not complete happens exactly when a test says so.
 
 ## 4. The epoll backend
@@ -185,7 +198,7 @@ Level-triggered epoll with optimistic writes. The loop owns the syscalls.
       +-- listen fd readable ------> ep_on_accept()      accept() in a loop
       |
       +-- client fd readable ------> ep_on_client_readable()
-      |                                read() -> rbuf -> frame -> ep_forward()
+      |                                read() -> rbuf -> try_frame() -> dispatch()
       |
       +-- client fd writable ------> ep_on_client_writable()
       |                                drain out, or ep_stream_flush()

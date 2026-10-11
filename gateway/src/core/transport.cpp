@@ -6,14 +6,12 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 // Bytes between a socket and a connection's plaintext buffers: the TLS Session on
-// either leg, the sent-request test and the interim 100 Continue.
+// either leg, and the sent-request test.
 
 #include "gateway/gateway.hpp"
 
 #include "core/limits.hpp"
 #include "request.hpp"
-
-#include <sys/socket.h>
 
 #include <cstdint>
 #include <memory>
@@ -160,15 +158,12 @@ namespace llmbridge
             return false;
         }
 
-        // Drain whatever plaintext became available into rbuf. From here on the
-        // existing HTTP framing / SSE pump code takes over unchanged.
+        // Plaintext into rbuf; framing and the SSE pump take over unchanged.
         uint8_t buf[16384];
         size_t r;
         while ((r = u->tls->read_plaintext({buf, sizeof buf})) > 0)
         {
-            // Client-side TLS lands here too, so the arrival stamp belongs here as
-            // much as on the plaintext reads. Harmless on an upstream connection,
-            // whose `client_upload_ns` nobody reads.
+            // The client's arrival stamp; harmless on an upstream, where nobody reads it.
             if (u->ts_first_byte == 0) u->ts_first_byte = now_ns();
             u->rbuf.append(reinterpret_cast<const char*>(buf), r);
         }
@@ -178,11 +173,8 @@ namespace llmbridge
             return false;
         }
 
-        // Handshake completed on this feed. On an upstream conn the request has
-        // been waiting in `out` and can finally go through the Session. On an
-        // Inbound conn there is nothing pending, because the client speaks first
-        // and its request arrives as plaintext out of this very call; t2 is an
-        // upstream concept and stamping it here would be meaningless.
+        // Handshake completed on this feed. An upstream's request has waited in `out`
+        // for it; a client speaks first, so nothing is pending there and t2 is moot.
         if (!hs_was_done && u->tls->handshake_done() && u->is_client)
         {
             // The inbound handshake finishes before t0 (t0 is the framed request),
@@ -220,32 +212,4 @@ namespace llmbridge
 #endif
         return true;
     }
-
-    /// Answer `Expect: 100-continue` without entering the response path.
-    bool Gateway::send_interim_continue(Connection* c, bool uring) noexcept
-    {
-#ifdef LLMBRIDGE_HAVE_TLS
-        if (c->tls)
-        {
-            if (!c->tls->handshake_done()) return true;
-            const auto* p = reinterpret_cast<const uint8_t*>(kContinue.data());
-            if (c->tls->write_plaintext({p, kContinue.size()}) != kContinue.size()) return true;
-#ifdef LLMBRIDGE_HAVE_URING
-            if (uring) { ur_tls_flush(c); return true; } // its completion finishes nothing: Idle
-#endif
-            (void)uring;
-            bool done = false;
-            (void)ep_tls_flush(c, &done); // a partial flush finishes on writable, but nothing finishes: Idle
-            return true;
-        }
-#else
-        (void)uring;
-#endif
-        const ssize_t n = ::send(c->fd, kContinue.data(), kContinue.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
-        // A torn interim line is a protocol error the client cannot recover from. The
-        // caller closes through its backend: setting `doomed` here left epoll spinning on
-        // a registered fd and let io_uring free a connection still in _clients.
-        return n <= 0 || static_cast<size_t>(n) == kContinue.size();
-    }
-
 } // namespace llmbridge

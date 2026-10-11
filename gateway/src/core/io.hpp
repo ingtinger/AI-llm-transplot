@@ -47,8 +47,6 @@ namespace llmbridge::detail
         virtual void close(Connection& c) noexcept = 0;
 
         // The handlers each backend still writes itself, until they are shared.
-        virtual void forward(Connection& client) noexcept = 0;
-        virtual void reframe(Connection& client) noexcept = 0; // idle again: frame what it pipelined
         virtual void finish(Connection& client) noexcept = 0;
         virtual void stream_pump(Connection& u) noexcept = 0;
         virtual void stream_flush(Connection& client) noexcept = 0;

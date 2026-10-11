@@ -198,7 +198,7 @@ namespace llmbridge
         // request queued behind it keeps its place.
         client->rbuf.insert(0, client->req.saved);
         ++_stats.upstream_failovers;
-        _ops->forward(*client);
+        dispatch(client);
         return true;
     }
 

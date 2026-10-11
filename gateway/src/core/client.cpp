@@ -55,6 +55,208 @@ namespace llmbridge
         return d;
     }
 
+    void Gateway::on_client_bytes(Connection* c) noexcept
+    {
+        if (c->req.f.phase == Phase::Idle && !c->rbuf.empty()) try_frame(c);
+        if (!c->doomed) gate_client_reads(c);
+    }
+
+    // Reading continues while a request is in flight, so this is the only bound on what
+    // a client can pipeline behind it. No legal request is larger, so a pause costs a
+    // legitimate client nothing; it resumes once its requests drain the buffer.
+    void Gateway::gate_client_reads(Connection* c) noexcept
+    {
+        const bool over = c->req.f.phase != Phase::Idle && c->rbuf.size() > kMaxClientBuffered;
+        if (over == c->read_paused) return;
+        if (over)
+        {
+            ++_stats.client_read_pauses;
+            LB_WARN("CAP client pipelined ", c->rbuf.size(), " bytes behind its request in flight ",
+                    *c, "; reading paused");
+        }
+        _ops->set_read(*c, !over);
+    }
+
+    void Gateway::client_gone(Connection* c) noexcept
+    {
+        // Mid-request (a reply or stream still owed included) is an abort; idle is normal.
+        if (c->req.f.phase != Phase::Idle) abort_pair(c);
+        else _ops->close(*c);
+    }
+
+    void Gateway::send_continue(Connection* c) noexcept
+    {
+        // Phase stays Idle, so the send completing finishes nothing.
+        c->out.stage().append(kContinue);
+        if (_ops->send(*c) == Sent::Failed) _ops->close(*c);
+    }
+
+    // t0 is stamped before the parse that frames the request, so the parse counts in the
+    // request path; a partial request discards it, so network wait never does.
+    void Gateway::try_frame(Connection* c) noexcept
+    {
+        // A request whose length is known is not re-parsed per read.
+        if (c->client_frame_want && c->rbuf.size() < c->client_frame_want) return;
+        const int64_t t0 = now_ns();
+        net::http::Message m;
+        const auto st = net::http::parse_request(c->rbuf, m);
+        if (st == net::http::FrameStatus::NeedMore)
+        {
+            if (m.total_len && !c->client_frame_want)
+            {
+                c->client_frame_want = m.total_len;
+                c->rbuf.reserve(m.total_len);
+                // No body byte yet: the client is waiting on us, not the network.
+                if (c->rbuf.size() <= m.header_len &&
+                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)))
+                    send_continue(c);
+            }
+            return;
+        }
+        c->client_frame_want = 0;
+        // The one per-request reset, before any reply: even a 400 carries its own
+        // sequence number and none of the previous request's state.
+        c->req.begin(g_seq.fetch_add(1, std::memory_order_relaxed));
+        c->upstream_slot = -1;
+        c->req.f.ts_req_recvd = t0;
+        if (st == net::http::FrameStatus::Error) return error_respond(c, 400, "request framing");
+        if (!net::http::request_line_ok(c->rbuf)) return error_respond(c, 400, "request line");
+
+        c->msg = m;
+        c->req.f.client_upload_ns = span_since(c->ts_first_byte, t0);
+        c->req.f.client_conn_reused = c->ever_framed;
+        c->req.f.client_conn_setup_ns = c->req.f.client_conn_reused ? 0 : span_since(c->ts_accepted, t0);
+        // A pipelining client's next request is already here, so its arrival begins now.
+        c->ts_first_byte = c->rbuf.size() > m.total_len ? t0 : 0;
+        // Nothing here inflates, and every reader downstream assumes JSON.
+        if (c->msg.encoded) return error_respond(c, 415, "compressed request body");
+        if (_sink) sink_capture(c);
+        if (_sink || _policy)
+            if (const char* why = capture_model(c)) return error_respond(c, 400, why, kAmbiguousKeysMessage);
+        LB_DEBUG(ReqId{c->req.f.req_seq}, " ", request_line(c->rbuf), " on ", *c);
+        // The policy seam: framed, but nothing translated, no credential mapped and no
+        // upstream acquired, so a refusal reaches no provider. Venue 0 without one.
+        c->upstream_slot = 0;
+        if (_policy)
+        {
+            const Decision d = policy_decision(c, m);
+            if (!d.allow) return error_respond(c, d.deny_status, d.reason, d.message);
+            // Out of range is the default: a venue that has left the table must not send
+            // the request somewhere arbitrary.
+            if (d.upstream_index >= 0 && static_cast<size_t>(d.upstream_index) < _upstreams.size())
+                c->upstream_slot = d.upstream_index;
+            else if (d.upstream_index >= 0)
+                LB_WARN(ReqId{c->req.f.req_seq}, " policy chose upstream ",
+                        static_cast<int64_t>(d.upstream_index), " of ",
+                        static_cast<int64_t>(_upstreams.size()), "; using 0");
+            // Copied: the views die when decide() returns. Refused rather than cut, which
+            // would route to whatever model the prefix names.
+            if (!c->req.f.model_override.set(d.model) || !c->req.f.tier_override.set(d.service_tier))
+                return error_respond(c, 500, "policy override longer than the gateway holds");
+        }
+        dispatch(c);
+    }
+
+    void Gateway::dispatch(Connection* c) noexcept
+    {
+        // Resolved per attempt: a failover may land on a venue of another dialect. The
+        // client dialect is read off the request line, back in rbuf for a failover.
+        const Upstream& up = upstream_of(c);
+        {
+            const TranslationPlan plan = resolve_dialect(c, up);
+            if (!plan.ok) return error_respond(c, 400, plan.why);
+            c->req.f.translate_body = plan.translate;
+            c->req.f.effective_dialect = plan.venue;
+        }
+        // Built before an upstream is acquired, so a bad body cannot leak a pooled one.
+        note_build(c->msg.total_len);
+        const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
+        if (c->req.f.translate_body)
+        {
+            const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
+            const char* why = "";
+            if (!build_translated_request(up, c->req.f.effective_dialect, body, client_hdrs, _strip_headers,
+                                          _rebuild, _xlate, why, c->req.f.model_override.view(),
+                                          &c->req.f.wants_usage))
+            {
+                // A credential is never echoed: it would land in a JSON body unescaped.
+                if (why[0] == 't') return error_respond(c, 400, "translate", translate_failure(body));
+                return error_respond(c, 400, "malformed credential",
+                                     why[0] == 'b' ? refuse::kBedrockCredential : refuse::kCredential);
+            }
+        }
+        else
+        {
+            // Byte-forward still rebuilds: Host must name the venue. The model is
+            // spliced, so every other byte the client sent survives.
+            std::string_view rewritten;
+            if (!c->req.f.model_override.empty() || !c->req.f.tier_override.empty())
+            {
+                std::string_view had;
+                if (!provider::apply_overrides(body, c->req.f.model_override.view(),
+                                               c->req.f.tier_override.view(), &had, _xlate))
+                    return error_respond(c, 400, "cannot apply route overrides");
+                rewritten = _xlate;
+                c->req.f.asked_tier.set(had); // `had` points into rbuf, reused before the sink
+            }
+            // A venue with a base path needs an origin-form target to prefix.
+            if (!request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
+                                 c->msg.header_len, _strip_headers, up.host_hdr,
+                                 up.base_path, rewritten, _rebuild))
+                return error_respond(c, 400, "request target not origin-form");
+        }
+
+        c->req.f.phase = Phase::Dispatched; // from here until a response byte, failover may redo it
+        Connection* u = acquire_upstream(c->upstream_slot);
+        if (!u)
+        {
+            secure_clear(_rebuild); // a credential must not wait in the scratch
+            // A failover attempt runs on a copy put back in rbuf; drop it, or the next
+            // failover inserts a second one.
+            if (!c->req.saved.empty()) c->rbuf.erase(0, c->msg.total_len);
+            if (!upstream_failed(c, 502, "no upstream (connect failed)"))
+                error_respond(c, 502, "no upstream (connect failed)");
+            return;
+        }
+
+        LB_DEBUG(ReqId{c->req.f.req_seq}, " upstream ", *u, " pooled=", u->from_pool,
+                 " dest=", upstream_of(u).ip, ":", upstream_of(u).port);
+        // The swap hands the request over and takes the upstream's scrubbed, allocated
+        // buffer back as the next scratch.
+        u->out.stage().swap(_rebuild);
+        // The original bytes, kept when a failover could use them: the rebuilt request
+        // is in this venue's dialect.
+        if (_policy && _upstreams.size() > 1 && c->req.saved.empty())
+        {
+            const size_t extra = c->rbuf.size() - c->msg.total_len;
+            c->req.saved.swap(c->rbuf);
+            c->rbuf.assign(c->req.saved, c->msg.total_len, extra);
+            c->req.saved.resize(c->msg.total_len);
+        }
+        else c->rbuf.erase(0, c->msg.total_len);
+        pair(c, u);
+        c->ever_framed = true;            // past the setup deadline for good
+        c->ts_client_activity = now_ns(); // and the idle clock restarts here
+        c->req.f.ts_req_built = now_ns();
+        c->req.f.ts_progress = c->req.f.ts_req_built;
+        // Per attempt: a failover's venue is not the last one's. Pooled means no handshake.
+        c->req.f.ts_wire_ready = u->connected ? c->req.f.ts_req_built : 0;
+        c->req.f.ts_up_sent = 0;
+        c->req.f.upstream_pooled = u->connected;
+        c->req.f.upstream_ip = u->up_addr.sin_addr.s_addr;
+
+        if (!u->connected) return; // the connect's completion sends it
+        switch (_ops->send(*u))
+        {
+            case Sent::Done: c->req.f.ts_up_sent = now_ns(); return;
+            case Sent::Queued: return;
+            case Sent::Failed:
+                if (!retry_upstream(u) && !upstream_failed(c, 502, "upstream write failed"))
+                    error_respond(c, 502, "upstream write failed, retry exhausted");
+                return;
+        }
+    }
+
     void Gateway::respond(Connection* client) noexcept
     {
         switch (_ops->send(*client))

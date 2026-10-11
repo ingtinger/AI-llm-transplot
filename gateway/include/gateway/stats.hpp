@@ -46,6 +46,7 @@ namespace llmbridge
         /// Inbound handshakes that failed, mostly scanners; logged at DEBUG, counted here.
         uint64_t client_tls_handshake_failures = 0;
         uint64_t stream_pauses = 0;     // epoll: upstream reads paused for client backpressure
+        uint64_t client_read_pauses = 0; // a client pipelined past the cap: its reads paused
         uint64_t uring_enobufs = 0;     // io_uring: provided-buffer pool momentarily empty
         uint64_t accept_backoffs = 0;   // listener paused: out of file descriptors
         /// Requests an installed Policy refused; a subset of `errors`, not a sibling.

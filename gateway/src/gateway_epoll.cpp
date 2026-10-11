@@ -100,11 +100,17 @@ namespace llmbridge
     // upstream SSE bytes while the client's write buffer is draining, so a slow
     // client can't make us buffer an unbounded stream. (EPOLLHUP/EPOLLERR still
     // fire while paused, so an upstream close is never missed.)
+    void Gateway::ep_set_read(Connection* c, bool on) noexcept
+    {
+        if (c->read_paused == !on) return;
+        c->read_paused = !on;
+        ep_sync_interest(c);
+    }
+
     void Gateway::ep_pause_read(Connection* c) noexcept
     {
         if (c->read_paused) return;
-        c->read_paused = true;
-        ep_sync_interest(c);
+        ep_set_read(c, false);
         ++_stats.stream_pauses; // observability: proves backpressure actually engaged
         // Both guards above are edge-triggered (`read_paused` early-returns), so this
         // is one line per episode, not per event. WARN like every other cap: at the
@@ -118,8 +124,7 @@ namespace llmbridge
     void Gateway::ep_resume_read(Connection* c) noexcept
     {
         if (!c->read_paused) return;
-        c->read_paused = false;
-        ep_sync_interest(c);
+        ep_set_read(c, true);
         // Same level as the pause: a log that opens an episode and never closes it
         // reads as still stuck.
         LB_WARN("CAP backpressure cleared, resuming upstream reads ", *c);
@@ -332,269 +337,13 @@ namespace llmbridge
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         // Inbound TLS: ciphertext off the socket, plaintext into rbuf. Everything
-        // below this point, framing included, is unchanged and unaware of TLS.
+        // after this, framing included, is unaware of TLS.
         const bool ok = c->tls ? ep_tls_drain_read(c) : ep_drain_read(c);
 #else
         const bool ok = ep_drain_read(c);
 #endif
-        if (!ok)
-        {
-            // EOF/error: mid-request close is a real abort; idle close is normal.
-            const bool in_flight = c->req.f.phase != Phase::Idle;
-            if (in_flight) abort_pair(c);
-            else ep_close_client(c);
-            return;
-        }
-        // Reading continues while a request is in flight, so this is the only bound on
-        // what a client can pipeline behind it.
-        if (c->rbuf.size() > kMaxClientBuffered)
-        {
-            LB_WARN("CAP client buffered ", c->rbuf.size(), " bytes on ", *c, "; closing");
-            abort_pair(c);
-            return;
-        }
-        // One request in flight at a time per client.
-        if (c->req.f.phase != Phase::Idle) return;
-        if (c->rbuf.empty()) return;
-
-        // Stamp just before framing so the (completing) HTTP parse is counted in
-        // the request-path overhead. On a partial read parse returns NeedMore and
-        // we discard t0 and return, so inter-packet network wait is never charged
-        // to the gateway.
-        // A request whose length is already known is not re-parsed per read: the headers
-        // were walked once, and the answer does not change until the bytes are in.
-        if (c->client_frame_want && c->rbuf.size() < c->client_frame_want) return;
-        const int64_t t0 = now_ns();
-        net::http::Message m;
-        auto st = net::http::parse_request(c->rbuf, m);
-        if (st == net::http::FrameStatus::NeedMore)
-        {
-            if (m.total_len && !c->client_frame_want)
-            {
-                c->client_frame_want = m.total_len;
-                c->rbuf.reserve(m.total_len);
-                // No body byte yet: the client is waiting on us, not the network.
-                if (c->rbuf.size() <= m.header_len &&
-                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)) &&
-                    !send_interim_continue(c, /*uring=*/false))
-                    ep_close_client(c);
-            }
-            return;
-        }
-        c->client_frame_want = 0;
-        // The one per-request reset, before any reply: a framing error's 400 carries
-        // its own sequence number and none of the previous request's state. The
-        // sequencer is assigned here and not later because every log line below
-        // quotes it, and ep_forward erases the request out of rbuf.
-        c->req.begin(g_seq.fetch_add(1, std::memory_order_relaxed));
-        c->upstream_slot = -1;
-        c->req.f.ts_req_recvd = t0;
-        if (st == net::http::FrameStatus::Error) { error_respond(c, 400, "request framing"); return; }
-        if (!net::http::request_line_ok(c->rbuf)) { error_respond(c, 400, "request line"); return; }
-
-        c->msg = m;
-        c->req.f.client_upload_ns = span_since(c->ts_first_byte, t0);
-        c->req.f.client_conn_reused = c->ever_framed;
-        c->req.f.client_conn_setup_ns = c->req.f.client_conn_reused ? 0 : span_since(c->ts_accepted, t0);
-        // A pipelining client's next request is already here, so its arrival begins
-        // now; otherwise the next read stamps it.
-        c->ts_first_byte = c->rbuf.size() > m.total_len ? t0 : 0;
-        // Fail closed on a body we cannot read. Nothing here inflates, and every
-        // reader downstream scans bytes assuming JSON: wants_stream, model_of and
-        // the translator.
-        if (c->msg.encoded) { error_respond(c, 415, "compressed request body"); return; }
-        if (_sink) sink_capture(c);
-        if (_sink || _policy)
-            if (const char* why = capture_model(c))
-            {
-                error_respond(c, 400, why, kAmbiguousKeysMessage);
-                return;
-            }
-        LB_DEBUG(ReqId{c->req.f.req_seq}, " ", request_line(c->rbuf), " on ", *c);
-        // The policy seam, one call site per backend. Here because framing has
-        // succeeded but nothing is translated, no credential mapped and no upstream
-        // acquired, so a refusal reaches no provider.
-        // Default to the first upstream, so a build with no policy, and a policy that
-        // only authenticates, both behave exactly as the single-upstream gateway did.
-        c->upstream_slot = 0;
-        if (_policy)
-        {
-            const Decision d = policy_decision(c, m);
-            if (!d.allow) { error_respond(c, d.deny_status, d.reason, d.message); return; }
-            // Out of range is the default, not an error: a policy that does not route
-            // leaves this at -1, and one that names a venue that has since left the
-            // table must not send the request somewhere arbitrary.
-            if (d.upstream_index >= 0 &&
-                static_cast<size_t>(d.upstream_index) < _upstreams.size())
-                c->upstream_slot = d.upstream_index;
-            else if (d.upstream_index >= 0)
-                LB_WARN(ReqId{c->req.f.req_seq}, " policy chose upstream ",
-                        static_cast<int64_t>(d.upstream_index), " of ",
-                        static_cast<int64_t>(_upstreams.size()), "; using 0");
-            // Copied: the policy's views die when this returns, and a failover runs
-            // from a later event. Refused rather than cut, which would route to
-            // whatever model the prefix names.
-            if (!c->req.f.model_override.set(d.model) || !c->req.f.tier_override.set(d.service_tier))
-            {
-                error_respond(c, 500, "policy override longer than the gateway holds");
-                return;
-            }
-        }
-        ep_forward(c); // resolves the translation for the chosen venue; see ep_forward
-    }
-
-    void Gateway::ep_forward(Connection* c) noexcept
-    {
-        // The venue was chosen by the policy (or defaulted to 0) before this ran; it is
-        // stamped on the client so the response leg can still find the dialect after
-        // the upstream has been released back to its pool.
-        const Upstream& up = upstream_of(c);
-        // Resolve the translation for the venue this attempt chose, on every forward, so a
-        // lands on a venue of a different dialect rebuilds correctly instead of reusing
-        // the first venue's mode. The client dialect is read off the request line, which
-        // is in rbuf on the initial call and restored there before a failover retry. An
-        // unbuilt client/venue pair is refused here, before anything reaches the upstream.
-        {
-            const TranslationPlan plan = resolve_dialect(c, up);
-            if (!plan.ok) { error_respond(c, 400, plan.why); return; }
-            c->req.f.translate_body = plan.translate;
-            c->req.f.effective_dialect = plan.venue;
-        }
-        // Build the bytes to send upstream (translate first, before acquiring an
-        // upstream, so a bad body can't leak a pooled connection).
-        note_build(c->msg.total_len);
-        if (c->req.f.translate_body)
-        {
-            std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
-            // Remember whether the client asked for a final usage chunk. The
-            // request bytes are consumed below, but the stream needs it later.
-            // `wants_usage` is an output of the translation below, not a separate
-            // question: the translator parses this body anyway.
-            const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
-            const char* why = "";
-            // Either failure => 400, and nothing goes upstream.
-            if (!build_translated_request(up, c->req.f.effective_dialect, body, client_hdrs, _strip_headers,
-                                          _rebuild, _xlate, why, c->req.f.model_override.view(),
-                                          &c->req.f.wants_usage))
-            {
-                if (why[0] == 't')
-                    error_respond(c, 400, "translate", translate_failure(body));
-                // The caller's own header, so the caller is told. The value is
-                // never echoed: it is a credential, and this string lands in a JSON
-                // body with no escaping.
-                else if (why[0] == 'b')
-                    error_respond(c, 400, "malformed credential",
-                                     refuse::kBedrockCredential);
-                else
-                    error_respond(c, 400, "malformed credential",
-                                     refuse::kCredential);
-                return;
-            }
-        }
-        else
-        {
-            // No `wants_usage` on this path, deliberately. Its only reader is the
-            // Anthropic-to-OpenAI SSE translator, built only when `translate_body`
-            // is set.
-            // Byte-forward still rebuilds, even with nothing to strip: Host must name
-            // the venue, not the client's idea of us.
-            // Byte-forward rewrites the model by splicing the value, so every other
-            // byte the client sent survives; the derived Content-Length then describes
-            // the spliced body without anyone having to remember to update it.
-            std::string_view rewritten;
-            if (!c->req.f.model_override.empty() || !c->req.f.tier_override.empty())
-            {
-                std::string_view had;
-                if (!provider::apply_overrides(
-                    std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len),
-                    c->req.f.model_override.view(), c->req.f.tier_override.view(), &had, _xlate))
-                { error_respond(c, 400, "cannot apply route overrides"); return; }
-                rewritten = _xlate;
-                // Copied, not held: `had` points into the request buffer, which is
-                // reused before the sink runs. Truncated and not refused, because a
-                // tier too long to be one is still worth reporting.
-                c->req.f.asked_tier.set(had);
-            }
-            // Refused, not repaired: a venue with a base path needs an origin-form
-            // target to prefix, and nothing has been sent upstream at this point.
-            if (!request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
-                                 c->msg.header_len, _strip_headers, up.host_hdr,
-                                 up.base_path, rewritten, _rebuild))
-            { error_respond(c, 400, "request target not origin-form"); return; }
-        }
-
-        c->req.f.phase = Phase::Dispatched; // from here until a response byte, failover may redo it
-        Connection* u = acquire_upstream(c->upstream_slot);
-        if (!u)
-        {
-            secure_clear(_rebuild); // a credential must not wait in the scratch for the next request
-            // A failover attempt runs on a copy put back in rbuf; failover_req keeps the
-            // original, so drop the copy or the next failover inserts a second one.
-            if (!c->req.saved.empty()) c->rbuf.erase(0, c->msg.total_len);
-            if (!upstream_failed(c, 502, "no upstream (connect failed)"))
-                error_respond(c, 502, "no upstream (connect failed)");
-            return;
-        }
-
-        LB_DEBUG(ReqId{c->req.f.req_seq}, " upstream ", *u, " pooled=", u->from_pool,
-                 " dest=", upstream_of(u).ip, ":", upstream_of(u).port);
-        // The rebuilt request is already in `_rebuild`; the swap hands it over and
-        // takes the upstream's scrubbed, still-allocated buffer back as the next scratch.
-        u->out.stage().swap(_rebuild);
-        // Keep the original bytes when a failover could use them: the rebuilt request
-        // above was translated for this venue's dialect, so it cannot be resent to a
-        // different one. One copy per in-flight request, and only where it can pay off.
-        if (_policy && _upstreams.size() > 1 && c->req.saved.empty())
-        {
-            const size_t extra = c->rbuf.size() - c->msg.total_len;
-            c->req.saved.swap(c->rbuf);
-            c->rbuf.assign(c->req.saved, c->msg.total_len, extra);
-            c->req.saved.resize(c->msg.total_len);
-        }
-        else c->rbuf.erase(0, c->msg.total_len);
-        pair(c, u);
-        c->ever_framed = true;        // past the setup deadline for good
-        c->ts_client_activity = now_ns(); // and the idle clock restarts here
-        c->req.f.ts_req_built = now_ns();   // end of our request-side work
-        c->req.f.ts_progress = c->req.f.ts_req_built; // idle-timeout baseline for this request
-        // Per attempt: a failover's venue is not the last one's. Pooled means no handshake.
-        c->req.f.ts_wire_ready = u->connected ? c->req.f.ts_req_built : 0;
-        c->req.f.ts_up_sent = 0;
-        c->req.f.upstream_pooled = u->connected;
-        c->req.f.upstream_ip = u->up_addr.sin_addr.s_addr;
-
-        // Optimistic send: if the pooled upstream is already connected (the common
-        // case), write immediately and only arm EPOLLOUT if the socket buffer is
-        // full. Arming unconditionally costs two epoll_ctl calls + an extra wakeup
-        // per request; the client-response leg already writes this way.
-        if (u->connected)
-        {
-#ifdef LLMBRIDGE_HAVE_TLS
-            if (u->tls)
-            {
-                // Pooled TLS conns are always past the handshake (a fresh conn is
-                // never `connected` here). Push the plaintext through the session
-                // and flush the ciphertext; partial flushes finish on writability.
-                tls_push_out(u);
-                bool done = false;
-                if (!ep_tls_flush(u, &done))
-                {
-                    if (!retry_upstream(u) && !upstream_failed(c, 502, "upstream write failed")) error_respond(c, 502, "upstream write failed, retry exhausted");
-                    return;
-                }
-                if (done && tls_out_flushed(u)) c->req.f.ts_up_sent = now_ns();
-                return;
-            }
-#endif
-            bool done = false;
-            if (!ep_pump_write(u, &done)) { if (!retry_upstream(u) && !upstream_failed(c, 502, "upstream write failed")) error_respond(c, 502, "upstream write failed, retry exhausted"); return; }
-            if (done) c->req.f.ts_up_sent = now_ns(); // request fully sent (end of request path)
-            else ep_arm_write(u);               // socket full; finish on writability
-        }
-        else
-        {
-            ep_arm_write(u); // connect pending; ep_on_upstream_writable sends once it completes
-        }
+        if (!ok) return client_gone(c);
+        on_client_bytes(c);
     }
 
     void Gateway::ep_on_upstream_writable(Connection* u) noexcept
@@ -842,7 +591,7 @@ namespace llmbridge
     {
         if (c->req.f.streaming) { ep_stream_flush(c); return; } // pump path has its own drain logic
         bool done = false;
-        if (!ep_pump_write(c, &done)) { abort_pair(c); return; }
+        if (!ep_pump_write(c, &done)) return client_gone(c);
         if (!done) { ep_arm_write(c); return; }
         ep_finish_client(c);
     }
@@ -894,7 +643,7 @@ namespace llmbridge
         const bool close_now = c->close_after_resp || !c->msg.keep_alive;
         c->msg = net::http::Message{};
         if (close_now) { ep_close_client(c); return; }
-        ep_on_client_readable(c); // service any pipelined next request already in rbuf
+        on_client_bytes(c); // a pipelined next request is framed from rbuf, with no read
     }
 
     // Decode + translate the upstream body bytes now sitting in u->rbuf, appending
@@ -963,18 +712,12 @@ namespace llmbridge
             _g.ep_arm_write(&u); // learn when the non-blocking connect completes
             return true;
         }
-        void set_read(Connection& c, bool on) noexcept override
-        {
-            if (on) _g.ep_resume_read(&c);
-            else _g.ep_pause_read(&c);
-        }
+        void set_read(Connection& c, bool on) noexcept override { _g.ep_set_read(&c, on); }
         void close(Connection& c) noexcept override
         {
             if (c.is_client) _g.ep_close_client(&c);
             else _g.ep_close_upstream(&c);
         }
-        void forward(Connection& c) noexcept override { _g.ep_forward(&c); }
-        void reframe(Connection& c) noexcept override { _g.ep_on_client_readable(&c); }
         void finish(Connection& c) noexcept override { _g.ep_finish_client(&c); }
         void stream_pump(Connection& u) noexcept override { _g.ep_stream_pump(&u); }
         void stream_flush(Connection& c) noexcept override { _g.ep_stream_flush(&c); }
