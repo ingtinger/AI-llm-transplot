@@ -20,18 +20,27 @@ Two connection kinds, and the vocabulary is used consistently everywhere:
 
 | | |
 |---|---|
-| **client conn** | a customer's connection to us. `is_client == true` |
-| **upstream conn** | our connection to the provider. `is_client == false` |
+| **client conn** | a customer's connection to us: `ClientConn` |
+| **upstream conn** | our connection to the provider: `UpstreamConn` |
 
-They are linked by `peer` for the duration of one request, and unlinked when it
-completes. An upstream with no peer is either idle in the pool or dying.
+Both derive from `ConnBase` (`gateway/src/core/conn.hpp`), what a socket needs on
+either leg: the fd, the buffers, the TLS Session and the backend's flags. The request
+and its stream live only on the client; the venue, the response framer and the pool
+links only on the upstream, which keeps a pooled upstream under 512 bytes (a
+`static_assert` holds it). A backend learns the kind of an event from its tag, the
+low bits of epoll's event data or of io_uring's `user_data`, and calls a typed
+handler; shared code holding a `ConnBase` reaches the concrete type through `visit()`.
+
+They are linked by `ClientConn::up` and `UpstreamConn::client` for the duration of one
+request, and unlinked when it completes. An upstream with no client is either idle in
+the pool or dying.
 
 ## 2. The buffers
 
 Both are named from the **gateway's** point of view on that socket: `rbuf` is what
 we read from the peer, `out` is what we write to it. The same field name
 therefore holds the request on one connection and the response on the other, and
-which is which depends on `is_client`. That is the most confusing thing about the
+which is which depends on the kind. That is the most confusing thing about the
 data model, so here is one request crossing all four:
 
 ```
@@ -401,10 +410,12 @@ different reasons:
                                           doomed && inflight == 0
 ```
 
-Every `Connection` is in exactly one `Registry` (`gateway/src/core/registry.hpp`):
+Every connection is in exactly one `Registry` (`gateway/src/core/registry.hpp`):
 `_clients`, `_upconns` (live upstreams, pooled ones too) or `_doomed`. Each member
 holds its own index, so a close moves it in O(1), and the destructor and the
-io_uring drain walk the registries instead of following `peer` to find upstreams.
+io_uring drain walk the registries instead of following `up` to find upstreams.
+`Engine::free_conn` deletes a doomed one as its own type, keeping an upstream's
+buffers warm for the next.
 
 **The unconditional frees are safe for two different structural reasons.** epoll
 never increments `inflight`, so it is always 0. `UringIo::run()` ends with a drain
@@ -444,7 +455,7 @@ time to first token.
 
 The pool is one intrusive list per venue: `acquire` takes the newest, removal on
 close is O(1), and the reaper visits only expired connections, which sit at the
-oldest end of each list. `peer` links are written only by `pair()` and `unpair()`,
+oldest end of each list. `up` and `client` are written only by `pair()` and `unpair()`,
 and every close unpairs, so neither leg keeps a pointer to a freed connection.
 
 **Why the 30 s reap.** Providers drop idle keep-alives on their own schedule, and
@@ -595,11 +606,13 @@ A transport-agnostic wrapper over the two was tried and reverted: every caller
 already sits inside a TLS-only branch, so it resolved to `tls_out_flushed()` at
 every site and read as a safety net while changing nothing.
 
-### 10c. Why the TLS helpers take `c` and not `u`
+### 10c. Why the TLS helpers take a `ConnBase`
 
-They are no-op-safe building blocks shared by both backends. Since inbound TLS
-landed they run on client connections too, and `u` means upstream everywhere else
-in the file. Direction is read from `c->is_client`, never assumed.
+They are no-op-safe building blocks shared by both backends, and since inbound TLS
+landed they run on client connections too. What differs by direction lives in the two
+`tls_feed` overloads, chosen by type: a client's failed handshake is counted as scanner
+noise, and an upstream's completed one stamps t2 and pushes the request that waited
+for it.
 
 ### 10d. Two TLS checks that look removable
 
