@@ -25,16 +25,24 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 namespace llmbridge::detail
 {
     namespace
     {
+        // user_data: the connection, the op in the low three bits and the kind in the
+        // fourth (ConnBase is aligned to 16), so a completion reaches a typed handler.
         enum UOp : uint64_t { UAccept = 0, URecv = 1, USend = 2, UConnect = 3, UTimer = 4, UCancel = 5 };
-        constexpr uint64_t kTagMask = 7;
-        inline uint64_t make_ud(Connection* c, UOp op) { return reinterpret_cast<uintptr_t>(c) | op; }
-        inline Connection* ud_conn(uint64_t d) { return reinterpret_cast<Connection*>(d & ~kTagMask); }
-        inline UOp ud_op(uint64_t d) { return static_cast<UOp>(d & kTagMask); }
+        constexpr uint64_t kOpMask = 7;
+        constexpr uint64_t kUpstreamBit = 8;
+        static_assert(alignof(ConnBase) >= 16);
+        inline uint64_t make_ud(const ConnBase* c, UOp op)
+        {
+            return reinterpret_cast<uintptr_t>(c) | op | (c->kind == ConnKind::Upstream ? kUpstreamBit : 0);
+        }
+        inline ConnBase* ud_conn(uint64_t d) { return reinterpret_cast<ConnBase*>(d & ~(kOpMask | kUpstreamBit)); }
+        inline UOp ud_op(uint64_t d) { return static_cast<UOp>(d & kOpMask); }
 
         constexpr unsigned kRingDepth = 4096;
         // Provided buffers for the multishot recvs, each recycled as soon as it is copied out.
@@ -87,7 +95,7 @@ namespace llmbridge::detail
         s->fd = _e._listen_fd;
         s->accept_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
         s->ioprio = IORING_ACCEPT_MULTISHOT; // one SQE, a completion per accepted fd
-        s->user_data = make_ud(nullptr, UAccept);
+        s->user_data = UAccept;
         return true;
     }
 
@@ -112,17 +120,16 @@ namespace llmbridge::detail
     }
 
     // Full even after a flush: this pair cannot progress, so both legs end together.
-    void UringIo::drop_sq_full(Connection* c) noexcept
+    void UringIo::drop_sq_full(ConnBase* c) noexcept
     {
         LB_WARN("CAP io_uring submission queue full; closing ", *c);
-        Connection* client = c->is_client ? c : c->peer;
-        if (client) _e.abort_pair(client);
+        if (ClientConn* client = visit(*c, [](auto& k) { return client_of(k); })) _e.abort_pair(client);
         else close(*c);
     }
 
     // One multishot recv per connection, drawing from the provided buffers; re-armed
     // only when the kernel ends it.
-    bool UringIo::arm_recv(Connection* c) noexcept
+    bool UringIo::arm_recv(ConnBase* c) noexcept
     {
         io_uring_sqe* s = nullptr;
         if (!next_sqe(&s))
@@ -146,7 +153,7 @@ namespace llmbridge::detail
 
     // Its last completion, -ECANCELED, re-arms if reads resumed meanwhile. Bytes the
     // kernel already placed still arrive: bounded by the shared buffer ring.
-    bool UringIo::cancel_recv(Connection* c) noexcept
+    bool UringIo::cancel_recv(ConnBase* c) noexcept
     {
         io_uring_sqe* s = nullptr;
         if (!next_sqe(&s)) return false;
@@ -156,7 +163,7 @@ namespace llmbridge::detail
         return true;
     }
 
-    bool UringIo::submit_send(Connection* c) noexcept
+    bool UringIo::submit_send(ConnBase* c) noexcept
     {
         io_uring_sqe* s = nullptr;
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -197,7 +204,7 @@ namespace llmbridge::detail
     }
 
 #ifdef LLMBRIDGE_HAVE_TLS
-    void UringIo::tls_flush(Connection* u) noexcept
+    void UringIo::tls_flush(ConnBase* u) noexcept
     {
         if (u->tls_out.pinned()) return; // the completion flushes what staged behind
         _e.tls_pump_out(u);
@@ -208,7 +215,7 @@ namespace llmbridge::detail
 
     // A TLS conn's SQE points at tls_out, so plaintext must pass through the Session
     // first, or the kernel is handed a zero-length send (found by curl, not reading).
-    void UringIo::client_send(Connection* c) noexcept
+    void UringIo::client_send(ConnBase* c) noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         if (c->tls)
@@ -221,10 +228,10 @@ namespace llmbridge::detail
         submit_send(c);
     }
 
-    void UringIo::close(Connection& c) noexcept
+    void UringIo::close(ConnBase& c) noexcept
     {
         if (c.doomed) return;
-        Connection* other = _e.forget(&c);
+        ConnBase* other = _e.forget(c);
         // Every op on the fd completes, so the inflight count drains; the fd closes at the free.
         if (c.fd >= 0)
         {
@@ -235,7 +242,7 @@ namespace llmbridge::detail
         maybe_free(&c);
     }
 
-    void UringIo::maybe_free(Connection* c) noexcept
+    void UringIo::maybe_free(ConnBase* c) noexcept
     {
         if (!c->doomed || c->inflight > 0) return; // a completion still references it
         if (c->fd >= 0)
@@ -243,12 +250,10 @@ namespace llmbridge::detail
             ::close(c->fd);
             c->fd = -1;
         }
-        _e._doomed->remove(c);
-        _e.retire_wbuf(c);
-        delete c;
+        _e.free_conn(c);
     }
 
-    Sent UringIo::send(Connection& c) noexcept
+    Sent UringIo::send(ConnBase& c) noexcept
     {
         if (c.send_inflight()) return Sent::Queued; // its completion sends the rest
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -260,7 +265,7 @@ namespace llmbridge::detail
         return Sent::Queued;
     }
 
-    bool UringIo::connect(Connection& u) noexcept
+    bool UringIo::connect(UpstreamConn& u) noexcept
     {
         const int fd = net::make_client_socket();
         if (fd < 0) return false;
@@ -282,7 +287,7 @@ namespace llmbridge::detail
         return true;
     }
 
-    void UringIo::set_read(Connection& c, bool on) noexcept
+    void UringIo::set_read(ConnBase& c, bool on) noexcept
     {
         if (c.read_paused == !on) return;
         if (on)
@@ -314,7 +319,7 @@ namespace llmbridge::detail
         if (op == UCancel) return;
         if (op == UAccept) return on_accept(res, flags);
 
-        Connection* c = ud_conn(user_data);
+        ConnBase* c = ud_conn(user_data);
         // A multishot recv stays armed only while F_MORE is set and it delivers data; its
         // terminal completion may still carry F_MORE, and must release the slot.
         const bool armed = (op == URecv) && (flags & IORING_CQE_F_MORE) && res > 0;
@@ -332,13 +337,15 @@ namespace llmbridge::detail
             if (!armed) maybe_free(c);
             return;
         }
-        switch (op)
+        if (user_data & kUpstreamBit)
         {
-            case URecv: on_recv(c, res, flags); break;
-            case USend: on_send(c, res); break;
-            case UConnect: on_connect(c, res); break;
-            default: break;
+            auto* u = static_cast<UpstreamConn*>(c);
+            if (op == URecv) on_recv(u, res, flags);
+            else if (op == USend) on_send(u, res);
+            else if (op == UConnect) on_connect(u, res);
         }
+        else if (op == URecv) on_recv(static_cast<ClientConn*>(c), res, flags);
+        else if (op == USend) on_send(static_cast<ClientConn*>(c), res);
     }
 
     void UringIo::on_accept(int res, uint32_t flags) noexcept
@@ -358,9 +365,8 @@ namespace llmbridge::detail
         net::set_nodelay(fd);
         if (_e._client_sndbuf > 0)
             ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_e._client_sndbuf, sizeof(_e._client_sndbuf));
-        Connection* c = new Connection();
+        auto* c = new ClientConn();
         c->fd = fd;
-        c->is_client = true;
         c->id = _e._next_client_id++;
         c->ts_accepted = now_ns();
         c->ts_client_activity = c->ts_accepted;
@@ -380,7 +386,7 @@ namespace llmbridge::detail
         arm_recv(c);
     }
 
-    void UringIo::on_recv(Connection* c, int res, uint32_t flags) noexcept
+    template <class C> void UringIo::on_recv(C* c, int res, uint32_t flags) noexcept
     {
         const bool armed = flags & IORING_CQE_F_MORE;
         // The provided buffers ran out for a moment: the kernel ended the multishot
@@ -401,9 +407,7 @@ namespace llmbridge::detail
         if (res <= 0) // EOF or an error
         {
             if (flags & IORING_CQE_F_BUFFER) _bufring.recycle(flags >> IORING_CQE_BUFFER_SHIFT);
-            if (c->is_client) _e.client_gone(c);
-            else _e.on_upstream_eof(c, false);
-            return;
+            return lost(c, false);
         }
         // Copied out of the kernel's buffer, which goes straight back. TLS bytes are
         // ciphertext: the Session's plaintext lands in rbuf.
@@ -417,35 +421,38 @@ namespace llmbridge::detail
             else
 #endif
             {
-                if (c->ts_first_byte == 0) c->ts_first_byte = now_ns();
+                stamp_first_byte(*c);
                 c->rbuf.append(_bufring.data(bid), static_cast<size_t>(res));
             }
             _bufring.recycle(bid);
-            if (!c->is_client) note_response_bytes(c);
+            if constexpr (std::is_same_v<C, UpstreamConn>) note_response_bytes(c);
         }
         // The kernel ended the multishot (pool pressure): re-arm. A failed arm may free c.
         if (!armed && !c->read_paused && !arm_recv(c)) return;
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (!tls_ok)
-        {
-            // Fatal: a client's is its connection dying, never a retryable upstream fault.
-            if (c->is_client) return _e.client_gone(c);
-            return _e.on_upstream_eof(c, true);
-        }
+        if (!tls_ok) return lost(c, true);
         if (c->tls) tls_flush(c); // handshake replies, or request bytes just pushed
 #else
         (void)tls_ok;
 #endif
-        if (c->is_client) _e.on_client_bytes(c);
-        else _e.on_upstream_bytes(c);
+        arrived(c);
     }
 
-    void UringIo::on_connect(Connection* u, int res) noexcept
+    // Fatal on a client is its connection dying, never a retryable upstream fault.
+    void UringIo::lost(ClientConn* c, bool) noexcept { _e.client_gone(c); }
+
+    void UringIo::lost(UpstreamConn* u, bool tls_failed) noexcept { _e.on_upstream_eof(u, tls_failed); }
+
+    void UringIo::arrived(ClientConn* c) noexcept { _e.on_client_bytes(c); }
+
+    void UringIo::arrived(UpstreamConn* u) noexcept { _e.on_upstream_bytes(u); }
+
+    void UringIo::on_connect(UpstreamConn* u, int res) noexcept
     {
         if (res < 0)
         {
-            _e.note_connect_failure(u->upstream_slot, std::strerror(-res));
-            Connection* client = unpair(u);
+            _e.note_connect_failure(u->venue, std::strerror(-res));
+            ClientConn* client = unpair(u);
             close(*u);
             if (client) _e.fail_request(client, 502, "upstream connect refused");
             else ++_e._stats.errors;
@@ -456,7 +463,7 @@ namespace llmbridge::detail
         if (!_e.upstream_is_tls(u))
         {
             u->wire_ready = true;
-            if (u->peer) u->peer->req.f.ts_wire_ready = now_ns();
+            if (u->client) u->client->req.f.ts_wire_ready = now_ns();
         }
         if (!arm_recv(u)) return; // for the upstream's life; may free u
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -471,19 +478,12 @@ namespace llmbridge::detail
         submit_send(u);
     }
 
-    void UringIo::on_send(Connection* c, int res) noexcept
+    template <class C> void UringIo::on_send(C* c, int res) noexcept
     {
         c->wire().sent(res > 0 ? static_cast<size_t>(res) : 0); // unpins; what staged folds in
-        if (res <= 0)
-        {
-            if (c->is_client) _e.client_gone(c);
-            else _e.upstream_lost(c, Engine::UpFail::Write);
-            return;
-        }
+        if (res <= 0) return send_failed(c);
         c->sent_bytes += static_cast<uint64_t>(res);
-        // A client draining a stream the provider finished is progress, not idleness.
-        if (c->is_client ? c->req.f.streaming : c->peer != nullptr)
-            (c->is_client ? c : c->peer)->req.f.ts_progress = now_ns();
+        progressed(c);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (c->tls)
         {
@@ -495,16 +495,8 @@ namespace llmbridge::detail
             // The Session may hold more: later flights, or plaintext held for the handshake.
             if (c->tls->handshake_done() && !c->out.idle()) _e.tls_push_out(c);
             tls_flush(c);
-            if (c->send_inflight()) return;
-            if (!c->is_client)
-            {
-                if (c->peer && _e.tls_out_flushed(c)) c->peer->req.f.ts_up_sent = now_ns();
-                return;
-            }
-            if (!_e.tls_out_flushed(c)) return;
-            if (c->req.f.streaming) _e.stream_flush(c);
-            else _e.finish(c);
-            return;
+            if (c->send_inflight() || !_e.tls_out_flushed(c)) return;
+            return drained(c);
         }
 #endif
         if (!c->out.idle())
@@ -512,13 +504,34 @@ namespace llmbridge::detail
             submit_send(c); // partial, or staged behind
             return;
         }
-        // An upstream's request stays in `out` for a resend; its response comes by recv.
-        if (!c->is_client)
-        {
-            if (c->peer) c->peer->req.f.ts_up_sent = now_ns();
-        }
-        else if (c->req.f.streaming) _e.stream_flush(c); // finalizes if the stream ended
+        drained(c);
+    }
+
+    void UringIo::send_failed(ClientConn* c) noexcept { _e.client_gone(c); }
+
+    void UringIo::send_failed(UpstreamConn* u) noexcept { _e.upstream_lost(u, Engine::UpFail::Write); }
+
+    // A client draining a stream the provider finished is progress, not idleness.
+    void UringIo::progressed(ClientConn* c) noexcept
+    {
+        if (c->req.f.streaming) c->req.f.ts_progress = now_ns();
+    }
+
+    void UringIo::progressed(UpstreamConn* u) noexcept
+    {
+        if (u->client) u->client->req.f.ts_progress = now_ns();
+    }
+
+    void UringIo::drained(ClientConn* c) noexcept
+    {
+        if (c->req.f.streaming) _e.stream_flush(c); // finalizes if the stream ended
         else _e.finish(c);
+    }
+
+    // An upstream's request stays in `out` for a resend; its response comes by recv.
+    void UringIo::drained(UpstreamConn* u) noexcept
+    {
+        if (u->client) u->client->req.f.ts_up_sent = now_ns();
     }
 
     int UringIo::run()
@@ -548,13 +561,13 @@ namespace llmbridge::detail
         // until none is outstanding, so no kernel write lands in freed memory. Closed
         // connections were cancelled by close().
         _draining = true;
-        const auto stop_conn = [this](Connection* c) {
+        const auto stop_conn = [this](ConnBase* c) {
             if (c->fd < 0) return;
             ::shutdown(c->fd, SHUT_RDWR);
             submit_cancel(c->fd);
         };
-        for (Connection* c : *_e._clients) stop_conn(c);
-        for (Connection* u : *_e._upconns) stop_conn(u); // pooled and in flight alike
+        for (ClientConn* c : *_e._clients) stop_conn(c);
+        for (UpstreamConn* u : *_e._upconns) stop_conn(u); // pooled and in flight alike
         while (_inflight > 0)
         {
             const int r = _ring.submit_and_wait(1);

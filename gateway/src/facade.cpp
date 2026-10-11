@@ -76,8 +76,8 @@ namespace llmbridge
     void Gateway::set_client_sndbuf_for_test(int bytes) noexcept { _e->_client_sndbuf = bytes; }
     void Gateway::set_epoll_write_cap_for_test(size_t bytes) noexcept { _e->_ep_write_cap = bytes; }
     size_t Gateway::prefault_resident_bytes_for_test() { return _e->prefault_resident_bytes_for_test(); }
-    void Gateway::retire_wbuf(Connection* u) noexcept { _e->retire_wbuf(u); }
-    void Gateway::adopt_warm(Connection* u) noexcept { _e->adopt_warm(u); }
+    void Gateway::retire_wbuf(UpstreamConn* u) noexcept { _e->retire_wbuf(u); }
+    void Gateway::adopt_warm(UpstreamConn* u) noexcept { _e->adopt_warm(u); }
     void Gateway::note_build(size_t need) noexcept { _e->note_build(need); }
     size_t Gateway::warm_bufs_for_test() const noexcept { return _e->_warm.size(); }
 } // namespace llmbridge

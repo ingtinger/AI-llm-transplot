@@ -23,28 +23,28 @@
 namespace llmbridge::detail
 {
     /// Whether this client can be handed a chunked stream and keep its connection.
-    [[nodiscard]] inline bool stream_reusable_out(const Connection* c) noexcept
+    [[nodiscard]] inline bool stream_reusable_out(const ClientConn* c) noexcept
     {
         return c->msg.http_1_1 && c->msg.keep_alive;
     }
 
     /// Can reuse only if we framed the reply so the body has an end marker, the
     /// stream reached that marker, and the caller wanted the connection kept.
-    [[nodiscard]] inline bool stream_client_reusable(const Connection* c) noexcept
+    [[nodiscard]] inline bool stream_client_reusable(const ClientConn* c) noexcept
     {
         return c->req.f.stream_chunked_out && !c->close_after_resp && c->msg.keep_alive;
     }
 
     /// The upstream may outlive this stream: it said keep-alive, and the stream was not
     /// aborted, corrupt or timed out.
-    [[nodiscard]] inline bool stream_keeps_upstream(const Connection* c) noexcept
+    [[nodiscard]] inline bool stream_keeps_upstream(const ClientConn* c) noexcept
     {
         return c->req.f.stream_keep_alive && !c->close_after_resp;
     }
 
     /// The terminal chunk was consumed: a close-delimited body cannot tell finished
     /// from died.
-    [[nodiscard]] inline bool stream_body_ended(const Connection* c) noexcept
+    [[nodiscard]] inline bool stream_body_ended(const ClientConn* c) noexcept
     {
         if (c->req.f.stream_body == net::http::Body::Length) return c->req.f.stream_left == 0;
         return c->req.f.stream_body == net::http::Body::Chunked && c->req.chunkdec.done();
@@ -52,7 +52,7 @@ namespace llmbridge::detail
 
     /// Wrap whatever was appended to `out` at or after `pos` in one chunk frame.
     /// A no-op on a close-delimited stream, so both framings share one write path.
-    inline void chunk_wrap(const Connection* c, std::string& out, size_t pos)
+    inline void chunk_wrap(const ClientConn* c, std::string& out, size_t pos)
     {
         if (!c->req.f.stream_chunked_out || out.size() <= pos) return;
         char hdr[24];
@@ -66,7 +66,7 @@ namespace llmbridge::detail
 
     /// The terminating zero-length chunk. Emitted only on a clean end: a truncated
     /// stream must not be given the marker that says it finished.
-    inline void chunk_terminate(const Connection* c, std::string& out)
+    inline void chunk_terminate(const ClientConn* c, std::string& out)
     {
         if (c->req.f.stream_chunked_out) out.append("0\r\n\r\n", 5);
     }
@@ -130,7 +130,7 @@ namespace llmbridge::detail
 
     /// `tail` searches the end of `bytes`, which is where a non-streamed body puts
     /// it, beside the usage block.
-    inline void note_served_tier(Connection* c, std::string_view bytes, bool tail) noexcept
+    inline void note_served_tier(ClientConn* c, std::string_view bytes, bool tail) noexcept
     {
         if (!c->req.f.served_tier.empty() || c->req.f.served_tier_tries >= kTierTries) return;
         ++c->req.f.served_tier_tries;
@@ -141,7 +141,7 @@ namespace llmbridge::detail
         c->req.f.served_tier.set(scan_string(head, "\"service_tier\"", tail));
     }
 
-    inline void keep_served_model(Connection* c, std::string_view m) noexcept
+    inline void keep_served_model(ClientConn* c, std::string_view m) noexcept
     {
         c->req.f.served_model.set(m);
     }
@@ -149,7 +149,7 @@ namespace llmbridge::detail
     /// The model a reply names. A non-streamed body is read whole, top level only;
     /// a stream is read in the head of each of its first reads, one `data:` line at
     /// a time, since both dialects name the model in their first event.
-    inline void note_served_model(Connection* c, std::string_view bytes, bool streamed) noexcept
+    inline void note_served_model(ClientConn* c, std::string_view bytes, bool streamed) noexcept
     {
         if (!c->req.f.served_model.empty() || c->req.f.served_model_tries >= kTierTries) return;
         ++c->req.f.served_model_tries;
@@ -170,7 +170,7 @@ namespace llmbridge::detail
 
     /// Usage a byte-forwarded stream states, read as it arrives: Anthropic states its
     /// input and cache counts in the first event and OpenAI its totals in the last.
-    inline void stream_note_usage(Connection* client, std::string_view bytes)
+    inline void stream_note_usage(ClientConn* client, std::string_view bytes)
     {
         client->req.stream_usage.feed(bytes);
     }
@@ -178,7 +178,7 @@ namespace llmbridge::detail
     /// A finished stream's token counts, from the Anthropic translator or from what a
     /// byte-forwarded stream stated; one function so the sink and the log agree. A
     /// dialect that learns to stream adds its own branch here.
-    inline BodyUsage stream_tokens(const Connection* c) noexcept
+    inline BodyUsage stream_tokens(const ClientConn* c) noexcept
     {
         if (c->req.f.sse_translating) return c->sse_xlate.usage();
         return c->req.stream_usage.usage();
@@ -194,7 +194,7 @@ namespace llmbridge::detail
     //
     // A Content-Length stream ends at its last byte, with the connection still open.
     // A close-delimited stream genuinely ends at EOF, and must still finish there.
-    inline bool stream_complete(const Connection* client, bool at_eof)
+    inline bool stream_complete(const ClientConn* client, bool at_eof)
     {
         if (client->req.f.stream_body == net::http::Body::Chunked) return client->req.chunkdec.done();
         if (client->req.f.stream_body == net::http::Body::Length) return client->req.f.stream_left == 0;
@@ -215,7 +215,7 @@ namespace llmbridge::detail
     // (e.g. honouring the translator's cap) can't land on one backend only; the
     // backends keep their own idiomatic delivery (flush+pause vs kick+cap).
     // `in` is the upstream's raw buffer (consumed); `out` receives client SSE.
-    inline StreamStep stream_step(Connection* client, std::string& in, std::string& out, bool at_eof)
+    inline StreamStep stream_step(ClientConn* client, std::string& in, std::string& out, bool at_eof)
     {
         // Reused, never re-allocated
         std::string& sse_in = client->req.sse_scratch;

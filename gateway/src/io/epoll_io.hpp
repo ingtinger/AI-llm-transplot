@@ -27,27 +27,29 @@ namespace llmbridge::detail
         EpollIo& operator=(const EpollIo&) = delete;
         int run(); // until Engine::_stop
 
-        Sent send(Connection& c) noexcept override;
-        bool connect(Connection& u) noexcept override;
-        void set_read(Connection& c, bool on) noexcept override;
-        void close(Connection& c) noexcept override;
+        Sent send(ConnBase& c) noexcept override;
+        bool connect(UpstreamConn& u) noexcept override;
+        void set_read(ConnBase& c, bool on) noexcept override;
+        void close(ConnBase& c) noexcept override;
 
       private:
-        void sync_interest(Connection* c) noexcept; // the one writer of the interest mask
-        void arm_write(Connection* c) noexcept;
-        void disarm_write(Connection* c) noexcept;
+        void sync_interest(ConnBase* c) noexcept; // the one writer of the interest mask
+        void arm_write(ConnBase* c) noexcept;
+        void disarm_write(ConnBase* c) noexcept;
         void pause_accept() noexcept;
         void resume_accept() noexcept;
         void on_accept() noexcept;
-        void on_client_readable(Connection* c) noexcept;
-        void on_client_writable(Connection* c) noexcept;
-        void on_upstream_writable(Connection* u) noexcept;
-        void on_upstream_readable(Connection* u) noexcept;
-        bool drain_read(Connection* c) noexcept;
-        bool pump_write(Connection* c, bool* done) noexcept;
+        void on_client_readable(ClientConn* c) noexcept;
+        void on_client_writable(ClientConn* c) noexcept;
+        void on_upstream_writable(UpstreamConn* u) noexcept;
+        void on_upstream_readable(UpstreamConn* u) noexcept;
+        template <class C> bool drain_read(C* c) noexcept;
+        bool pump_write(ConnBase* c, bool* done) noexcept;
 #ifdef LLMBRIDGE_HAVE_TLS
-        bool tls_flush(Connection* u, bool* done) noexcept; // arms EPOLLOUT on a partial write
-        bool tls_drain_read(Connection* u) noexcept;
+        bool tls_flush(ConnBase* u, bool* done) noexcept; // arms EPOLLOUT on a partial write
+        template <class C> bool tls_read(C* c) noexcept;  // into the Session, plaintext to rbuf
+        bool tls_drain_read(ClientConn* c) noexcept;
+        bool tls_drain_read(UpstreamConn* u) noexcept;
 #endif
 
         /// Most bytes one readable event pulls off a socket. A drain to EAGAIN once staged

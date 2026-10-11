@@ -203,8 +203,7 @@ TEST(Rebuild, PrefaultMapsTheScratchPages)
 TEST(Rebuild, ARetiredBufferIsHandedToTheNextConnection)
 {
     llmbridge::Gateway gw(0, "127.0.0.1", 1);
-    llmbridge::Connection dying;
-    dying.is_client = false;
+    llmbridge::UpstreamConn dying;
     dying.out.stage().assign(1u << 20, 'k'); // a request, credential included, still in it
 #ifdef LLMBRIDGE_HAVE_TLS
     dying.tls_out.stage().assign(1u << 20, 'c'); // and its ciphertext
@@ -214,8 +213,7 @@ TEST(Rebuild, ARetiredBufferIsHandedToTheNextConnection)
     gw.retire_wbuf(&dying);
     EXPECT_EQ(gw.warm_bufs_for_test(), 1u);
     EXPECT_TRUE(dying.out.bytes().empty());
-    llmbridge::Connection born;
-    born.is_client = false;
+    llmbridge::UpstreamConn born;
     gw.adopt_warm(&born);
     EXPECT_EQ(gw.warm_bufs_for_test(), 0u);
     EXPECT_EQ(born.out.bytes().data(), pages);
@@ -231,19 +229,15 @@ TEST(Rebuild, ARetiredBufferIsHandedToTheNextConnection)
     EXPECT_EQ(std::count(born.out.bytes().data(), born.out.bytes().data() + (1u << 20), 'k'), 0)
         << "the credential must not survive into the next connection";
     EXPECT_EQ(gw.stats().warm_reuses, 1u);
-    // Too small to matter, a client's buffer, and a full list are all left alone.
-    llmbridge::Connection small;
-    small.is_client = false;
+    // Too small to matter, and a full list, are left alone. A client's buffer cannot be
+    // offered at all: retire_wbuf takes an UpstreamConn.
+    llmbridge::UpstreamConn small;
     small.out.stage().assign(1024, 'x');
     gw.retire_wbuf(&small);
-    llmbridge::Connection client;
-    client.out.stage().assign(1u << 20, 'x');
-    gw.retire_wbuf(&client);
     EXPECT_EQ(gw.warm_bufs_for_test(), 0u);
     for (size_t i = 0; i < llmbridge::Gateway::kWarmBufs + 2; ++i)
     {
-        llmbridge::Connection d;
-        d.is_client = false;
+        llmbridge::UpstreamConn d;
         d.out.stage().assign(1u << 17, 'x');
         gw.retire_wbuf(&d);
     }

@@ -11,7 +11,7 @@
 // keep-alive, multi-client + upstream-pool reuse, warm-up gating,
 // upstream-refused error, and clean shutdown.
 
-#include "core/conn.hpp" // Connection::s_live
+#include "core/conn.hpp" // ConnBase::s_live
 #include "gateway/gateway.hpp"
 
 #include <gtest/gtest.h>
@@ -3085,15 +3085,15 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyBackend,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
 
-// ── Bug-2 regression (deterministic, no sanitizer needed): every Connection the
+// ── Bug-2 regression (deterministic, no sanitizer needed): every connection the
 // gateway allocates must be freed. Tear down with 50 requests in flight (acquired
-// upstreams reachable only via peer, exactly what leaked) and assert the live
-// Connection count returns to baseline after ~Gateway.
+// upstreams reachable only via their client, exactly what leaked) and assert the live
+// connection count returns to baseline after ~Gateway.
 TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
 {
     for (const llmbridge::IoBackend backend : {llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring})
     {
-        const long base = llmbridge::Connection::s_live.load();
+        const long base = llmbridge::ConnBase::s_live.load();
         {
             TestBackend be;
             be.set_trickle(4); // slow replies so requests are still in flight at teardown
@@ -3114,7 +3114,7 @@ TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
             t.join();
             be.stop();
         } // ~Gateway runs here
-        EXPECT_EQ(llmbridge::Connection::s_live.load(), base) << be_name(backend);
+        EXPECT_EQ(llmbridge::ConnBase::s_live.load(), base) << be_name(backend);
     }
 }
 
@@ -3126,7 +3126,7 @@ TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
 // it also checks both workers together serve every request and free every conn.
 TEST(GatewayMultiWorker, ShardedConcurrentClientsNoRaceNoLeak)
 {
-    const long base = llmbridge::Connection::s_live.load();
+    const long base = llmbridge::ConnBase::s_live.load();
     {
         TestBackend be;
         be.start();
@@ -3159,7 +3159,7 @@ TEST(GatewayMultiWorker, ShardedConcurrentClientsNoRaceNoLeak)
         for (auto& g : gws) total += g->stats().requests; // safe: read after join
         EXPECT_EQ(total, static_cast<uint64_t>(M)); // the two workers together served all
     }
-    EXPECT_EQ(llmbridge::Connection::s_live.load(), base); // no leak across workers
+    EXPECT_EQ(llmbridge::ConnBase::s_live.load(), base); // no leak across workers
 }
 
 // Translation parity across both backends and all three dialects (2 x 3 = 6).

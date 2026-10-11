@@ -20,7 +20,7 @@ namespace llmbridge::detail
 {
 
     // Compiles to `false` in a build without TLS support.
-    bool Engine::upstream_is_tls(const Connection* u) const noexcept
+    bool Engine::upstream_is_tls(const UpstreamConn* u) const noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         return u->tls != nullptr;
@@ -37,14 +37,13 @@ namespace llmbridge::detail
     // strictly between the socket and those buffers. On a TLS connection `out` counts
     // plaintext fed into the Session (its bytes stay for a resend), and `tls_out`
     // holds the ciphertext on its way to the socket.
-    bool Engine::tls_required(const Connection* c) const noexcept
-    {
-        return c->is_client ? _tls.client_tls : upstream_of(c).tls;
-    }
+    bool Engine::tls_required(const ClientConn*) const noexcept { return _tls.client_tls; }
 
-    bool Engine::tls_invariant_ok(Connection* c) noexcept
+    bool Engine::tls_required(const UpstreamConn* u) const noexcept { return upstream_of(u).tls; }
+
+    bool Engine::tls_invariant_ok(ConnBase* c) noexcept
     {
-        if (c->tls || !tls_required(c)) return true;
+        if (c->tls || !visit(*c, [this](const auto& k) { return tls_required(&k); })) return true;
 
         // Must be encrypted and has no Session: refuse the write, the caller tears it
         // down. Unreachable today and kept on purpose: GATEWAY-INTERNALS.md 10d.
@@ -52,12 +51,12 @@ namespace llmbridge::detail
         return false;
     }
 
-    bool Engine::tls_attach_upstream(Connection* u) noexcept
+    bool Engine::tls_attach_upstream(UpstreamConn* u) noexcept
     {
         // The venue's own hostname, never _tls.sni_host. init_client drives both SNI
         // and SSL_set1_host from this, so a global value would verify every venue's
         // certificate against the first venue's name: a valid-cert-wrong-server hole
-        // across the table. u->upstream_slot is set at every caller before this runs.
+        // across the table. u->venue is set at every caller before this runs.
         u->tls = std::make_unique<net::tls::Session>();
         if (!u->tls->init_client(_tls_upstream_ctx, upstream_of(u).sni_host))
         {
@@ -67,7 +66,7 @@ namespace llmbridge::detail
         return true;
     }
 
-    bool Engine::tls_attach_client(Connection* c) noexcept
+    bool Engine::tls_attach_client(ClientConn* c) noexcept
     {
         c->tls = std::make_unique<net::tls::Session>();
         if (!c->tls->init_server(_tls_client_ctx))
@@ -81,7 +80,7 @@ namespace llmbridge::detail
         return true;
     }
 
-    void Engine::tls_pump_out(Connection* u) noexcept
+    void Engine::tls_pump_out(ConnBase* u) noexcept
     {
         // stage() is safe while a send SQE reads tls_out: it is then the back half.
         // Reserved once for what this pass moves. Growing by append cost a 4 MB
@@ -99,7 +98,7 @@ namespace llmbridge::detail
         if (unsent > _stats.tls_buffered_peak) _stats.tls_buffered_peak = unsent;
     }
 
-    void Engine::tls_push_out(Connection* u) noexcept
+    void Engine::tls_push_out(ConnBase* u) noexcept
     {
         // Feed as much plaintext as the Session accepts; its ciphertext lands straight
         // in tls_out's stage, behind any flight already staged: order is the wire's.
@@ -125,12 +124,13 @@ namespace llmbridge::detail
         u->tls->set_sink(nullptr);
     }
 
-    bool Engine::tls_out_flushed(const Connection* u) const noexcept
+    bool Engine::tls_out_flushed(const ConnBase* u) const noexcept
     {
         return u->out.idle() && u->tls_out.idle() && !u->tls->has_pending_output();
     }
 
-    bool Engine::tls_feed(Connection* u, const char* p, size_t n) noexcept
+    template <class C>
+    Engine::TlsIn Engine::tls_ingest(C* u, const char* p, size_t n, bool quiet_handshake) noexcept
     {
         const bool hs_was_done = u->tls->handshake_done();
         if (n > 0 &&
@@ -138,15 +138,14 @@ namespace llmbridge::detail
         {
             LB_WARN("TLS input refused ", *u, " handshake_done=", hs_was_done,
                     " err=", u->tls->last_error());
-            return false;
+            return TlsIn::Failed;
         }
         if (u->tls->want() == net::tls::Want::Error)
         {
             // The error is an OpenSSL reason plus a file path, no key material. A
             // client handshake failure is almost always a scanner, so it is DEBUG and
             // counted; anything else is actionable and WARN. GATEWAY-INTERNALS.md 10d.
-            const bool scanner_noise = u->is_client && !hs_was_done;
-            if (scanner_noise)
+            if (quiet_handshake && !hs_was_done)
             {
                 ++_stats.client_tls_handshake_failures;
                 LB_DEBUG("TLS failed ", *u, " during=handshake err=", u->tls->last_error());
@@ -154,7 +153,7 @@ namespace llmbridge::detail
             else
                 LB_WARN("TLS failed ", *u, " during=", hs_was_done ? "session" : "handshake",
                         " err=", u->tls->last_error());
-            return false;
+            return TlsIn::Failed;
         }
 
         // Plaintext into rbuf; framing and the SSE pump take over unchanged.
@@ -162,45 +161,54 @@ namespace llmbridge::detail
         size_t r;
         while ((r = u->tls->read_plaintext({buf, sizeof buf})) > 0)
         {
-            // The client's arrival stamp; harmless on an upstream, where nobody reads it.
-            if (u->ts_first_byte == 0) u->ts_first_byte = now_ns();
+            stamp_first_byte(*u);
             u->rbuf.append(reinterpret_cast<const char*>(buf), r);
         }
         if (u->tls->want() == net::tls::Want::Error)
         {
             LB_WARN("TLS read failed ", *u, " err=", u->tls->last_error());
-            return false;
+            return TlsIn::Failed;
         }
+        return !hs_was_done && u->tls->handshake_done() ? TlsIn::Handshook : TlsIn::Fed;
+    }
 
-        // Handshake completed on this feed. An upstream's request has waited in `out`
-        // for it; a client speaks first, so nothing is pending there and t2 is moot.
-        if (!hs_was_done && u->tls->handshake_done() && u->is_client)
+    bool Engine::tls_feed(ClientConn* c, const char* p, size_t n) noexcept
+    {
+        const TlsIn r = tls_ingest(c, p, n, /*quiet_handshake=*/true);
+        if (r == TlsIn::Handshook)
         {
             // The inbound handshake finishes before t0 (t0 is the framed request),
             // so it is invisible to every other number this file reports. Recorded
-            // here or it cannot be seen at all. Warm-up gated like the others.
+            // here or it cannot be seen at all. Warm-up gated like the others. A
+            // client speaks first, so nothing is pending.
             const int64_t now = now_ns();
-            LB_DEBUG("TLS established ", *u);
-            if (u->ts_accepted > 0 && now - _t_start >= _warmup_ns)
-                _stats.accept_tls.record(static_cast<uint64_t>(now - u->ts_accepted));
+            LB_DEBUG("TLS established ", *c);
+            if (c->ts_accepted > 0 && now - _t_start >= _warmup_ns)
+                _stats.accept_tls.record(static_cast<uint64_t>(now - c->ts_accepted));
         }
-        if (!hs_was_done && u->tls->handshake_done() && !u->is_client)
+        return r != TlsIn::Failed;
+    }
+
+    bool Engine::tls_feed(UpstreamConn* u, const char* p, size_t n) noexcept
+    {
+        const TlsIn r = tls_ingest(u, p, n, /*quiet_handshake=*/false);
+        if (r == TlsIn::Handshook)
         {
             // t2 belongs here for TLS, not at TCP connect. The wire cannot carry
             // the request until the handshake is done, so stamping t2 earlier put
             // the entire handshake inside upwrite-us (t3-t2) and left connect-us
             // reporting the TCP leg alone. See the attribution test in
-            // gateway/tests/gateway_tls_test.cpp.
+            // gateway/tests/gateway_tls_test.cpp. The request has waited in `out`.
             u->wire_ready = true;
-            if (u->peer) u->peer->req.f.ts_wire_ready = now_ns();
+            if (u->client) u->client->req.f.ts_wire_ready = now_ns();
             if (!u->out.idle()) tls_push_out(u);
         }
-        return true;
+        return r != TlsIn::Failed;
     }
 
 #endif // LLMBRIDGE_HAVE_TLS
 
-    bool Engine::upstream_request_sent(const Connection* u) const noexcept
+    bool Engine::upstream_request_sent(const UpstreamConn* u) const noexcept
     {
         if (u->send_inflight()) return false; // an SQE still reads the send buffer
         if (!u->out.idle()) return false;     // plaintext not fully handed over

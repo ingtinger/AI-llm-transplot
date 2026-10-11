@@ -21,7 +21,7 @@
 
 namespace
 {
-    using llmbridge::Connection;
+    using llmbridge::ClientConn;
     using llmbridge::detail::kTierTries;
     using llmbridge::detail::note_served_model;
     using llmbridge::detail::note_served_tier;
@@ -29,7 +29,7 @@ namespace
 
 TEST(ServedTier, GivesUpAfterFourTriesWithNothingFound)
 {
-    Connection c;
+    ClientConn c;
     const std::string no_tier = R"({"id":"x","choices":[{"delta":{"content":"hi"}}]})";
     for (int i = 0; i < 4; ++i)
     {
@@ -46,7 +46,7 @@ TEST(ServedTier, GivesUpAfterFourTriesWithNothingFound)
 
 TEST(ServedTier, FindsItInTheHeadOfAChunk)
 {
-    Connection c;
+    ClientConn c;
     const std::string chunk =
         R"({"id":"x","service_tier":"flex","choices":[{"delta":{"content":"hi"}}]})";
     note_served_tier(&c, chunk, /*tail=*/false);
@@ -56,7 +56,7 @@ TEST(ServedTier, FindsItInTheHeadOfAChunk)
 
 TEST(ServedTier, FindsItInTheTailOfANonStreamedBody)
 {
-    Connection c;
+    ClientConn c;
     // Far enough from the front that a head-only search (kTierHead) would miss it;
     // this is what the non-streaming caller passes tail=true for.
     const std::string padding(3000, ' ');
@@ -71,13 +71,13 @@ TEST(ServedTier, FindsItInTheTailOfANonStreamedBody)
 TEST(ServedTier, AToolInputBeforeTheUsageCannotNameIt)
 {
     // Raw JSON the model wrote, ahead of the reply's own usage block.
-    Connection c;
+    ClientConn c;
     note_served_tier(&c,
                      R"({"content":[{"type":"tool_use","input":{"service_tier":"priority"}}],)"
                      R"("usage":{"input_tokens":5,"service_tier":"standard"}})",
                      /*tail=*/true);
     EXPECT_EQ(std::string(c.req.f.served_tier.view()), "standard");
-    Connection q;
+    ClientConn q;
     note_served_tier(&q, R"({"choices":[{"delta":{"content":"\"service_tier\":\"x\""}}],)"
                          R"("service_tier":"flex"})",
                      /*tail=*/false);
@@ -86,7 +86,7 @@ TEST(ServedTier, AToolInputBeforeTheUsageCannotNameIt)
 
 TEST(ServedTier, OnceFoundIsNeverOverwritten)
 {
-    Connection c;
+    ClientConn c;
     const std::string first = R"({"service_tier":"flex","choices":[]})";
     note_served_tier(&c, first, /*tail=*/false);
     ASSERT_EQ(std::string(c.req.f.served_tier.view()), "flex");
@@ -103,7 +103,7 @@ TEST(ServedTier, OnceFoundIsNeverOverwritten)
 
 TEST(ServedTier, GivingUpIsPermanentEvenIfATierAppearsLater)
 {
-    Connection c;
+    ClientConn c;
     const std::string no_tier = R"({"choices":[{"delta":{"content":"x"}}]})";
     for (int i = 0; i < kTierTries; ++i) note_served_tier(&c, no_tier, /*tail=*/false);
     ASSERT_EQ(c.req.f.served_tier_tries, kTierTries);
@@ -119,21 +119,21 @@ TEST(ServedTier, GivingUpIsPermanentEvenIfATierAppearsLater)
 // kTierTries reads, and it reads only the top-level model of each event.
 TEST(ServedModel, ReadsTheTopLevelModelOfEachDialectAndNothingNested)
 {
-    Connection a;
+    ClientConn a;
     note_served_model(&a, "event: message_start\ndata: {\"type\":\"message_start\","
                           "\"message\":{\"id\":\"m\",\"model\":\"claude-x\"}}\n\n", true);
     EXPECT_EQ(std::string(a.req.f.served_model.view()), "claude-x");
 
-    Connection o;
+    ClientConn o;
     note_served_model(&o, "data: {\"id\":\"c\",\"meta\":{\"model\":\"decoy\"},\"model\":\"gpt-x\"}\n\n",
                       true);
     EXPECT_EQ(std::string(o.req.f.served_model.view()), "gpt-x");
 
-    Connection n;
+    ClientConn n;
     note_served_model(&n, R"({"choices":[{"message":{"model":"decoy"}}]})", false);
     EXPECT_EQ(n.req.f.served_model.n, 0);
     // A model in a later event of the first read is found; one in a ping is not a model.
-    Connection l;
+    ClientConn l;
     note_served_model(&l, "event: ping\ndata: {\"type\":\"ping\"}\n\n"
                           "data: {\"model\":\"later\"}\n\n", true);
     EXPECT_EQ(std::string(l.req.f.served_model.view()), "later");
@@ -141,20 +141,20 @@ TEST(ServedModel, ReadsTheTopLevelModelOfEachDialectAndNothingNested)
 
 TEST(ServedModel, GivesUpAfterFourTriesAndCutsAt64Bytes)
 {
-    Connection c;
+    ClientConn c;
     for (int i = 0; i < 10; ++i) note_served_model(&c, "data: {\"choices\":[]}\n\n", true);
     EXPECT_EQ(c.req.f.served_model_tries, kTierTries);
     note_served_model(&c, "data: {\"model\":\"late\"}\n\n", true);
     EXPECT_EQ(c.req.f.served_model.n, 0) << "giving up is permanent";
 
-    Connection t;
+    ClientConn t;
     note_served_model(&t, R"({"model":")" + std::string(100, 'm') + R"("})", false);
     EXPECT_EQ(std::string(t.req.f.served_model.view()), std::string(64, 'm'));
 }
 
 TEST(StreamChunk, WrapsWhatWasAppendedInOneHexSizedChunk)
 {
-    Connection c;
+    ClientConn c;
     c.req.f.stream_chunked_out = true;
     for (const size_t n : {size_t{1}, size_t{15}, size_t{16}, size_t{4122}, size_t{1} << 20})
     {

@@ -34,7 +34,7 @@ namespace llmbridge
     /// The field promises identity of "the leading bytes" and not this number.
     inline constexpr size_t kPrefixHashBytes = 4096;
 
-    struct Connection; // src/core/conn.hpp
+    struct UpstreamConn; // src/core/conn.hpp
     namespace detail
     {
         class Engine; // src/engine.hpp
@@ -130,8 +130,8 @@ namespace llmbridge
         /// Prefault the scratch buffers now and report how much of one is resident.
         size_t prefault_resident_bytes_for_test();
         /// Buffer rotation, callable from tests.
-        void retire_wbuf(Connection* u) noexcept;
-        void adopt_warm(Connection* u) noexcept;
+        void retire_wbuf(UpstreamConn* u) noexcept;
+        void adopt_warm(UpstreamConn* u) noexcept;
         void note_build(size_t need) noexcept; // counts a build the scratch could not hold
         [[nodiscard]] size_t warm_bufs_for_test() const noexcept;
 

@@ -31,6 +31,9 @@
 
 namespace llmbridge
 {
+    struct ConnBase;
+    struct ClientConn;
+    struct UpstreamConn;
     class UpstreamPool;
     template <class T> class Registry;
 }
@@ -59,8 +62,9 @@ namespace llmbridge::detail
         [[nodiscard]] size_t pooled_upstream_count() const noexcept;
         void set_pool_cap(size_t n) noexcept;
         size_t prefault_resident_bytes_for_test();
-        void retire_wbuf(Connection* u) noexcept;
-        void adopt_warm(Connection* u) noexcept;
+        void retire_wbuf(UpstreamConn* u) noexcept;
+        void adopt_warm(UpstreamConn* u) noexcept;
+        void free_conn(ConnBase* c) noexcept; // closed and unreachable: retire its buffers, delete it
         void note_build(size_t need) noexcept;
         void prefault(std::string& s) const; // reserve `_prefault_bytes` and touch every page
 
@@ -70,83 +74,96 @@ namespace llmbridge::detail
         bool _stream_backpressure = false; ///< IoCaps::stream_backpressure of the running backend
 
         // The request side (core/client.cpp).
-        void on_client_bytes(Connection* c) noexcept; // frame if idle, then bound what is buffered
-        void try_frame(Connection* c) noexcept;       // stamps t0, frames one request, dispatches it
-        void dispatch(Connection* client) noexcept;   // translate or rebuild, acquire, send
-        void gate_client_reads(Connection* c) noexcept; // the pipelining cap pauses, never closes
-        void client_gone(Connection* c) noexcept;       // EOF or a socket error on a client
-        void send_continue(Connection* c) noexcept;     // the interim 100, staged like any reply
-        void respond(Connection* client) noexcept;      // send what is owed; finish if it all went
-        void finish(Connection* client) noexcept;       // a staged reply is on the wire
-        void abort_pair(Connection* client) noexcept;
-        void fail_request(Connection* client, int code, const char* why) noexcept; // failover, else reply
+        void on_client_bytes(ClientConn* c) noexcept; // frame if idle, then bound what is buffered
+        void try_frame(ClientConn* c) noexcept;       // stamps t0, frames one request, dispatches it
+        void dispatch(ClientConn* client) noexcept;   // translate or rebuild, acquire, send
+        void gate_client_reads(ClientConn* c) noexcept; // the pipelining cap pauses, never closes
+        void client_gone(ClientConn* c) noexcept;       // EOF or a socket error on a client
+        void send_continue(ClientConn* c) noexcept;     // the interim 100, staged like any reply
+        void respond(ClientConn* client) noexcept;      // send what is owed; finish if it all went
+        void finish(ClientConn* client) noexcept;       // a staged reply is on the wire
+        void abort_pair(ClientConn* client) noexcept;
+        void fail_request(ClientConn* client, int code, const char* why) noexcept; // failover, else reply
         /// Reply `code` and abandon any upstream. `why` is for the log; `detail` is what
         /// a 4xx shows the client, never a policy's reason.
-        void error_respond(Connection* client, int code, const char* why,
+        void error_respond(ClientConn* client, int code, const char* why,
                            const char* detail = nullptr) noexcept;
-        Decision policy_decision(Connection* c, const net::http::Message& m) noexcept;
+        Decision policy_decision(ClientConn* c, const net::http::Message& m) noexcept;
         /// The bookkeeping half of a close: unpaired, deregistered, doomed. Returns a
         /// client's upstream, which the backend closes too.
-        Connection* forget(Connection* c) noexcept;
+        ConnBase* forget(ConnBase& c) noexcept;
+        ConnBase* forget(ClientConn* c) noexcept;
+        ConnBase* forget(UpstreamConn* u) noexcept;
 
         // The upstream side (core/upstream.cpp).
-        [[nodiscard]] Connection* new_upstream(int slot) noexcept; // its address parsed, not open
-        Connection* acquire_upstream(int slot) noexcept;           // pooled, else a fresh connect
-        bool retry_upstream(Connection* u) noexcept;               // once, on a fresh connection
-        void release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
-        [[nodiscard]] bool pool_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
-        bool upstream_failed(Connection* client, int status, const char* why) noexcept; // failover
-        [[nodiscard]] Retry failover_target(Connection* client, int status, const char* why) noexcept;
+        [[nodiscard]] UpstreamConn* new_upstream(int slot) noexcept; // its address parsed, not open
+        UpstreamConn* acquire_upstream(int slot) noexcept;         // pooled, else a fresh connect
+        bool retry_upstream(UpstreamConn* u) noexcept;             // once, on a fresh connection
+        void release_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept;
+        [[nodiscard]] bool pool_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept;
+        bool upstream_failed(ClientConn* client, int status, const char* why) noexcept; // failover
+        [[nodiscard]] Retry failover_target(ClientConn* client, int status, const char* why) noexcept;
         enum class UpFail : uint8_t
         {
             Eof,
             Tls,
             Write,
         };
-        void upstream_lost(Connection* u, UpFail f) noexcept; // retry, fail over, else a 502
-        void on_upstream_eof(Connection* u, bool tls_failed) noexcept;
-        void on_upstream_bytes(Connection* u) noexcept; // the response, its head parsed once
-        void on_response(Connection* u, const net::http::ResponseHead& h, std::string_view body,
+        void upstream_lost(UpstreamConn* u, UpFail f) noexcept; // retry, fail over, else a 502
+        void on_upstream_eof(UpstreamConn* u, bool tls_failed) noexcept;
+        void on_upstream_bytes(UpstreamConn* u) noexcept; // the response, its head parsed once
+        void on_response(UpstreamConn* u, const net::http::ResponseHead& h, std::string_view body,
                          size_t total_len) noexcept;
-        static void note_quota(Connection* client, const net::http::ResponseHead& h) noexcept;
-        static void note_venue_req_id(Connection* client, std::string_view head) noexcept;
+        static void note_quota(ClientConn* client, const net::http::ResponseHead& h) noexcept;
+        static void note_venue_req_id(ClientConn* client, std::string_view head) noexcept;
         /// Read the kernel's RTT to the venue that just answered.
-        static void note_upstream_rtt(Connection* client, const Connection* u) noexcept;
-        static void note_upstream_error(Connection* client, const net::http::ResponseHead& h,
+        static void note_upstream_rtt(ClientConn* client, const UpstreamConn* u) noexcept;
+        static void note_upstream_error(ClientConn* client, const net::http::ResponseHead& h,
                                         std::string_view body) noexcept;
-        [[nodiscard]] const Upstream& upstream_of(const Connection* c) const noexcept;
-        [[nodiscard]] bool upstream_is_tls(const Connection* u) const noexcept;
+        [[nodiscard]] const Upstream& upstream_of(const ClientConn* c) const noexcept; // its request's venue
+        [[nodiscard]] const Upstream& upstream_of(const UpstreamConn* u) const noexcept;
+        [[nodiscard]] const Upstream& venue_at(int slot) const noexcept; // 0 when out of range
+        [[nodiscard]] bool upstream_is_tls(const UpstreamConn* u) const noexcept;
         /// Has the request left the machine on every transport it uses? Pooling one
         /// that has not truncates the next client's request (ProxyEarlyResponse).
-        [[nodiscard]] bool upstream_request_sent(const Connection* u) const noexcept;
+        [[nodiscard]] bool upstream_request_sent(const UpstreamConn* u) const noexcept;
 
         // Streams (core/stream.cpp).
-        void begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept;
-        void stream_pump(Connection* u) noexcept;       // translate new upstream body bytes
-        void stream_flush(Connection* client) noexcept; // write them; pause, or cap, a slow client
-        void stream_on_upstream_eof(Connection* u) noexcept;
-        void finalize_stream(Connection* client) noexcept;
-        static void stream_warn_if_encoded(const Connection* client, const net::http::ResponseHead& h) noexcept;
-        void stream_record_latency(const Connection* client) noexcept;
-        void stream_truncate(Connection* client) noexcept; // no [DONE]: the three mutations together
+        void begin_stream(UpstreamConn* u, const net::http::ResponseHead& h) noexcept;
+        void stream_pump(UpstreamConn* u) noexcept;     // translate new upstream body bytes
+        void stream_flush(ClientConn* client) noexcept; // write them; pause, or cap, a slow client
+        void stream_on_upstream_eof(UpstreamConn* u) noexcept;
+        void finalize_stream(ClientConn* client) noexcept;
+        static void stream_warn_if_encoded(const ClientConn* client, const net::http::ResponseHead& h) noexcept;
+        void stream_record_latency(const ClientConn* client) noexcept;
+        void stream_truncate(ClientConn* client) noexcept; // no [DONE]: the three mutations together
 
         // The sink (core/sink.cpp) and the sweep (core/sweep.cpp).
-        void sink_capture(Connection* c) noexcept;
-        [[nodiscard]] const char* capture_model(Connection* c) noexcept; // why to refuse, or null
-        void sink_emit(Connection* c, int status, bool streamed) noexcept;
+        void sink_capture(ClientConn* c) noexcept;
+        [[nodiscard]] const char* capture_model(ClientConn* c) noexcept; // why to refuse, or null
+        void sink_emit(ClientConn* c, int status, bool streamed) noexcept;
         void sweep_idle() noexcept; // heartbeat, pool reaping and every timeout, one walk
-        void sweep_client(Connection* c, int64_t now, bool busy) noexcept;
+        void sweep_client(ClientConn* c, int64_t now, bool busy) noexcept;
 
 #ifdef LLMBRIDGE_HAVE_TLS
-        // Both legs (core/transport.cpp). The parameter is `c`: client conns too.
-        [[nodiscard]] bool tls_required(const Connection* c) const noexcept;
-        [[nodiscard]] bool tls_invariant_ok(Connection* c) noexcept; // false: tear it down
-        bool tls_attach_upstream(Connection* u) noexcept;
-        bool tls_attach_client(Connection* c) noexcept; // false: drop it, never answer in plaintext
-        void tls_pump_out(Connection* c) noexcept;       // the Session's ciphertext into tls_out
-        bool tls_feed(Connection* c, const char* p, size_t n) noexcept; // false: fatal
-        void tls_push_out(Connection* c) noexcept;       // unfed plaintext into the Session
-        [[nodiscard]] bool tls_out_flushed(const Connection* c) const noexcept;
+        // Both legs (core/transport.cpp): ConnBase where the two kinds are alike.
+        [[nodiscard]] bool tls_required(const ClientConn* c) const noexcept;
+        [[nodiscard]] bool tls_required(const UpstreamConn* u) const noexcept;
+        [[nodiscard]] bool tls_invariant_ok(ConnBase* c) noexcept; // false: tear it down
+        bool tls_attach_upstream(UpstreamConn* u) noexcept;
+        bool tls_attach_client(ClientConn* c) noexcept; // false: drop it, never answer in plaintext
+        void tls_pump_out(ConnBase* c) noexcept;        // the Session's ciphertext into tls_out
+        bool tls_feed(ClientConn* c, const char* p, size_t n) noexcept; // false: fatal
+        bool tls_feed(UpstreamConn* u, const char* p, size_t n) noexcept;
+        enum class TlsIn : uint8_t
+        {
+            Failed,
+            Fed,
+            Handshook, ///< the handshake completed on this feed
+        };
+        template <class C> TlsIn tls_ingest(C* c, const char* p, size_t n, bool quiet_handshake) noexcept;
+        void tls_push_out(ConnBase* c) noexcept;        // unfed plaintext into the Session
+        [[nodiscard]] bool tls_out_flushed(const ConnBase* c) const noexcept;
 #endif
 
         // Re-resolution (resolve.cpp).
@@ -212,9 +229,11 @@ namespace llmbridge::detail
 
         int _listen_fd = -1;
         int64_t _accept_resume_ns = 0; ///< listener paused until then; 0 when accepting
-        /// Every Connection is in exactly one: live clients, live upstreams (pooled ones
+        /// Every connection is in exactly one: live clients, live upstreams (pooled ones
         /// too), or closed and awaiting the free (GATEWAY-INTERNALS.md 7).
-        std::unique_ptr<Registry<Connection>> _clients, _upconns, _doomed;
+        std::unique_ptr<Registry<ClientConn>> _clients;
+        std::unique_ptr<Registry<UpstreamConn>> _upconns;
+        std::unique_ptr<Registry<ConnBase>> _doomed;
         std::unique_ptr<UpstreamPool> _pool;
         uint64_t _next_client_id = 1;
         /// The rebuilt request, swapped with an upstream's `out` so buffers rotate.

@@ -27,6 +27,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 
 #include "io/epoll_io.hpp"
 #include "io/uring_io.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
@@ -82,9 +83,9 @@ namespace llmbridge::detail
                     ") but its mode does not build its own request target; only "
                     "--translate azure may carry one");
         }
-        _clients = std::make_unique<Registry<Connection>>();
-        _upconns = std::make_unique<Registry<Connection>>();
-        _doomed = std::make_unique<Registry<Connection>>();
+        _clients = std::make_unique<Registry<ClientConn>>();
+        _upconns = std::make_unique<Registry<UpstreamConn>>();
+        _doomed = std::make_unique<Registry<ConnBase>>();
         _pool = std::make_unique<UpstreamPool>();
         _pool->init(_upstreams.size(), Gateway::kMaxIdleUpstreams);
         _rr_inflight.assign(_upstreams.size(), 0);
@@ -171,21 +172,25 @@ namespace llmbridge::detail
         if (_rr.thread.joinable()) _rr.thread.join();
         // Every connection is in one registry, pooled and in-flight upstreams included,
         // so this frees each once. The pool's links into the freed are never read again.
-        const auto free_conn = [](Connection* c) {
+        const auto release = [](auto* c) {
             if (c->fd >= 0) ::close(c->fd);
-            delete c;
+            visit(*c, [](auto& k) { delete &k; });
         };
-        _clients->clear(free_conn);
-        _upconns->clear(free_conn);
-        _doomed->clear(free_conn);
+        _clients->clear(release);
+        _upconns->clear(release);
+        _doomed->clear(release);
         if (_listen_fd >= 0) ::close(_listen_fd);
     }
 
-    const Upstream& Engine::upstream_of(const Connection* c) const noexcept
+    const Upstream& Engine::venue_at(int slot) const noexcept
     {
-        const size_t i = (c->upstream_slot >= 0) ? static_cast<size_t>(c->upstream_slot) : 0;
+        const size_t i = (slot >= 0) ? static_cast<size_t>(slot) : 0;
         return _upstreams[i < _upstreams.size() ? i : 0];
     }
+
+    const Upstream& Engine::upstream_of(const ClientConn* c) const noexcept { return venue_at(c->upstream_slot); }
+
+    const Upstream& Engine::upstream_of(const UpstreamConn* u) const noexcept { return venue_at(u->venue); }
 
     uint16_t Engine::bound_port() const noexcept
     {
@@ -200,7 +205,7 @@ namespace llmbridge::detail
     {
         if (needle.empty()) return false;
         bool found = false;
-        _pool->for_each([&](const Connection* u) {
+        _pool->for_each([&](const UpstreamConn* u) {
             found = found || u->out.bytes().find(needle) != std::string::npos;
         });
         return found;
@@ -258,9 +263,9 @@ namespace llmbridge::detail
         return resident;
     }
 
-    void Engine::retire_wbuf(Connection* u) noexcept
+    void Engine::retire_wbuf(UpstreamConn* u) noexcept
     {
-        if (u->is_client || _warm.size() >= Gateway::kWarmBufs || u->out.capacity() < Gateway::kWarmMin) return;
+        if (_warm.size() >= Gateway::kWarmBufs || u->out.capacity() < Gateway::kWarmMin) return;
         // A closing connection may still hold a request, credential included; the pool
         // scrub runs at release, and a connection closed mid-request never got there.
         // The ciphertext is the same request encrypted, so it is scrubbed too. Freed
@@ -275,7 +280,7 @@ namespace llmbridge::detail
         _warm.push_back(std::move(set));
     }
 
-    void Engine::adopt_warm(Connection* u) noexcept
+    void Engine::adopt_warm(UpstreamConn* u) noexcept
     {
         if (_warm.empty()) return;
         WarmSet set = std::move(_warm.back());
@@ -285,6 +290,16 @@ namespace llmbridge::detail
         u->tls_out.adopt(std::move(set.tls_out));
 #endif
         ++_stats.warm_reuses;
+    }
+
+    // Only an upstream's buffers are worth keeping: they hold the rebuilt requests.
+    void Engine::free_conn(ConnBase* c) noexcept
+    {
+        _doomed->remove(c);
+        visit(*c, [this](auto& k) {
+            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(k)>, UpstreamConn>) retire_wbuf(&k);
+            delete &k;
+        });
     }
 
     void Engine::attach(IoOps* io, const IoCaps& caps) noexcept
