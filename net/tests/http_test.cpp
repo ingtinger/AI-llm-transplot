@@ -1088,3 +1088,35 @@ TEST(ProviderHeads, RateLimitHeadsNameTheQuota)
         EXPECT_EQ(h.event_stream, std::string_view(p.name) == "anthropic_stream") << p.name;
     }
 }
+
+// The framer frames every provider reply exactly as parse_response does, byte by byte,
+// and parses the head once however many reads the body takes (NP1).
+TEST(ResponseFramer, FramesLikeParseResponseAndParsesTheHeadOnce)
+{
+    for (const ProviderReply& p : provider_replies())
+    {
+        llmbridge::net::http::ResponseDecoder dec;
+        const auto want = llmbridge::net::http::parse_response(p.wire, dec);
+        llmbridge::net::http::ResponseFramer f;
+        std::string buf;
+        llmbridge::net::http::ParsedResponse got;
+        uint64_t parses_at_head = 0;
+        for (const char c : p.wire)
+        {
+            buf += c;
+            const FrameStatus hs = f.head(buf);
+            if (hs != FrameStatus::Complete) continue;
+            if (!parses_at_head) parses_at_head = f.head_parses();
+            got = f.message(buf);
+            if (got.status != FrameStatus::NeedMore) break;
+        }
+        EXPECT_EQ(got.status, want.status) << p.name;
+        EXPECT_EQ(got.body, want.body) << p.name;
+        EXPECT_EQ(got.total_len, want.total_len) << p.name;
+        EXPECT_EQ(f.head_parses(), parses_at_head) << p.name << ": the head was parsed again";
+        f.reset();
+        EXPECT_EQ(f.head(p.wire), FrameStatus::Complete) << p.name;
+        EXPECT_EQ(f.message(p.wire).status, want.status) << p.name;
+        EXPECT_EQ(f.head_parses(), parses_at_head + 1) << p.name;
+    }
+}

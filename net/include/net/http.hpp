@@ -584,6 +584,42 @@ namespace llmbridge::net::http
         }
     };
 
+    // The body of a response whose head is already parsed into `r.head`: complete, or
+    // NeedMore, or an error. Shared by parse_response and ResponseFramer.
+    inline void frame_response_body(std::string_view buf, ResponseDecoder& st, ParsedResponse& r) noexcept
+    {
+        // An interim 1xx is not the answer, and framing one as it orphans the real
+        // response on a pooled connection. Read-until-close cannot be pooled.
+        if (r.head.status < 200 || r.head.body == Body::UntilClose)
+        {
+            r.status = FrameStatus::Error;
+            return;
+        }
+        if (r.head.body != Body::Chunked)
+        {
+            const size_t len = r.head.body == Body::Length ? r.head.content_length : 0;
+            const size_t need = r.head.header_len + len;
+            if (buf.size() < need) return; // NeedMore
+            r.body = buf.substr(r.head.header_len, len); // no copy
+            r.total_len = need;
+            r.status = FrameStatus::Complete;
+            return;
+        }
+        // Feed only the bytes that arrived since the last call; `st` is reset between
+        // responses on a pooled connection.
+        const std::string_view after = buf.substr(r.head.header_len);
+        if (!st.dec.done() && st.fed < after.size())
+        {
+            if (!st.dec.feed(after.substr(st.fed), st.body)) { r.status = FrameStatus::Error; return; }
+            st.fed = st.dec.consumed();
+        }
+        if (st.body.size() > kMaxBodyLen) { r.status = FrameStatus::Error; return; }
+        if (!st.dec.done()) return; // NeedMore
+        r.body = st.body;
+        r.total_len = r.head.header_len + st.dec.consumed();
+        r.status = FrameStatus::Complete;
+    }
+
     // Re-runnable like parse_request: NeedMore until the whole message is present.
     [[nodiscard]] inline ParsedResponse parse_response(std::string_view buf, ResponseDecoder& st,
                                                        bool head_request = false) noexcept
@@ -592,39 +628,47 @@ namespace llmbridge::net::http
         const FrameStatus hs = parse_response_head(buf, r.head, head_request);
         if (hs == FrameStatus::NeedMore) return r; // status stays NeedMore
         if (hs == FrameStatus::Error) { r.status = FrameStatus::Error; return r; }
-
-        // An interim 1xx is not the answer, and framing one as it orphans the real
-        // response on a pooled connection. Read-until-close cannot be pooled.
-        if (r.head.status < 200 || r.head.body == Body::UntilClose)
-        {
-            r.status = FrameStatus::Error;
-            return r;
-        }
-
-        if (r.head.body != Body::Chunked)
-        {
-            const size_t len = r.head.body == Body::Length ? r.head.content_length : 0;
-            const size_t need = r.head.header_len + len;
-            if (buf.size() < need) return r; // NeedMore
-            r.body = buf.substr(r.head.header_len, len); // no copy
-            r.total_len = need;
-            r.status = FrameStatus::Complete;
-            return r;
-        }
-
-        // Feed only the bytes that arrived since the last call; `st` is reset between
-        // responses on a pooled connection.
-        const std::string_view after = buf.substr(r.head.header_len);
-        if (!st.dec.done() && st.fed < after.size())
-        {
-            if (!st.dec.feed(after.substr(st.fed), st.body)) { r.status = FrameStatus::Error; return r; }
-            st.fed = st.dec.consumed();
-        }
-        if (st.body.size() > kMaxBodyLen) { r.status = FrameStatus::Error; return r; }
-        if (!st.dec.done()) return r; // NeedMore
-        r.body = st.body;
-        r.total_len = r.head.header_len + st.dec.consumed();
-        r.status = FrameStatus::Complete;
+        frame_response_body(buf, st, r);
         return r;
     }
+
+    // One response read across many reads: the head is parsed once and cached, and its
+    // Body kind frames the rest. reset() between responses on a pooled connection.
+    class ResponseFramer
+    {
+      public:
+        /// NeedMore until the head is buffered; Complete from the cache after that.
+        FrameStatus head(std::string_view buf, bool head_request = false) noexcept
+        {
+            if (_have_head) return FrameStatus::Complete;
+            const FrameStatus s = parse_response_head(buf, _r.head, head_request);
+            ++_head_parses;
+            _have_head = s == FrameStatus::Complete;
+            return s;
+        }
+        /// The whole message, framed by the cached head. Call after head() is Complete.
+        ParsedResponse message(std::string_view buf) noexcept
+        {
+            ParsedResponse r;
+            r.head = _r.head;
+            frame_response_body(buf, _dec, r);
+            return r;
+        }
+        [[nodiscard]] const ResponseHead& h() const noexcept { return _r.head; }
+        /// Parses run, complete or not, over this framer's life: one per response once
+        /// the head has arrived whole.
+        [[nodiscard]] uint64_t head_parses() const noexcept { return _head_parses; }
+        void reset() noexcept
+        {
+            _r = ParsedResponse{};
+            _have_head = false;
+            _dec.reset();
+        }
+
+      private:
+        ParsedResponse _r{};
+        ResponseDecoder _dec;
+        uint64_t _head_parses = 0;
+        bool _have_head = false;
+    };
 } // namespace llmbridge::net::http
