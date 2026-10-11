@@ -301,6 +301,9 @@ namespace
         // Shrink the receive window on accepted sockets, so the gateway's write to
         // this backend blocks after a few hundred KB instead of many MB.
         void set_small_rcvbuf(int b) { _rcvbuf = b; }
+        // After each complete reply, wait `ms`, then close: the end of a close-delimited
+        // body arrives as its own event, after the body has gone on.
+        void set_close_after_reply_ms(int ms) { _close_after_reply_ms = ms; }
         int requests_seen() const { return _requests_seen.load(); }
         void clear_last_request()
         {
@@ -485,6 +488,12 @@ namespace
                     nanosleep(&ts, nullptr);
                     (void)!::write(c, _late.data(), _late.size());
                 }
+                if (_close_after_reply_ms > 0)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(_close_after_reply_ms));
+                    ::close(c);
+                    return;
+                }
                 if (_close_after_first) { ::close(c); return; } // drop the "idle" keep-alive
                 if (_close_first_n > 0 && conn_index < _close_first_n) { ::close(c); return; }
                 if (!m.keep_alive) { ::close(c); return; }
@@ -507,6 +516,7 @@ namespace
         int _close_first_n = 0;
         std::atomic<int> _accepted{0};
         int _stall = 0;
+        int _close_after_reply_ms = 0;
         bool _reply_before_read = false;
         int _reset_after_reply_ms = 0;
         int _rcvbuf = 0;
@@ -6650,6 +6660,26 @@ class ProxyForwardStream : public ProxyIT,
                            public ::testing::WithParamInterface<llmbridge::IoBackend>
 {
 };
+
+// A close-delimited stream ends at the provider's EOF. Here the EOF comes after the
+// body has reached the client, so nothing else is left to flush the terminal chunk.
+TEST_P(ProxyForwardStream, ACloseDelimitedStreamEndsWhenTheProviderClosesLater)
+{
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Connection: close\r\n\r\n" + openai_sse_events());
+    _backend.set_close_after_reply_ms(150);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    const std::string got = c.recv_chunked(3000);
+    ASSERT_FALSE(got.empty()) << "no terminal chunk after the provider's EOF";
+    EXPECT_NE(got.find("data: [DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 1u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
 
 // Usage survives a stream long enough that the tail is trimmed many times. Nothing
 // exercised the trim path before this, so its bound could be changed without a test
