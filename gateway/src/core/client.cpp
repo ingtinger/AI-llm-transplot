@@ -99,7 +99,9 @@ namespace llmbridge::detail
         if (c->client_frame_want && c->rbuf.size() < c->client_frame_want) return;
         const int64_t t0 = now_ns();
         net::http::Message m;
-        const auto st = net::http::parse_request(c->rbuf, m);
+        // The one header walk: framing, credentials, Expect and Connection together.
+        HeadFacts facts;
+        const auto st = net::http::parse_request(c->rbuf, m, HeadReader{c->rbuf, _strip_headers, facts});
         if (st == net::http::FrameStatus::NeedMore)
         {
             if (m.total_len && !c->client_frame_want)
@@ -107,9 +109,7 @@ namespace llmbridge::detail
                 c->client_frame_want = m.total_len;
                 c->rbuf.reserve(m.total_len);
                 // No body byte yet: the client is waiting on us, not the network.
-                if (c->rbuf.size() <= m.header_len &&
-                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)))
-                    send_continue(c);
+                if (c->rbuf.size() <= m.header_len && facts.expect == 2) send_continue(c);
             }
             return;
         }
@@ -123,6 +123,7 @@ namespace llmbridge::detail
         if (!net::http::request_line_ok(c->rbuf)) return error_respond(c, 400, "request line");
 
         c->msg = m;
+        c->req.f.head = facts;
         c->req.f.client_upload_ns = span_since(c->ts_first_byte, t0);
         c->req.f.client_conn_reused = c->ever_framed;
         c->req.f.client_conn_setup_ns = c->req.f.client_conn_reused ? 0 : span_since(c->ts_accepted, t0);
@@ -173,14 +174,15 @@ namespace llmbridge::detail
         const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
         if (c->req.f.translate_body)
         {
-            const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
+            const std::string_view head(c->rbuf.data(), c->msg.header_len);
             const char* why = "";
-            if (!build_translated_request(up, c->req.f.effective_dialect, body, client_hdrs, _strip_headers,
+            if (!build_translated_request(up, c->req.f.effective_dialect, body, head, c->req.f.head,
                                           _rebuild, _xlate, why, c->req.f.model_override.view(),
                                           &c->req.f.wants_usage))
             {
                 // A credential is never echoed: it would land in a JSON body unescaped.
                 if (why[0] == 't') return error_respond(c, 400, "translate", translate_failure(body));
+                if (why[0] == 'n') return error_respond(c, 400, "no credential", refuse::kNoCredential);
                 return error_respond(c, 400, "malformed credential",
                                      why[0] == 'b' ? refuse::kBedrockCredential : refuse::kCredential);
             }
@@ -199,11 +201,10 @@ namespace llmbridge::detail
                 rewritten = _xlate;
                 c->req.f.asked_tier.set(had); // `had` points into rbuf, reused before the sink
             }
-            // A venue with a base path needs an origin-form target to prefix.
-            if (!request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
-                                 c->msg.header_len, _strip_headers, up.host_hdr,
-                                 up.base_path, rewritten, _rebuild))
-                return error_respond(c, 400, "request target not origin-form");
+            if (const char* bad = build_forward(std::string_view(c->rbuf.data(), c->msg.total_len),
+                                                c->msg.header_len, c->req.f.head, _strip_headers,
+                                                up.host_hdr, up.base_path, rewritten, _rebuild))
+                return error_respond(c, 400, bad);
         }
 
         c->req.f.phase = Phase::Dispatched; // from here until a response byte, failover may redo it

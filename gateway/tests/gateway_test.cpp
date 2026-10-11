@@ -13,6 +13,7 @@
 
 #include "core/conn.hpp" // ConnBase::s_live
 #include "gateway/gateway.hpp"
+#include "gateway/refusals.hpp"
 
 #include <gtest/gtest.h>
 
@@ -10730,4 +10731,131 @@ TEST_P(ProxyRoute, ThePoolCapCountsConnectionsNotVenues)
     a.stop();
     b.stop();
     c.stop();
+}
+
+// ── What a forwarded request drops ─────────────
+
+class ProxyHop : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+// The client's Connection header and the hop-by-hop headers speak for its own hop.
+// Forwarded, `Connection: close` made the provider close a connection the gateway
+// could have pooled, and an `Upgrade` invited a 101 the gateway cannot relay. They are
+// dropped, with any header the client's Connection names.
+TEST_P(ProxyHop, AByteForwardDropsTheClientsHopByHopHeaders)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const std::string req = openai_request_hdrs(
+        "hi", "Connection: keep-alive, X-Hop-Secret\r\nX-Hop-Secret: s3cret\r\n"
+              "Keep-Alive: timeout=5\r\nTE: trailers\r\nUpgrade: h2c\r\n"
+              "Proxy-Connection: keep-alive\r\nTrailer: X-Sum\r\nX-Kept: k\r\n");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(req));
+    ASSERT_EQ(c.recv_status(), 200);
+    const std::string up = _backend.last_request();
+    for (const char* gone : {"Connection:", "X-Hop-Secret", "s3cret", "Keep-Alive:", "TE:",
+                             "Upgrade:", "Proxy-Connection:", "Trailer:"})
+        EXPECT_EQ(up.find(gone), std::string::npos) << gone << " went upstream:\n" << up;
+    EXPECT_NE(up.find("\r\nX-Kept: k\r\n"), std::string::npos) << up;
+    const std::string body = req.substr(req.find("\r\n\r\n") + 4);
+    EXPECT_EQ(up.substr(up.size() - body.size()), body) << up;
+}
+
+// A client that closes after each request no longer costs the provider leg a fresh
+// connection: the upstream is pooled on its own response alone.
+TEST_P(ProxyHop, ClientsThatCloseStillShareOnePooledUpstream)
+{
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    for (int i = 0; i < 3; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(make_request("hello", /*keep_alive=*/false)));
+        ASSERT_EQ(c.recv_status(), 200) << i;
+        EXPECT_TRUE(c.wait_closed()) << "the client's own close is still honoured";
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 1u);
+    EXPECT_EQ(_gw->stats().upstream_reused, 2u);
+}
+
+// An HTTP/1.0 request goes upstream as 1.1, so the provider keeps the connection.
+TEST_P(ProxyHop, AnHttp10RequestGoesUpstreamAsHttp11)
+{
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    for (int i = 0; i < 2; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.0\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"));
+        ASSERT_EQ(c.recv_status(), 200) << i;
+        EXPECT_TRUE(c.wait_closed()) << "an HTTP/1.0 client is still closed after its reply";
+    }
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.rfind("POST /v1/chat/completions HTTP/1.1\r\n", 0), 0u) << up;
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 1u);
+}
+
+// The client's dialect came from substrings of a request line cut at 128 bytes, so an
+// OpenAI Assistants path ending in /messages read as Anthropic and an OpenAI venue
+// refused it with "no translator". Exact routes on the full target byte-forward it.
+TEST_P(ProxyHop, AnOpenAiPathEndingInMessagesIsByteForwarded)
+{
+    _backend.set_response(http_ok(R"({"id":"msg_1","object":"thread.message"})"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const std::string body = R"({"role":"user","content":"hi"})";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send("POST /v1/threads/thread_abc/messages HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_EQ(_backend.last_request().rfind("POST /v1/threads/thread_abc/messages HTTP/1.1\r\n", 0), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyHop,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));
+
+// The auth scheme is case-insensitive (RFC 9110 11.1): `BEARER k` was not mapped, so the
+// provider got no key and answered 401.
+TEST_P(ProxyAuth, TheBearerSchemeIsCaseInsensitive)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: BEARER sk-upper\r\n")));
+    ASSERT_EQ(c.recv_status(), 200);
+    EXPECT_NE(_backend.last_request().find("\r\nx-api-key: sk-upper\r\n"), std::string::npos)
+        << _backend.last_request();
+}
+
+// The AzureOpenAI SDK sends its key as `api-key`, which was not read: the request was
+// refused as "control characters are refused", which named the wrong problem.
+TEST_P(ProxyAzure, AnApiKeyHeaderIsTheCredential)
+{
+    _backend.set_response(http_ok(R"({"choices":[]})"));
+    start_azure();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("ping", "api-key: AZKEY\r\n")));
+    ASSERT_EQ(c.recv_status(), 200);
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("\r\napi-key: AZKEY\r\n"), std::string::npos) << up;
+    EXPECT_EQ(up.find("api-key: AZKEY"), up.rfind("api-key: AZKEY")) << "sent twice: " << up;
+}
+
+TEST_P(ProxyAzure, NoCredentialIsNamedAsMissing)
+{
+    _backend.set_response(http_ok(R"({"choices":[]})"));
+    start_azure();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("ping", "")));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 400) << r;
+    EXPECT_NE(r.find(llmbridge::refuse::kNoCredential), std::string::npos) << r;
+    EXPECT_EQ(_backend.requests_seen(), 0);
 }

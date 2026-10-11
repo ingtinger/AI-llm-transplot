@@ -13,7 +13,7 @@
 #include "core/io.hpp"
 #include "core/limits.hpp"
 #include "core/registry.hpp"
-#include "net/socket_util.hpp" // tcp_rtt
+#include "net/socket_util.hpp"
 #include "request.hpp"
 #include "response.hpp"
 #include "scan.hpp"
@@ -267,9 +267,9 @@ namespace llmbridge::detail
                               std::string_view body, size_t total_len) noexcept
     {
         ClientConn* client = u->client;
-        // Pooled only if it stays open: the response says keep-alive and, for a
-        // byte-forward that relayed the client's Connection header, the client did too.
-        const bool keep_alive = h.keep_alive && (client->req.f.translate_body || client->msg.keep_alive);
+        // The venue alone decides whether its connection stays open: a client's own
+        // Connection header is never forwarded.
+        const bool keep_alive = h.keep_alive;
         if (client->req.f.translate_body && h.status != 0 && h.status != 200)
         {
             // A provider failure keeps its status and message: a 429 or 529 translated

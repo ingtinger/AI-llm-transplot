@@ -53,6 +53,30 @@ namespace llmbridge
         Replying,   ///< a whole reply is staged for the client
     };
 
+    /// What the gateway reads from a client's request head in the framing walk, as
+    /// offsets from the head's start: a request put back at the front of its buffer
+    /// for a failover reads the same. A header the operator strips is not seen.
+    struct HeadFacts
+    {
+        struct Span
+        {
+            uint32_t at = 0, len = 0;
+            [[nodiscard]] std::string_view in(std::string_view head) const noexcept
+            {
+                return head.substr(at, len);
+            }
+            [[nodiscard]] bool empty() const noexcept { return len == 0; }
+        };
+        /// The first of each credential, trimmed.
+        Span authorization, x_api_key, api_key, x_goog_api_key, anthropic_version;
+        /// Each Connection line's value; more than kConnections refuse a byte-forward.
+        static constexpr uint8_t kConnections = 4;
+        Span connection[kConnections];
+        uint8_t connections = 0;
+        uint8_t expect = 0; ///< the first Expect: 0 none, 1 another, 2 100-continue
+        bool content_length = false;
+    };
+
     /// Everything a request owns that is trivially copyable. Never assigned field by
     /// field to reset it: begin() constructs a fresh one in place.
     struct ReqState
@@ -124,6 +148,7 @@ namespace llmbridge
         FixedStr<16> served_tier;
         FixedStr<64> served_model;   ///< cut at 64: longer ids are Bedrock ARNs
         FixedStr<kSinkCaptureBytes> captured[kSinkCaptureMax];
+        HeadFacts head;
     };
     static_assert(std::is_trivially_copyable_v<ReqState>);
     static_assert(std::is_trivially_destructible_v<ReqState>);

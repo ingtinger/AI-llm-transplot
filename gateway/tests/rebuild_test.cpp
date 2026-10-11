@@ -113,6 +113,45 @@ TEST(Rebuild, TheRequestLineIsNeverStrippedAsAHeader)
 // The three other producers of an upstream body get the same treatment: the
 // buffer form must yield the bytes of the value form and keep its storage.
 
+// The hop-by-hop headers, and any the client's Connection names, are this hop's: the
+// venue never sees them, and the rest of the head survives in order.
+TEST(Rebuild, HopByHopAndConnectionListedHeadersAreDropped)
+{
+    const std::vector<std::string> strip;
+    std::string into;
+    const std::string m = "POST /v1/chat/completions HTTP/1.1\r\nHost: client\r\nX-A: 1\r\n"
+                          "Connection: close, X-Listed\r\nkeep-alive: timeout=5\r\nX-Listed: 2\r\n"
+                          "TE: trailers\r\nUpgrade: h2c\r\nProxy-Connection: close\r\n"
+                          "Trailer: X-Sum\r\nConnection: x-also\r\nX-Also: 3\r\nX-B: 4\r\n"
+                          "Expect: 100-continue\r\nAccept-Encoding: gzip\r\n"
+                          "Content-Length: 2\r\n\r\nxx";
+    ASSERT_TRUE(llmbridge::detail::request_without(m, head_len(m), strip, "venue", "", {}, into));
+    EXPECT_EQ(into, "POST /v1/chat/completions HTTP/1.1\r\nHost: venue\r\nContent-Length: 2\r\n"
+                    "X-A: 1\r\nX-B: 4\r\n\r\nxx");
+}
+
+TEST(Rebuild, AnHttp10RequestLineGoesAsHttp11)
+{
+    const std::vector<std::string> strip;
+    std::string into;
+    const std::string m = "GET /v1/models HTTP/1.0\r\nX-A: 1\r\n\r\n";
+    ASSERT_TRUE(llmbridge::detail::request_without(m, head_len(m), strip, "venue", "/base", {}, into));
+    EXPECT_EQ(into, "GET /base/v1/models HTTP/1.1\r\nHost: venue\r\nX-A: 1\r\n\r\n");
+}
+
+// The Connection lines are read in the framing walk into a fixed table; a request with
+// more than it holds is refused rather than forwarded with a listed header kept.
+TEST(Rebuild, MoreConnectionLinesThanTheWalkHoldsAreRefused)
+{
+    const std::vector<std::string> strip;
+    std::string into;
+    std::string m = "POST /v1 HTTP/1.1\r\n";
+    for (int i = 0; i < 5; ++i) m += "Connection: x-" + std::to_string(i) + "\r\n";
+    m += "Content-Length: 0\r\n\r\n";
+    EXPECT_FALSE(llmbridge::detail::request_without(m, head_len(m), strip, "venue", "", {}, into));
+    EXPECT_TRUE(into.empty());
+}
+
 static std::string big_openai(size_t turns)
 {
     std::string b = R"({"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,)"

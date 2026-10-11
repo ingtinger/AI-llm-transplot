@@ -27,6 +27,8 @@ namespace llmbridge
         inline constexpr const char* kCredential =
             "a credential header holds bytes that cannot be forwarded "
             "(control characters are refused)";
+        inline constexpr const char* kNoCredential =
+            "no credential: send api-key, x-api-key or Authorization: Bearer";
         inline constexpr const char* kBedrockCredential =
             "a Bedrock venue is signed with the caller's AWS access key pair, sent as "
             "Bearer ACCESS_KEY_ID:SECRET or ACCESS_KEY_ID:SECRET:SESSION_TOKEN; the bearer "

@@ -150,6 +150,43 @@ TEST(AuthHeaders, GoldenSerializedResult)
 // live request, twenty times past this line. A tight tolerance would flake on a
 // shared runner; this one cannot without something being genuinely wrong.
 // Skipped under the sanitizers, which slow every path uniformly.
+// The AzureOpenAI SDK sends `api-key`; it was not read at all.
+TEST(AuthHeaders, AnAzureApiKeyIsACredential)
+{
+    const std::vector<std::string> strip;
+    std::string out;
+    ASSERT_TRUE(auth_headers_for(UpstreamDialect::Azure, "api-key: AZKEY\r\n", strip, out));
+    EXPECT_EQ(out, "api-key: AZKEY\r\n");
+    ASSERT_TRUE(auth_headers_for(UpstreamDialect::Azure,
+                                 "Authorization: Bearer B\r\napi-key: AZKEY\r\n", strip, out));
+    EXPECT_EQ(out, "api-key: AZKEY\r\n") << "Azure's own header wins";
+    EXPECT_FALSE(auth_headers_for(UpstreamDialect::Azure, "api-key: a\x01" "b\r\n", strip, out))
+        << "validated with the other credentials";
+    EXPECT_FALSE(auth_headers_for(UpstreamDialect::Anthropic, "api-key: a\x01" "b\r\n", strip, out))
+        << "validated whether or not the venue reads it";
+    EXPECT_FALSE(auth_headers_for(UpstreamDialect::Azure, "Host: x\r\n", strip, out))
+        << "no credential at all is refused";
+}
+
+// RFC 9110 11.1: the scheme is case-insensitive.
+TEST(AuthHeaders, TheBearerSchemeIsCaseInsensitive)
+{
+    const std::vector<std::string> strip;
+    std::string out;
+    for (const char* auth : {"Bearer k", "bearer k", "BEARER k", "bEaReR k", "Bearer   k"})
+    {
+        ASSERT_TRUE(auth_headers_for(UpstreamDialect::Anthropic,
+                                     std::string("Authorization: ") + auth + "\r\n", strip, out));
+        EXPECT_EQ(out, "x-api-key: k\r\nanthropic-version: 2023-06-01\r\n") << auth;
+    }
+    for (const char* auth : {"Bearerk", "Basic k", "Bearer"})
+    {
+        ASSERT_TRUE(auth_headers_for(UpstreamDialect::Anthropic,
+                                     std::string("Authorization: ") + auth + "\r\n", strip, out));
+        EXPECT_EQ(out, "anthropic-version: 2023-06-01\r\n") << auth;
+    }
+}
+
 #if defined(__has_feature)
     #define LLMBRIDGE_TEST_UNDER_CLANG_SANITIZER \
         (__has_feature(address_sanitizer) || __has_feature(thread_sanitizer))
