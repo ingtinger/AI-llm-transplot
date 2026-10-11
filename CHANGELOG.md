@@ -8,6 +8,54 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.84.0]. 2026-10-10
+
+### Fixed
+
+- **An SSE response framed by Content-Length ends at its last byte**. A stream
+  ended only at the upstream's EOF unless it was chunked, so a provider that framed it
+  with Content-Length and kept the connection open left the client without its
+  terminal chunk until the idle timeout truncated the stream (120 s by default), and
+  the upstream was closed instead of pooled. The stream now counts its body against
+  the length; bytes past it keep the upstream out of the pool.
+
+### Changed
+
+- **The response head is parsed once**. `net::http::ResponseFramer` on each
+  upstream caches the head and frames the body by its `Body` kind; the gateway used to
+  parse the head to detect a stream and then again on every read through
+  `parse_response`. `parse_response` stays, sharing the body framing.
+- **One response side for both backends**: `on_upstream_bytes`, `on_response`,
+  `finish`, `stream_pump` and `stream_flush` replace the `ep_`/`ur_` twins. Backpressure
+  is a capability: where `IoCaps::stream_backpressure` holds (epoll) a slow client
+  pauses its stream's upstream; elsewhere (io_uring) the 8 MiB cap, now
+  `kStreamBufCap`, drops the stream. 3 `ep_`/`ur_` twin pairs remain, all transport.
+- **One decision and one log text per upstream failure**:
+  - **Behaviour change: io_uring `resp_path` now includes the response parse**:
+    t4 of a whole response is stamped before the parse on both backends.
+  - The venue's address is parsed once, when the connection is created, and an
+    unparseable one fails the acquire on both backends (epoll's `start_connect`
+    already refused it, so only the decision site moved). epoll connects to that
+    address with `make_client_socket` and `connect`.
+  - An upstream send failure is `upstream write failed` on both backends; io_uring
+    reported it as `upstream EOF`.
+  - A TLS read failure is `upstream TLS failed` on both backends; io_uring logged it as
+    `upstream write failed`, epoll as `upstream EOF`. Operators grepping logs for
+    the old texts should be told.
+- The convention check's "unmarked" rule follows calls through shared methods, now that
+  a backend reaches most shared methods only through other shared ones.
+- epoll's send disarms `EPOLLOUT` whenever it completes, so a write event after a
+  stream or a reply finds nothing armed.
+
+### Tests
+
+- `ProxyForwardStream.AContentLengthStreamEndsWithoutWaitingForEof` fails on both
+  backends against 0.83.1; `ResponseFramer.FramesLikeParseResponseAndParsesTheHeadOnce`;
+  core tests for a slow client pausing its stream's upstream and a drain resuming it
+  (deterministic, no kernel buffers), the cap where reads cannot pause, a
+  Content-Length stream ending without EOF, bytes past it, and one head parse across
+  ten body reads.
+
 ## [0.83.1]. 2026-10-10
 
 ### Fixed
