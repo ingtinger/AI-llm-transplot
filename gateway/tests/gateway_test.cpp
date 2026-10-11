@@ -2498,6 +2498,26 @@ TEST_P(ProxyBackend, APooledRequestTheProviderAlreadyHeldIsNotResent)
     EXPECT_EQ(_gw->stats().upstream_retries, 0u);
 }
 
+// The other side of the same window: a pooled connection the provider drops within a
+// round trip of our request is resent once on a fresh connection, on both backends.
+// The connection is alive when it is reused, so no eviction can race the retry.
+TEST_P(ProxyBackend, APooledConnectionDroppedRightAfterTheRequestIsRetriedOnce)
+{
+    _backend.set_drop_second_after_ms(50);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(c.recv_status(), 200);
+    ASSERT_TRUE(c.send(make_request())); // rides the pooled connection, which drops it
+    EXPECT_EQ(c.recv_status(3000), 200);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_retries, 1u);
+    EXPECT_EQ(_gw->stats().upstream_reused, 1u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
 TEST_P(ProxyBackend, MultipleClients)
 {
     start(0, true, UpstreamDialect::OpenAI, GetParam());
