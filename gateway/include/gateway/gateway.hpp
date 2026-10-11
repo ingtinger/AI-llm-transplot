@@ -225,15 +225,12 @@ namespace llmbridge
 
         void ep_on_accept() noexcept;
         void ep_on_client_readable(Connection* c) noexcept;
+        void ep_set_read(Connection* c, bool on) noexcept; // the one writer of read_paused
         void ep_on_client_writable(Connection* c) noexcept;
         void ep_on_upstream_writable(Connection* c) noexcept;
         void ep_on_upstream_readable(Connection* c) noexcept;
 
-        /// Forward the client's buffered, optionally translated, request to an
-        /// upstream; called inline once a full request is framed.
-        void ep_forward(Connection* client) noexcept;
         void ep_finish_client(Connection* c) noexcept;
-        [[nodiscard]] bool send_interim_continue(Connection* c, bool uring) noexcept; // false: close c
 
         // Streaming pump, epoll.
         void ep_pause_read(Connection* c) noexcept;   // drop EPOLLIN (backpressure)
@@ -250,6 +247,14 @@ namespace llmbridge
         bool _stream_backpressure = false; ///< IoCaps::stream_backpressure of the running backend
         /// Send what `client` owes; finish on the spot when it all went.
         void respond(Connection* client) noexcept;
+        /// Bytes reached `c->rbuf`: frame a request if idle, then bound what is buffered.
+        void on_client_bytes(Connection* c) noexcept;
+        void try_frame(Connection* c) noexcept; // stamps t0, frames one request, dispatches it
+        /// Translate or rebuild the framed request, acquire an upstream and send it.
+        void dispatch(Connection* client) noexcept;
+        void gate_client_reads(Connection* c) noexcept; // the pipelining cap pauses, never closes
+        void client_gone(Connection* c) noexcept;       // EOF or a socket error on a client
+        void send_continue(Connection* c) noexcept;     // the interim 100, staged like any reply
         void begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept; // enter streaming
         void stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
         void finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
@@ -423,8 +428,7 @@ namespace llmbridge
         void ur_on_recv(Connection* c, int res, uint32_t flags) noexcept;
         void ur_on_send(Connection* c, int res) noexcept;
         void ur_on_connect(Connection* u, int res) noexcept;
-        void ur_forward(Connection* c) noexcept;
-        void ur_try_forward_buffered(Connection* c) noexcept; // forward a framed request if idle
+        [[nodiscard]] bool ur_cancel_recv(Connection* c) noexcept; // ends its multishot recv
         void ur_on_response(Connection* u, const net::http::ResponseHead& h,
                            std::string_view body_buf, size_t total_len) noexcept;
         void ur_finish_client(Connection* c) noexcept;

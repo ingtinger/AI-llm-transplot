@@ -8,7 +8,7 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
-## [0.83.0]. 2026-10-10
+## [0.83.1]. 2026-10-10
 
 ### Fixed
 

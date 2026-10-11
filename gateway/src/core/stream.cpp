@@ -137,7 +137,7 @@ namespace llmbridge
         client->req.f.phase = Phase::Idle;
         client->out.clear();
         client->msg = net::http::Message{};
-        _ops->reframe(*client); // a pipelined next request may already be in rbuf
+        on_client_bytes(client); // a pipelined next request may already be in rbuf
     }
 
     void Gateway::stream_truncate(Connection* client) noexcept

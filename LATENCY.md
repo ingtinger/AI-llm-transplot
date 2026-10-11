@@ -104,19 +104,20 @@ The `ts_*` identifiers are the stable names; t0–t6 is shorthand used in commen
 and in this document. Every stamp is a `Connection` member except the last two,
 which are locals; nothing outlives the request that needs them.
 
-Stamps are named by the **function** that assigns them, in
-`gateway/src/gateway_epoll.cpp` and `gateway/src/gateway_uring.cpp`. The gateway is
-implemented twice, so every stamp has a site in each loop, and a change to one
-that misses the other is the characteristic bug in those files.
+Stamps are named by the **function** that assigns them. t0 and t1 are taken in
+shared code (`gateway/src/core/client.cpp`), once for both backends; the later
+stamps still have a site in each loop (`gateway/src/gateway_epoll.cpp`,
+`gateway/src/gateway_uring.cpp`), and a change to one that misses the other is the
+characteristic bug in those files.
 `scripts/check_conventions.py` verifies in CI that each named function still
 assigns the stamp attributed to it.
 
 | | identifier | storage | stamped when | assigned in (epoll / io_uring) |
 |---|---|---|---|---|
-| **t0** | `ts_req_recvd` | `ReqState` | the client's request is fully framed | `ep_on_client_readable` / `ur_try_forward_buffered` |
-| **t1** | `ts_req_built` | `ReqState` | the upstream request bytes exist: translation, auth mapping and re-serialisation done, nothing sent | `ep_forward` / `ur_forward` |
-| **t2** | `ts_wire_ready` | `ReqState` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `ep_forward`, `ep_on_upstream_writable`, `tls_feed` / `ur_forward`, `ur_on_connect` |
-| **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel. Several sites (plaintext, TLS-flushed, partial-write completion) all meaning "fully sent" | `ep_forward`, `ep_on_upstream_writable`, `ep_tls_drain_read` / `ur_on_send` |
+| **t0** | `ts_req_recvd` | `ReqState` | the client's request is fully framed. Taken just **before** the parse that frames it, on both backends, so the parse is request-path work; a parse that finds the request incomplete discards it, so network wait is never charged | `try_frame` (shared) |
+| **t1** | `ts_req_built` | `ReqState` | the upstream request bytes exist: translation, auth mapping and re-serialisation done, nothing sent | `dispatch` (shared) |
+| **t2** | `ts_wire_ready` | `ReqState` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `dispatch`, `tls_feed` (shared), `ep_on_upstream_writable` / `ur_on_connect` |
+| **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel. Several sites (plaintext, TLS-flushed, partial-write completion) all meaning "fully sent" | `dispatch` (shared), `ep_on_upstream_writable`, `ep_tls_drain_read` / `ur_on_send` |
 | **t4** | `ts_up_recvd` | `ReqState` | the provider's response arrived. **Non-streaming:** the body is framed. **Streaming:** the response *head* is framed, before any data chunk (see §3; this is not the first token) | `ep_on_upstream_readable` / `ur_on_recv` |
 | **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `ep_on_upstream_readable` / `ur_on_response` |
 | **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `ep_finish_client` / `ur_finish_client` |
