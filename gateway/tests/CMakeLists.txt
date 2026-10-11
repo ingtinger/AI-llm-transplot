@@ -16,6 +16,11 @@ add_executable(gateway_outbuf_test outbuf_test.cpp)
 target_link_libraries(gateway_outbuf_test PRIVATE gateway GTest::gtest_main)
 target_include_directories(gateway_outbuf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
+# The shared lifecycle driven by a FakeIo: deterministic, no event loop.
+add_executable(gateway_core_test core_test.cpp)
+target_link_libraries(gateway_core_test PRIVATE gateway GTest::gtest_main)
+target_include_directories(gateway_core_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 add_executable(gateway_dialect_test dialect_test.cpp)
 target_link_libraries(gateway_dialect_test PRIVATE gateway GTest::gtest_main)
 
@@ -73,6 +78,7 @@ gtest_discover_tests(gateway_stats_test)
 gtest_discover_tests(gateway_test)
 gtest_discover_tests(gateway_dialect_test)
 gtest_discover_tests(gateway_outbuf_test)
+gtest_discover_tests(gateway_core_test)
 # 1000 requests per case; generous timeout so a slow CI runner does not flake it.
 # RUN_SERIAL: each case drives 1000 requests across 100 threads. Run concurrently
 # with the rest of the suite under `ctest -j`, it both flakes and reports
