@@ -8,6 +8,37 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.85.1]. 2026-10-10
+
+### Changed
+
+- **Each backend is a `final` class that owns its loop**: `EpollIo`
+  (`gateway/src/io/epoll_io.cpp`) and `UringIo` (`gateway/src/io/uring_io.cpp`) hold their
+  own state (the epoll instance; the ring, its provided buffers and the drain count) and
+  implement `IoOps`. `gateway_epoll.cpp` and `gateway_uring.cpp` are gone; no `ep_`/`ur_`
+  method is left.
+- **`Gateway` is a facade over `detail::Engine`** (`gateway/src/engine.hpp`), which holds
+  the configuration, the registries and the one request lifecycle in `core/`. The public
+  API is unchanged; `gateway.hpp` no longer includes `net/http.hpp`, `net/tls.hpp`,
+  `net/uring.hpp` or `provider/translate.hpp`, and its t0-t6 table is gone: LATENCY.md is
+  the only one.
+- **A close is two halves**: `Engine::forget` does the bookkeeping on both backends
+  (unpair, deregister, pool, doomed); the backend's `close` does the descriptor.
+- **A fresh upstream costs one `epoll_ctl`**: it is registered once with
+  `EPOLLIN | EPOLLOUT`, where it was added for reads and then modified to arm the write.
+  It already took no `fcntl` (`make_client_socket` creates it non-blocking).
+- **The convention check enforces the boundary instead of the prefixes.** Checks 1, 2
+  and 5b (prefix crossings, one-sided unprefixed methods, constant prefixes) are
+  replaced by: `core/` includes no backend header, `core/` makes no socket call, and
+  `io/epoll*` and `io/uring*` never mention each other. Each rule is first run against a
+  planted violation, and the run fails if one goes unnoticed. LATENCY.md cites
+  `Class::method` for backend stamp sites.
+- The epoll instance is created when the loop starts, not in the constructor; a
+  failure there is logged and `run()` returns 1.
+- DESIGN.md "Naming conventions" and GATEWAY-INTERNALS.md sections 4-8 and 11 describe
+  the boundary and the two classes.
+
+
 ## [0.84.0]. 2026-10-10
 
 ### Fixed
