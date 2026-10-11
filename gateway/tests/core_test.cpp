@@ -170,6 +170,23 @@ namespace
         void SetUp() override { t.attach(io, /*backpressure=*/true); }
     };
 
+    // Either side of an unpair leaves both links clear: a link is never one-sided.
+    TEST_F(Core, PairAndUnpairWriteBothDirections)
+    {
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
+        llmbridge::pair(c, u);
+        EXPECT_EQ(c->up, u);
+        EXPECT_EQ(u->client, c);
+        EXPECT_EQ(llmbridge::unpair(c), u);
+        EXPECT_EQ(c->up, nullptr);
+        EXPECT_EQ(u->client, nullptr);
+        llmbridge::pair(c, u);
+        EXPECT_EQ(llmbridge::unpair(u), c);
+        EXPECT_EQ(c->up, nullptr);
+        EXPECT_EQ(u->client, nullptr);
+    }
+
     TEST_F(Core, AnErrorReplyIsStagedOnceAndFinishesWhenItIsOnTheWire)
     {
         ClientConn* c = t.client();
