@@ -246,6 +246,7 @@ namespace llmbridge
         {
             // t4 for a stream is the head, not the first token: LATENCY.md 3.
             client->req.f.ts_up_recvd = now_ns();
+            note_upstream_rtt(client, u);
             note_quota(client, h);
             note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
             return begin_stream(u, h);
@@ -255,6 +256,7 @@ namespace llmbridge
         if (r.failed()) return error_respond(client, 502, "upstream response framing");
         if (!r.complete()) return;
         client->req.f.ts_up_recvd = t4;
+        note_upstream_rtt(client, u);
         note_quota(client, h);
         note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
         note_upstream_error(client, h, r.body);

@@ -1090,7 +1090,7 @@ TEST(ProviderHeads, RateLimitHeadsNameTheQuota)
 }
 
 // The framer frames every provider reply exactly as parse_response does, byte by byte,
-// and parses the head once however many reads the body takes (NP1).
+// and parses the head once however many reads the body takes.
 TEST(ResponseFramer, FramesLikeParseResponseAndParsesTheHeadOnce)
 {
     for (const ProviderReply& p : provider_replies())

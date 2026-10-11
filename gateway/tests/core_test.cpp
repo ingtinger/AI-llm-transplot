@@ -588,7 +588,7 @@ namespace
         EXPECT_TRUE(u->doomed);
     }
 
-    // NP1: a response arriving over many reads has its head parsed once.
+    // A response arriving over many reads has its head parsed once.
     TEST_F(Core, AResponseHeadIsParsedOnceHoweverManyReadsTheBodyTakes)
     {
         Connection* c = t.client();
