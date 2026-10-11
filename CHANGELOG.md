@@ -8,6 +8,46 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.82.0]. 2026-10-10
+
+### Changed
+
+- **The `IoOps` seam** (`gateway/src/core/io.hpp`): the shared request lifecycle reaches
+  a socket only through `send`, `connect`, `set_read` and `close`, which each backend
+  implements over its own primitives (`Gateway::EpollIo`, `Gateway::UringIo`), plus
+  `IoCaps::stream_backpressure` (epoll pauses a slow stream's upstream, io_uring caps
+  its buffer). GATEWAY-INTERNALS.md 3d.
+- **Nine `ep_`/`ur_` twins are one method each**: `error_respond`, `upstream_failed`,
+  `abort_pair`, `begin_stream`, `stream_on_upstream_eof`, `finalize_stream`,
+  `acquire_upstream`, `retry_upstream` and `release_upstream`. The convention check
+  counts 7 twin pairs, down from 16. The sweep's `close_conn` and `abort_request`
+  dispatchers are gone.
+- io_uring closes a stream's upstream when it sends EOF, as epoll did, instead of
+  holding it to the finalize; the finalize's release refused it anyway.
+- io_uring submits a fresh upstream's connect when the connection is opened. A full
+  submission queue there now fails the acquire (failover, else a 502) instead of
+  aborting the client.
+- epoll no longer disarms `EPOLLOUT` when it pools an upstream; a TLS upstream that
+  armed it while its request went out takes one spurious writable event, which
+  disarms it.
+- io_uring replies through the shared `respond()`, which waits for a send already in
+  flight instead of submitting a second one.
+
+### Tests
+
+- `gateway/tests/core_test.cpp`: the shared lifecycle driven by a `FakeIo`, with no
+  event loop: an error reply behind a slow client's queued reply aborts instead of
+  following it, a failed send aborts the pair, a request still queued for the
+  upstream keeps it out of the pool, acquire, retry, failover, stream entry, EOF and
+  finalize. Each folded method was broken once on purpose and failed `gateway_test`
+  on both backends.
+- `ProxyBackend.APooledConnectionDroppedRightAfterTheRequestIsRetriedOnce`: the
+  stale-connection retry asserted on both backends; the existing retry tests reach it
+  deterministically on epoll only. `ProxyForwardStream.ACloseDelimitedStreamEndsWhenTheProviderClosesLater`:
+  the EOF that ends a close-delimited stream arrives after the body went out, so only
+  the EOF path can flush the terminal chunk.
+
+
 ## [0.81.1]. 2026-10-10
 
 The record of each request carries the kernel's round-trip time to the venue.

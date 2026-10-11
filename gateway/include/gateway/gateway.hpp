@@ -63,6 +63,11 @@ namespace llmbridge
     struct Connection;   // src/core/conn.hpp
     class UpstreamPool;  // src/core/pool.hpp
     template <class T> class Registry; // src/core/registry.hpp
+    namespace detail
+    {
+        class IoOps;    // src/core/io.hpp
+        struct IoCaps;
+    } // namespace detail
 
     class Gateway
     {
@@ -227,19 +232,29 @@ namespace llmbridge
         /// Forward the client's buffered, optionally translated, request to an
         /// upstream; called inline once a full request is framed.
         void ep_forward(Connection* client) noexcept;
-        /// Write the buffered response to the client; close out accounting.
-        void ep_respond(Connection* client) noexcept;
         void ep_finish_client(Connection* c) noexcept;
         [[nodiscard]] bool send_interim_continue(Connection* c, bool uring) noexcept; // false: close c
 
         // Streaming pump, epoll.
         void ep_pause_read(Connection* c) noexcept;   // drop EPOLLIN (backpressure)
         void ep_resume_read(Connection* c) noexcept;  // restore EPOLLIN
-        void ep_begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept; // enter streaming
         void ep_stream_pump(Connection* u) noexcept;      // decode+translate new upstream body bytes
-        void ep_stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
         void ep_stream_flush(Connection* client) noexcept;      // write buffered SSE, apply backpressure
-        void ep_finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
+
+        // The shared lifecycle, run on either backend through `_ops`. GATEWAY-INTERNALS.md 3d.
+        class EpollIo;
+        class UringIo;
+        friend struct GatewayCoreTest; // gateway/tests/core_test.cpp drives it with a FakeIo
+        void attach(detail::IoOps* io, const detail::IoCaps& caps) noexcept;
+        detail::IoOps* _ops = nullptr;
+        bool _stream_backpressure = false; ///< IoCaps::stream_backpressure of the running backend
+        /// Send what `client` owes; finish on the spot when it all went.
+        void respond(Connection* client) noexcept;
+        void begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept; // enter streaming
+        void stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
+        void finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
+        /// A new upstream to `slot`, not yet open.
+        [[nodiscard]] Connection* new_upstream(int slot) noexcept;
 
         /// Ask the installed policy about a freshly framed request. Callers treat
         /// `allow == false` as terminal and reply with their own ep_/ur_ responder.
@@ -256,9 +271,8 @@ namespace llmbridge
 
         /// Ask the policy for another venue and re-dispatch there. True when the
         /// request was re-sent, in which case the caller must not also answer the
-        /// client. Twins because the teardown and forward they call are backend-specific.
-        bool ep_upstream_failed(Connection* client, int status, const char* why) noexcept;
-        bool ur_upstream_failed(Connection* client, int status, const char* why) noexcept;
+        /// client.
+        bool upstream_failed(Connection* client, int status, const char* why) noexcept;
 
         /// Shared half: may this be re-dispatched, and where? No teardown happens here.
         [[nodiscard]] Retry failover_target(Connection* client, int status,
@@ -290,31 +304,28 @@ namespace llmbridge
         /// Heartbeat, pool reaping and every timeout, in one walk of the clients.
         void sweep_idle() noexcept;
         void sweep_client(Connection* c, int64_t now, bool busy) noexcept;
-        /// The sweep's teardowns, on whichever backend runs.
-        void close_conn(Connection* c) noexcept;
-        void abort_request(Connection* client) noexcept;
         void fail_request(Connection* client, int code, const char* why) noexcept; // failover, else reply
 
         /// `slot` indexes the upstream table; the pool it draws from is that venue's.
-        Connection* ep_acquire_upstream(int slot) noexcept;
+        Connection* acquire_upstream(int slot) noexcept;
         /// Pool `u` if UpstreamPool::release agrees, else close it. `keep_alive`: the
         /// response, and for a byte-forward the client, allow it; `body_ended`: the
         /// response reached a message boundary.
-        void ep_release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
-        /// The shared half: true when `u` is now pooled; logs and counts a refusal.
+        void release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
+        /// True when `u` is now pooled; logs and counts a refusal.
         [[nodiscard]] bool pool_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
         /// A pooled upstream failed before any response, so the provider dropped the
         /// idle keep-alive: resend the request once on a fresh connection.
-        bool ep_retry_upstream(Connection* u) noexcept;
+        bool retry_upstream(Connection* u) noexcept;
         void ep_close_client(Connection* c) noexcept;
         void ep_close_upstream(Connection* u) noexcept;
-        void ep_abort_pair(Connection* client) noexcept;
+        void abort_pair(Connection* client) noexcept;
         /// Reply with `code` and abandon any upstream. `why` is for the log, so an
         /// incident can ask why and not only whether. `detail` is what the client
         /// sees, and only a 4xx shows it: pass one for the caller's own error or a
         /// policy's checked message, never its reason, which is free reconnaissance.
-        void ep_error_respond(Connection* client, int code, const char* why,
-                                 const char* detail = nullptr) noexcept;
+        void error_respond(Connection* client, int code, const char* why,
+                           const char* detail = nullptr) noexcept;
 
         bool ep_drain_read(Connection* c) noexcept;
         bool ep_pump_write(Connection* c, bool* done) noexcept;
@@ -419,21 +430,9 @@ namespace llmbridge
         void ur_finish_client(Connection* c) noexcept;
         // Streaming pump, io_uring: serialized sends (one send SQE in flight) and a
         // bounded buffer.
-        void ur_begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept;
         void ur_stream_pump(Connection* u) noexcept;
-        void ur_stream_on_upstream_eof(Connection* u) noexcept;
         void ur_stream_flush(Connection* client) noexcept; // send pending bytes, or finalize
-        void ur_finalize_stream(Connection* client) noexcept;
-        Connection* ur_acquire_upstream(int slot) noexcept;
-        void ur_release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
-        /// A pooled upstream failed before any response: resend the request once on
-        /// a fresh connection. True if a retry was issued.
-        bool ur_retry_upstream(Connection* u) noexcept;
         void ur_close(Connection* c) noexcept;
-        void ur_abort_pair(Connection* client) noexcept;
-        /// Same contract as ep_error_respond.
-        void ur_error_respond(Connection* client, int code, const char* why,
-                                 const char* detail = nullptr) noexcept;
         void ur_maybe_free(Connection* c) noexcept;
 
         net::uring::Ring _ring;

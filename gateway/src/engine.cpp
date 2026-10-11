@@ -10,6 +10,7 @@
 
 #include "gateway/gateway.hpp"
 
+#include "core/io.hpp"
 #include "core/limits.hpp"
 #include "core/registry.hpp"
 #include "net/secure.hpp"
@@ -314,6 +315,12 @@ namespace llmbridge
         u->tls_out.adopt(std::move(set.tls_out));
 #endif
         ++_stats.warm_reuses;
+    }
+
+    void Gateway::attach(detail::IoOps* io, const detail::IoCaps& caps) noexcept
+    {
+        _ops = io;
+        _stream_backpressure = caps.stream_backpressure;
     }
 
     void Gateway::note_build(size_t need) noexcept

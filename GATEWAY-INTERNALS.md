@@ -82,7 +82,7 @@ neither half loses its capacity.
 
 The front keeps what was sent until it is staged over, cleared or taken. That is
 what keeps an upstream request available for a resend when a pooled connection
-turns out to be dead: `ep_retry_upstream` / `ur_retry_upstream` `take()` it, and
+turns out to be dead: `retry_upstream` `take()`s it, and
 resend only while the request is `Dispatched` (3c).
 
 ## 3. Request lifecycle, common to both backends
@@ -149,6 +149,31 @@ failover takes `Retry`'s.
 A write event with no reply staged, such as a drained interim `100 Continue`, finishes
 nothing. An error once a reply has begun, or with bytes still owed to the client,
 closes the client instead of staging a second reply into the first.
+
+### 3d. The seam: `IoOps`
+
+The shared lifecycle reaches a socket only through `detail::IoOps`
+(`gateway/src/core/io.hpp`), which each backend implements over its own primitives
+(`Gateway::EpollIo`, `Gateway::UringIo`). `run_epoll()` and `run_uring()` attach
+theirs before the first event, so a shared method such as `error_respond`,
+`acquire_upstream`, `retry_upstream`, `release_upstream`, `upstream_failed`,
+`abort_pair`, `begin_stream`, `stream_on_upstream_eof` or `finalize_stream` is
+written once and runs on both.
+
+| operation | epoll | io_uring |
+|---|---|---|
+| `send` | write now; `Queued` arms `EPOLLOUT` | one send SQE; always `Queued` unless nothing is owed |
+| `connect` | non-blocking `connect()`, `EPOLLIN` and `EPOLLOUT` | socket, resolve, a connect SQE |
+| `set_read` | `EPOLLIN` off or on | nothing yet: streams are capped (`IoCaps`) |
+| `close` | `ep_close_client` / `ep_close_upstream` | `ur_close` |
+
+A send that completes at once is a return value (`Sent::Done`), never a callback, so
+no handler runs re-entered. `IoCaps::stream_backpressure` says whether the backend
+pauses a stream's upstream for a slow client (epoll) or bounds it by its buffer cap
+(io_uring). The handlers each backend still writes itself (`forward`, `reframe`,
+`finish`, `stream_pump`, `stream_flush`) are reached through the same interface
+until they are shared. `gateway/tests/core_test.cpp` drives the shared methods with
+a `FakeIo`, so a send that does not complete happens exactly when a test says so.
 
 ## 4. The epoll backend
 
@@ -289,7 +314,7 @@ translate Anthropic events to OpenAI chunks, write to the client.
 
 Three flags carry the state, and their meanings are precise:
 
-- **`streaming`** latches in `*_begin_stream` and is cleared only when a stream
+- **`streaming`** latches in `begin_stream` and is cleared only when a stream
   finalizes on a connection that is kept; the next request's `begin()` resets the
   rest.
 - **`stream_ended`** means no further output will be produced. It becomes true
@@ -400,15 +425,15 @@ otherwise pay a fresh connect every time, which measured as the dominant term in
 time to first token.
 
 ```
-  ur_acquire_upstream / ep_acquire_upstream
+  acquire_upstream
         |
         +-- UpstreamPool::acquire(venue): the newest, from_pool = true, ++upstream_reused
         |
-        +-- else: new socket, connect (async on both backends)
+        +-- else: new socket, connect (async on both backends; IoOps::connect)
 
   ...request completes...
 
-  {ep,ur}_release_upstream -> UpstreamPool::release, the one reusability check;
+  release_upstream -> UpstreamPool::release, the one reusability check;
   any refusal closes the connection:
         |
         +-- closed already, or not keep-alive (response, or a byte-forward's client)

@@ -5,13 +5,15 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// Stream bookkeeping both backends share: the encoding warning, the latency record
-// and the one way to truncate.
+// A stream's life on either backend: entering it, the upstream's EOF, the finalize,
+// the encoding warning, the latency record and the one way to truncate.
 
 #include "gateway/gateway.hpp"
 
+#include "core/io.hpp"
 #include "core/limits.hpp"
 #include "request.hpp"
+#include "response.hpp"
 #include "stream.hpp"
 
 namespace llmbridge
@@ -46,6 +48,96 @@ namespace llmbridge
             client->req.f.ts_first_token >= client->req.f.ts_req_recvd)
             _stats.first_token.record(
                 static_cast<uint64_t>(client->req.f.ts_first_token - client->req.f.ts_req_recvd));
+    }
+
+    // The upstream answered text/event-stream: stage the client's SSE head, then
+    // translate or forward the body as it arrives.
+    void Gateway::begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept
+    {
+        Connection* client = u->peer;
+        client->req.f.streaming = true;
+        client->req.f.stream_chunked = h.chunked;
+        client->req.f.stream_keep_alive = h.keep_alive; // decides poolability at stream end
+        stream_warn_if_encoded(client, h);
+        // Only a request that needs translating gets a translator.
+        client->req.f.sse_translating =
+            client->req.f.translate_body && client->req.f.effective_dialect == UpstreamDialect::Anthropic;
+        if (client->req.f.sse_translating) client->sse_xlate.reset(-1, client->req.f.wants_usage);
+        // Chosen once, before either head is built, and remembered.
+        client->req.f.stream_chunked_out = stream_reusable_out(client);
+        if (_timing_headers)
+        {
+            // t5 = t4, stamped by the caller: a stream's response is not built at one
+            // instant, so the compute leg is the request side alone.
+            std::string timing;
+            const TimingSplit sp = timing_split(
+                client->req.f.ts_req_recvd, client->req.f.ts_req_built, client->req.f.ts_wire_ready,
+                client->req.f.ts_up_sent, client->req.f.ts_up_recvd, client->req.f.ts_up_recvd);
+            append_timing_headers(timing, client->req.f.ts_req_recvd, sp.compute_ns / 1000,
+                                  sp.connect_ns / 1000, sp.upwrite_ns / 1000,
+                                  sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
+                                  client->req.f.req_seq, client->req.f.client_upload_ns / 1000);
+            append_sse_head(client->out.stage(), timing,
+                            client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
+        }
+        else
+            client->out.stage().append(client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
+        client->req.f.phase = Phase::Streaming;
+
+        u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
+        _ops->stream_pump(*u);           // translate any initial body, flush the head
+    }
+
+    // The upstream closed: translate what remains, emit the terminal [DONE] if the
+    // framing allows, and flush toward the finalize.
+    void Gateway::stream_on_upstream_eof(Connection* u) noexcept
+    {
+        Connection* client = u->peer;
+        if (!client)
+        {
+            _ops->close(*u);
+            return;
+        }
+        const StreamStep st = stream_step(client, u->rbuf, client->out.stage(), /*at_eof=*/true);
+        if (st == StreamStep::Corrupt || st == StreamStep::Failed) stream_truncate(client);
+        // Ended either way, so the upstream is done. Kept while its reads were paused,
+        // the dead fd raised EPOLLHUP on every wait.
+        _ops->close(*u);
+        _ops->stream_flush(*client);
+    }
+
+    void Gateway::finalize_stream(Connection* client) noexcept
+    {
+        // Reuse is the whole point: a streaming request otherwise costs a fresh
+        // upstream connect, the dominant term in time-to-first-token.
+        if (Connection* u = unpair(client))
+            release_upstream(u, stream_keeps_upstream(client), stream_body_ended(client));
+        // The stream's outcome, size and tokens. `close_after_resp` here means
+        // truncated: no [DONE], which the client cannot tell from a clean finish.
+        LB_DEBUG(ReqId{client->req.f.req_seq}, " stream ended ",
+                 client->close_after_resp ? "TRUNCATED" : "clean",
+                 " tokens_in=", stream_tokens(client).in,
+                 " tokens_out=", stream_tokens(client).out,
+                 " on ", *client);
+        // Only a clean end is a served request; an abort was counted in errors.
+        if (!client->close_after_resp)
+        {
+            ++_stats.requests;
+            stream_record_latency(client);
+        }
+        if (_sink) sink_emit(client, 200, /*streamed=*/true);
+
+        // Keep the connection when the framing gave the body an end marker.
+        if (!stream_client_reusable(client))
+        {
+            _ops->close(*client);
+            return;
+        }
+        client->req.f.streaming = false; // over; begin() resets the rest at the next framing
+        client->req.f.phase = Phase::Idle;
+        client->out.clear();
+        client->msg = net::http::Message{};
+        _ops->reframe(*client); // a pipelined next request may already be in rbuf
     }
 
     void Gateway::stream_truncate(Connection* client) noexcept

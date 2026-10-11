@@ -22,8 +22,7 @@ namespace llmbridge
 {
     using namespace detail;
 
-    // Shared by both backends, hence no ep_/ur_ prefix: is this upstream carrying
-    // TLS? Compiles to `false` in a build without TLS support.
+    // Compiles to `false` in a build without TLS support.
     bool Gateway::upstream_is_tls(const Connection* u) const noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS

@@ -9,6 +9,7 @@
 
 #include "gateway/gateway.hpp"
 
+#include "core/io.hpp"
 #include "core/limits.hpp"
 #include "core/registry.hpp"
 #include "stream.hpp"
@@ -16,37 +17,6 @@
 namespace llmbridge
 {
     using namespace detail;
-
-    // The sweep's three teardowns, on whichever backend runs. `doomed` keeps every
-    // one of them a no-op on a connection already closed.
-    void Gateway::close_conn(Connection* c) noexcept
-    {
-#ifdef LLMBRIDGE_HAVE_URING
-        if (_active_backend == 2) { ur_close(c); return; }
-#endif
-        if (c->is_client) ep_close_client(c);
-        else ep_close_upstream(c);
-    }
-
-    void Gateway::abort_request(Connection* client) noexcept
-    {
-#ifdef LLMBRIDGE_HAVE_URING
-        if (_active_backend == 2) { ur_abort_pair(client); return; }
-#endif
-        ep_abort_pair(client);
-    }
-
-    void Gateway::fail_request(Connection* client, int code, const char* why) noexcept
-    {
-#ifdef LLMBRIDGE_HAVE_URING
-        if (_active_backend == 2)
-        {
-            if (!ur_upstream_failed(client, code, why)) ur_error_respond(client, code, why);
-            return;
-        }
-#endif
-        if (!ep_upstream_failed(client, code, why)) ep_error_respond(client, code, why);
-    }
 
     // Plaintext not yet on the wire or ciphertext not yet written, sends in flight included.
     static bool owes_client(const Connection* c) noexcept
@@ -84,7 +54,7 @@ namespace llmbridge
         // Providers close idle keep-alives on their own schedule, and finding a corpse
         // costs a request its retry, so expired ones go first. Only those are visited.
         if (_pool_idle_ns > 0)
-            _pool->reap(now - _pool_idle_ns, [this](Connection* u) { close_conn(u); });
+            _pool->reap(now - _pool_idle_ns, [this](Connection* u) { _ops->close(*u); });
 
         apply_reresolved();
 
@@ -119,7 +89,7 @@ namespace llmbridge
             ++_stats.client_setup_timeouts;
             LB_WARN("TIMEOUT client never framed a request ", *c,
                     " after_ns=", now - c->ts_accepted, " limit_ns=", _client_setup_ns);
-            close_conn(c);
+            _ops->close(*c);
             return;
         }
         // Established and quiet. Skipped while a request is in flight, because a slow
@@ -132,7 +102,7 @@ namespace llmbridge
             ++_stats.client_idle_timeouts;
             LB_WARN("TIMEOUT client idle ", *c, " after_ns=", now - c->ts_client_activity,
                     " limit_ns=", _client_idle_ns);
-            close_conn(c);
+            _ops->close(*c);
             return;
         }
         // A fresh connect that never became wire-ready. Separate from the idle timeout,
@@ -146,7 +116,7 @@ namespace llmbridge
                     " after_ns=", now - u->ts_accepted, " limit_ns=", _connect_ns);
             note_connect_failure(u->upstream_slot, "timed out");
             unpair(u);
-            close_conn(u);
+            _ops->close(*u);
             fail_request(c, 502, "upstream connect timeout");
             return;
         }
@@ -163,7 +133,7 @@ namespace llmbridge
                 " streaming=", c->req.f.streaming);
         if (!c->req.f.streaming) { fail_request(c, 504, "upstream idle timeout"); return; }
         stream_truncate(c); // the head is out; truncate honestly, with no [DONE]
-        abort_request(c);
+        abort_pair(c);
     }
 
 } // namespace llmbridge
