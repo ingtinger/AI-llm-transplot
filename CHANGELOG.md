@@ -8,6 +8,54 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.83.0]. 2026-10-10
+
+### Fixed
+
+- **Pipelining past the buffer cap pauses the client instead of closing it**.
+  A client may pipeline behind a request in flight; past `kMaxClientBuffered`
+  (16 MiB + 32 KiB, more than any legal request) the gateway used to abort the pair,
+  legitimate requests included. It now stops reading that client (`set_read`), counts
+  `Stats::client_read_pauses`, and resumes once its requests drain the buffer. On
+  io_uring a pause cancels the multishot recv and a resume re-arms it.
+- **A client that disconnects mid-reply is an error on both backends**. epoll
+  counted it; io_uring, whose reply no longer held the upstream, closed it as if idle.
+  One decision now: a client gone with a request, reply or stream still owed is an
+  abort and counts in `errors`; one gone between requests does not.
+
+### Changed
+
+- **Behaviour change: io_uring `req_path` now includes parsing**. t0 is stamped
+  just before the parse that frames the request on both backends; io_uring stamped it
+  after. io_uring's `req-path` and `added-total` rise by the parse cost. This is not a
+  regression: the two backends now measure the same span. LATENCY.md rows t0-t3 name
+  the shared sites.
+- **One request side for both backends**: `try_frame` (frame one request from `rbuf`)
+  and `dispatch` (translate or rebuild, acquire, send) replace `ep_on_client_readable`'s
+  framing, `ur_try_forward_buffered`, `ep_forward` and `ur_forward`.
+- **A finished request re-frames from the buffer** instead of issuing another `read()`
+  on epoll: one fewer syscall per keep-alive request.
+- **The interim `100 Continue` is staged in `OutBuf`** and sent like any reply, through
+  the backend's send; `send_interim_continue` and its direct `send()` are gone. An error
+  reply while the interim line is still queued behind a full socket now closes the
+  client instead of following it.
+- A client write failure with no request owed closes without counting an error on
+  epoll, as io_uring did.
+
+### Tests
+
+- `ProxyBackend.PipeliningPastTheCapIsPausedAndEveryRequestServed` (41 requests,
+  40 MiB pipelined behind one whose reply is held until the client blocks, all
+  served, no error) fails on both backends
+  against 0.82.0; `ProxyBackend.BytesPipelinedBehindARequestInFlightAreBounded` now
+  asserts a pause, not a close; `ProxyBackend.AClientGoneMidReplyCountsAsAnErrorOnBothBackends`
+  fails on io_uring against 0.82.0. Core tests for the pause, the interim line and
+  `client_gone`.
+- `ProxyBackend.RunningOutOfDescriptorsDoesNotSpinTheWorker` serves one request
+  before it fills the descriptor table: UBSan's first type check behind a call
+  through `IoOps` probes memory with a pipe, which cannot be made at that point.
+
+
 ## [0.82.0]. 2026-10-10
 
 ### Changed
