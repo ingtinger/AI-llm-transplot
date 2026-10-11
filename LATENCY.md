@@ -104,11 +104,9 @@ The `ts_*` identifiers are the stable names; t0–t6 is shorthand used in commen
 and in this document. Every stamp is a `Connection` member except the last two,
 which are locals; nothing outlives the request that needs them.
 
-Stamps are named by the **function** that assigns them. t0 and t1 are taken in
-shared code (`gateway/src/core/client.cpp`), once for both backends; the later
-stamps still have a site in each loop (`gateway/src/gateway_epoll.cpp`,
-`gateway/src/gateway_uring.cpp`), and a change to one that misses the other is the
-characteristic bug in those files.
+Stamps are named by the **function** that assigns them. Most are taken in shared
+code (`gateway/src/core/`), once for both backends; t2 and t3 still have a site in
+each loop, where the transport learns that a connect or a send completed.
 `scripts/check_conventions.py` verifies in CI that each named function still
 assigns the stamp attributed to it.
 
@@ -118,9 +116,9 @@ assigns the stamp attributed to it.
 | **t1** | `ts_req_built` | `ReqState` | the upstream request bytes exist: translation, auth mapping and re-serialisation done, nothing sent | `dispatch` (shared) |
 | **t2** | `ts_wire_ready` | `ReqState` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `dispatch`, `tls_feed` (shared), `ep_on_upstream_writable` / `ur_on_connect` |
 | **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel. Several sites (plaintext, TLS-flushed, partial-write completion) all meaning "fully sent" | `dispatch` (shared), `ep_on_upstream_writable`, `ep_tls_drain_read` / `ur_on_send` |
-| **t4** | `ts_up_recvd` | `ReqState` | the provider's response arrived. **Non-streaming:** the body is framed. **Streaming:** the response *head* is framed, before any data chunk (see §3; this is not the first token) | `ep_on_upstream_readable` / `ur_on_recv` |
-| **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `ep_on_upstream_readable` / `ur_on_response` |
-| **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `ep_finish_client` / `ur_finish_client` |
+| **t4** | `ts_up_recvd` | `ReqState` | the provider's response arrived. **Non-streaming:** the body is framed, stamped at the start of the read that completed it, before the parse, on both backends. **Streaming:** the response *head* is framed, before any data chunk (see §3; this is not the first token) | `on_upstream_bytes` (shared) |
+| **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `on_response` (shared) |
+| **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `finish` (shared) |
 
 **Two stamps sit outside the scheme, deliberately.** `ts_accepted` is taken when
 the client connection is accepted, which is before t0 and on a different clock

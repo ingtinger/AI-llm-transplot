@@ -63,8 +63,8 @@ namespace llmbridge
 
         uint64_t id = 0; // client conns: stable id; upstream conns: 0
 
-        /// Non-streaming chunked decode, fed only new bytes across reads.
-        net::http::ResponseDecoder rdec;
+        /// Upstream conns: the response in flight, its head parsed once.
+        net::http::ResponseFramer framer;
 
         std::string rbuf;
         /// Plaintext owed to the peer: on the socket, or for TLS fed to the Session.

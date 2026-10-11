@@ -98,11 +98,13 @@ namespace llmbridge
         bool wants_usage = false; ///< include_usage, as the translator read it
         bool client_conn_reused = false;
         bool upstream_pooled = false; ///< the upstream was already connected
-        /// Streaming: `streaming` latches in *_begin_stream; `stream_chunked` is the
-        /// upstream's framing, `stream_chunked_out` ours; `stream_ended` with
-        /// `close_after_resp` set means truncated (GATEWAY-INTERNALS.md 6b).
+        /// Streaming: `streaming` latches in begin_stream; `stream_body` is the
+        /// upstream's framing (`stream_left` bytes to go when it is a Content-Length),
+        /// `stream_chunked_out` ours; `stream_ended` with `close_after_resp` set means
+        /// truncated (GATEWAY-INTERNALS.md 6b).
+        uint64_t stream_left = 0;
+        net::http::Body stream_body = net::http::Body::None;
         bool streaming = false;
-        bool stream_chunked = false;
         bool stream_chunked_out = false;
         bool stream_ended = false;
         bool stream_keep_alive = false; ///< the upstream may be pooled at the end

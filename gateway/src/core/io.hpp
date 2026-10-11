@@ -29,8 +29,7 @@ namespace llmbridge::detail
 
     struct IoCaps
     {
-        /// Pausing a stream's upstream reads while its client drains. Without it a
-        /// backend bounds a stream by its buffer cap instead.
+        /// Pauses a stream's upstream for a slow client; else kStreamBufCap bounds it.
         bool stream_backpressure = false;
     };
 
@@ -45,11 +44,6 @@ namespace llmbridge::detail
         virtual void set_read(Connection& c, bool on) noexcept = 0;
         /// `c`, and a client's upstream with it; freed once no event can reach it.
         virtual void close(Connection& c) noexcept = 0;
-
-        // The handlers each backend still writes itself, until they are shared.
-        virtual void finish(Connection& client) noexcept = 0;
-        virtual void stream_pump(Connection& u) noexcept = 0;
-        virtual void stream_flush(Connection& client) noexcept = 0;
 
       protected:
         ~IoOps() = default;

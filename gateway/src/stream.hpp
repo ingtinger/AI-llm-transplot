@@ -46,7 +46,8 @@ namespace llmbridge::detail
     /// from died.
     [[nodiscard]] inline bool stream_body_ended(const Connection* c) noexcept
     {
-        return c->req.f.stream_chunked && c->req.chunkdec.done();
+        if (c->req.f.stream_body == net::http::Body::Length) return c->req.f.stream_left == 0;
+        return c->req.f.stream_body == net::http::Body::Chunked && c->req.chunkdec.done();
     }
 
     /// Wrap whatever was appended to `out` at or after `pos` in one chunk frame.
@@ -191,11 +192,12 @@ namespace llmbridge::detail
     // finishing there emits a fabricated finish_reason "stop" and a [DONE] telling
     // the client it received a complete answer.
     //
-    // A close-delimited stream (no chunked framing) genuinely ends at EOF, and must
-    // still finish there.
+    // A Content-Length stream ends at its last byte, with the connection still open.
+    // A close-delimited stream genuinely ends at EOF, and must still finish there.
     inline bool stream_complete(const Connection* client, bool at_eof)
     {
-        if (client->req.f.stream_chunked) return client->req.chunkdec.done();
+        if (client->req.f.stream_body == net::http::Body::Chunked) return client->req.chunkdec.done();
+        if (client->req.f.stream_body == net::http::Body::Length) return client->req.f.stream_left == 0;
         return at_eof;
     }
 
@@ -218,14 +220,22 @@ namespace llmbridge::detail
         // Reused, never re-allocated
         std::string& sse_in = client->req.sse_scratch;
         sse_in.clear();
-        if (client->req.f.stream_chunked)
+        if (client->req.f.stream_body == net::http::Body::Chunked)
         {
             const bool ok = client->req.chunkdec.feed(in, sse_in);
             in.clear();
             if (!ok) return StreamStep::Corrupt; // truncate honestly: no fake [DONE]
         }
+        else if (client->req.f.stream_body == net::http::Body::Length && in.size() > client->req.f.stream_left)
+        {
+            // Past the body: left in `in`, where it keeps the upstream out of the pool.
+            sse_in.assign(in, 0, client->req.f.stream_left);
+            in.erase(0, client->req.f.stream_left);
+            client->req.f.stream_left = 0;
+        }
         else
         {
+            if (client->req.f.stream_body == net::http::Body::Length) client->req.f.stream_left -= in.size();
             sse_in.swap(in);
             in.clear();
         }

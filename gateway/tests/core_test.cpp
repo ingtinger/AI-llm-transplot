@@ -91,6 +91,9 @@ namespace llmbridge
         void finalize(Connection* c) { g.finalize_stream(c); }
         void abort_pair(Connection* c) { g.abort_pair(c); }
         void bytes(Connection* c) { g.on_client_bytes(c); }
+        void upstream_bytes(Connection* u) { g.on_upstream_bytes(u); }
+        void flush(Connection* c) { g.stream_flush(c); }
+        void pump(Connection* u) { g.stream_pump(u); }
         void gone(Connection* c) { g.client_gone(c); }
         const Stats& stats() const { return g.stats(); }
         size_t pooled() const { return g.pooled_upstream_count(); }
@@ -139,9 +142,6 @@ namespace
             calls.push_back(c.is_client ? "close client" : "close upstream");
             _t.forget(c);
         }
-        void finish(Connection&) noexcept override { calls.push_back("finish"); }
-        void stream_pump(Connection&) noexcept override { calls.push_back("stream_pump"); }
-        void stream_flush(Connection&) noexcept override { calls.push_back("stream_flush"); }
 
         bool called(const std::string& what) const
         {
@@ -179,12 +179,12 @@ namespace
         Connection* u = t.upstream();
         t.dispatch(c, u);
         t.error_respond(c, 502);
-        EXPECT_EQ(c->req.f.phase, Phase::Replying);
-        EXPECT_TRUE(c->close_after_resp);
-        EXPECT_EQ(c->peer, nullptr);
         EXPECT_TRUE(u->doomed) << "an abandoned upstream is closed, never pooled";
-        EXPECT_EQ(io.calls, (std::vector<std::string>{"close upstream", "send client", "finish"}));
+        // On the wire at once: finished, and an error reply closes the client.
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"close upstream", "send client", "close client"}));
+        EXPECT_TRUE(c->doomed);
         EXPECT_EQ(t.stats().errors, 1u);
+        EXPECT_EQ(t.stats().requests, 0u);
     }
 
     // The client stopped reading: its reply is queued behind a full socket. A second
@@ -201,7 +201,6 @@ namespace
         t.error_respond(c, 502);
         EXPECT_TRUE(c->doomed) << "a reply already begun is aborted, not followed";
         EXPECT_EQ(c->out.bytes(), staged);
-        EXPECT_FALSE(io.called("finish"));
         EXPECT_EQ(t.stats().errors, 2u);
     }
 
@@ -211,7 +210,6 @@ namespace
         io.next_send = Sent::Failed;
         t.error_respond(c, 400);
         EXPECT_TRUE(c->doomed);
-        EXPECT_FALSE(io.called("finish"));
         EXPECT_EQ(t.stats().errors, 2u) << "the reply, then the abort";
     }
 
@@ -336,12 +334,15 @@ namespace
         llmbridge::net::http::ResponseHead h;
         h.header_len = 19;
         h.keep_alive = true;
+        h.body = llmbridge::net::http::Body::UntilClose;
+        io.next_send = Sent::Queued;
         t.begin_stream(u, h);
         EXPECT_EQ(c->req.f.phase, Phase::Streaming);
         EXPECT_TRUE(c->req.f.stream_chunked_out);
-        EXPECT_EQ(u->rbuf, "data: x\n\n");
+        EXPECT_TRUE(u->rbuf.empty()) << "the body was pumped";
         EXPECT_EQ(c->out.bytes().rfind("HTTP/1.1 200", 0), 0u);
-        EXPECT_EQ(io.calls, (std::vector<std::string>{"stream_pump"}));
+        EXPECT_NE(c->out.bytes().find("data: x"), std::string::npos);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"send client", "pause upstream"}));
     }
 
     TEST_F(Core, AnUpstreamEofEndsACloseDelimitedStreamAndClosesTheUpstream)
@@ -356,7 +357,9 @@ namespace
         EXPECT_TRUE(c->req.f.stream_ended);
         EXPECT_FALSE(c->close_after_resp);
         EXPECT_TRUE(u->doomed);
-        EXPECT_EQ(io.calls, (std::vector<std::string>{"close upstream", "stream_flush"}));
+        // Flushed at once and ended: finalized, and a close-delimited reply closes.
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"close upstream", "send client", "close client"}));
+        EXPECT_EQ(t.stats().requests, 1u);
     }
 
     TEST_F(Core, AChunkedStreamCutByEofIsTruncated)
@@ -364,7 +367,8 @@ namespace
         Connection* c = t.client();
         Connection* u = t.upstream();
         t.dispatch(c, u);
-        c->req.f.streaming = c->req.f.stream_chunked = true;
+        c->req.f.streaming = true;
+        c->req.f.stream_body = llmbridge::net::http::Body::Chunked;
         c->req.f.phase = Phase::Streaming;
         u->rbuf = "5\r\ndata:";
         t.upstream_eof(u);
@@ -377,7 +381,8 @@ namespace
         Connection* c = t.client();
         Connection* u = t.upstream();
         t.dispatch(c, u);
-        c->req.f.streaming = c->req.f.stream_chunked = c->req.f.stream_chunked_out = true;
+        c->req.f.streaming = c->req.f.stream_chunked_out = true;
+        c->req.f.stream_body = llmbridge::net::http::Body::Chunked;
         c->req.f.stream_keep_alive = c->req.f.stream_ended = true;
         std::string sse;
         ASSERT_TRUE(c->req.chunkdec.feed(std::string("0\r\n\r\n"), sse));
@@ -488,5 +493,118 @@ namespace
         EXPECT_LE(c->req.f.ts_req_recvd, c->req.f.ts_req_built);
         EXPECT_TRUE(c->rbuf.empty());
         EXPECT_EQ(io.calls, (std::vector<std::string>{"connect"})) << "a cold upstream sends on connect";
+    }
+    /// A streaming request in flight on `c` and `u`, the SSE head already sent.
+    void streaming(Connection* c, Connection* u, llmbridge::net::http::Body body, uint64_t len = 0)
+    {
+        c->req.f.streaming = true;
+        c->req.f.phase = Phase::Streaming;
+        c->req.f.stream_body = body;
+        c->req.f.stream_left = len;
+        c->req.f.stream_keep_alive = true;
+        (void)u;
+    }
+
+    // The client stops reading: the backend that can pause stops reading the upstream,
+    // once per episode, and resumes when the client drains. T1 without a kernel.
+    TEST_F(Core, ASlowClientPausesItsStreamsUpstreamAndADrainResumesIt)
+    {
+        Connection* c = t.client();
+        Connection* u = t.upstream();
+        t.dispatch(c, u);
+        streaming(c, u, llmbridge::net::http::Body::UntilClose);
+        io.next_send = Sent::Queued;
+        u->rbuf = "data: 1\n\n";
+        t.pump(u);
+        u->read_paused = true; // what set_read records in a backend
+        u->rbuf = "data: 2\n\n";
+        t.pump(u);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"send client", "pause upstream", "send client"}));
+        EXPECT_EQ(t.stats().stream_pauses, 1u);
+
+        io.next_send = Sent::Done; // the client drained
+        t.flush(c);
+        EXPECT_EQ(io.calls.back(), "resume upstream");
+        EXPECT_TRUE(c->out.idle());
+        EXPECT_FALSE(c->doomed);
+    }
+
+    // Where reads cannot be paused, the stream's buffer is capped instead.
+    TEST_F(Core, WithoutAPauseASlowClientsStreamIsCappedNotPaused)
+    {
+        FakeIo capped{t};
+        t.attach(capped, /*backpressure=*/false);
+        capped.next_send = Sent::Queued;
+        Connection* c = t.client();
+        Connection* u = t.upstream();
+        t.dispatch(c, u);
+        streaming(c, u, llmbridge::net::http::Body::UntilClose);
+        u->rbuf.assign(1 << 20, 'x');
+        t.pump(u);
+        EXPECT_FALSE(capped.called("pause upstream"));
+        EXPECT_FALSE(c->doomed);
+        for (int i = 0; i < 9 && !c->doomed; ++i)
+        {
+            u->rbuf.assign(1 << 20, 'x');
+            t.pump(u);
+        }
+        EXPECT_TRUE(c->doomed) << "past kStreamBufCap the stream is dropped";
+        EXPECT_EQ(t.stats().errors, 1u);
+    }
+
+    // A Content-Length-framed stream ends at its last byte, with the upstream still
+    // open, and the upstream is pooled: nothing waits for an EOF that never comes.
+    TEST_F(Core, AContentLengthStreamEndsAtItsLastByteWithoutEof)
+    {
+        Connection* c = t.client();
+        Connection* u = t.upstream();
+        t.dispatch(c, u);
+        const std::string body = "data: x\n\ndata: [DONE]\n\n";
+        streaming(c, u, llmbridge::net::http::Body::Length, body.size());
+        c->req.f.stream_chunked_out = true;
+        u->rbuf = body.substr(0, 10);
+        t.pump(u);
+        EXPECT_FALSE(c->req.f.stream_ended);
+        u->rbuf = body.substr(10);
+        t.pump(u);
+        EXPECT_TRUE(c->req.f.stream_ended);
+        EXPECT_FALSE(c->close_after_resp);
+        EXPECT_EQ(t.pooled(), 1u) << "the body ended at a message boundary";
+        EXPECT_EQ(t.stats().requests, 1u);
+        EXPECT_EQ(c->req.f.phase, Phase::Idle);
+    }
+
+    TEST_F(Core, BytesPastAContentLengthStreamKeepTheUpstreamOutOfThePool)
+    {
+        Connection* c = t.client();
+        Connection* u = t.upstream();
+        t.dispatch(c, u);
+        streaming(c, u, llmbridge::net::http::Body::Length, 9);
+        c->req.f.stream_chunked_out = true;
+        u->rbuf = "data: x\n\nHTTP/1.1 200 OK\r\n";
+        t.pump(u);
+        EXPECT_TRUE(c->req.f.stream_ended);
+        EXPECT_EQ(t.pooled(), 0u);
+        EXPECT_TRUE(u->doomed);
+    }
+
+    // A response arriving over many reads has its head parsed once.
+    TEST_F(Core, AResponseHeadIsParsedOnceHoweverManyReadsTheBodyTakes)
+    {
+        Connection* c = t.client();
+        Connection* u = t.upstream();
+        t.dispatch(c, u);
+        const std::string body(1000, 'a');
+        u->rbuf = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n";
+        t.upstream_bytes(u);
+        for (size_t at = 0; at < body.size(); at += 100)
+        {
+            u->rbuf.append(body, at, 100);
+            t.upstream_bytes(u);
+        }
+        EXPECT_EQ(u->framer.head_parses(), 1u);
+        EXPECT_EQ(c->req.f.phase, Phase::Idle) << "the reply finished";
+        EXPECT_EQ(t.stats().requests, 1u);
+        EXPECT_EQ(t.pooled(), 1u);
     }
 } // namespace

@@ -38,7 +38,7 @@ namespace llmbridge
         if (u.upstream_slot < 0 || static_cast<size_t>(u.upstream_slot) >= _lists.size())
             return Refusal::Closed;
 
-        u.rdec.reset();
+        u.framer.reset();
         // The request held the client's credential and the next client is someone
         // else. ProxyAuth.CredentialIsScrubbedFromAPooledUpstreamBuffer guards it.
         u.out.scrub();

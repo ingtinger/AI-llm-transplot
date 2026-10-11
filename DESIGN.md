@@ -72,10 +72,10 @@ Two rules make this worth the verbosity:
    counterpart returned nothing and the pairing had to be rediscovered by reading.
 
 **Constants carry the same claim, capitalised:** `kEpMaxReadPerEvent` is epoll's,
-`kUrStreamBufCap` is io_uring's, and a bare `kInitialBuf` is shared. This earns its
+`kUrBufCount` is io_uring's, and a bare `kInitialBuf` is shared. This earns its
 keep because the two backends bound memory by different means: epoll pauses its
 upstream read when a client write goes partial, io_uring has no pause path at all and
-drops the stream past `kUrStreamBufCap`. A constant that reads as shared invites a fix
+drops the stream past `kStreamBufCap`. A constant that reads as shared invites a fix
 on the wrong side, and a one-sided fix usually lands on the side that does not ship.
 
 The uring prefix is `ur_`, not `u_`, because `u` is the conventional parameter name
