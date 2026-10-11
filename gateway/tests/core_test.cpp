@@ -552,7 +552,7 @@ namespace
         EXPECT_EQ(t.stats().errors, 1u);
     }
 
-    // G4: a Content-Length-framed stream ends at its last byte, with the upstream still
+    // A Content-Length-framed stream ends at its last byte, with the upstream still
     // open, and the upstream is pooled: nothing waits for an EOF that never comes.
     TEST_F(Core, AContentLengthStreamEndsAtItsLastByteWithoutEof)
     {

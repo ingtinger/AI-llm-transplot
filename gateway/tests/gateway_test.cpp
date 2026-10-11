@@ -3860,7 +3860,7 @@ TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u);
     // epoll implements backpressure by pausing upstream reads; io_uring instead
-    // bounds the buffer (kUrStreamBufCap), so only assert the counter on epoll.
+    // bounds the buffer (kStreamBufCap), so only assert the counter on epoll.
     if (GetParam() == llmbridge::IoBackend::Epoll)
     {
             EXPECT_GT(_gw->stats().stream_pauses, 0u) << "slow client should have paused upstream reads";
@@ -6764,6 +6764,31 @@ TEST_P(ProxyForwardStream, ACloseDelimitedStreamEndsWhenTheProviderClosesLater)
     shutdown();
     EXPECT_EQ(_gw->stats().requests, 1u);
     EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// An SSE response framed by Content-Length ends at its last byte. The provider
+// keeps the connection open, so a stream that waited for EOF left the client hanging
+// until the idle timeout truncated it. It must end at once, and the upstream be reused.
+TEST_P(ProxyForwardStream, AContentLengthStreamEndsWithoutWaitingForEof)
+{
+    const std::string body = openai_sse_events();
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: " +
+                          std::to_string(body.size()) + "\r\nConnection: keep-alive\r\n\r\n" + body);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    for (int i = 0; i < 2; ++i)
+    {
+        ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+        const std::string got = c.recv_chunked(2000);
+        ASSERT_FALSE(got.empty()) << "stream " << i << " waited for an EOF that never comes";
+        EXPECT_NE(got.find("data: [DONE]"), std::string::npos);
+    }
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 2u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+    EXPECT_EQ(_gw->stats().upstream_reused, 1u) << "the upstream ended at a message boundary";
 }
 
 // Usage survives a stream long enough that the tail is trimmed many times. Nothing
