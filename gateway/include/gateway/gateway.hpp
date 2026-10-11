@@ -7,40 +7,18 @@
 
 #pragma once
 
-// Gateway: the whole llmbridge proxy in one class. A single-threaded, non-blocking
+// Gateway: the whole llmbridge proxy behind one class. A single-threaded, non-blocking
 // event loop (epoll or io_uring): accept, frame, optionally translate the provider
 // dialect, forward over a keep-alive upstream pool, read back, translate, reply.
-// The per-socket state is in src/core/conn.hpp; how it all fits, GATEWAY-INTERNALS.md.
-//
-// Per-request added latency is the headline metric, and LATENCY.md is normative for
-// every number below; change a stamp and that document changes with it.
-//
-//   t0 ts_req_recvd   client request fully framed
-//   t1 ts_req_built   upstream request built (nothing sent yet)
-//   t2 ts_wire_ready  socket can carry the request (== t1 when pooled)
-//   t3 ts_up_sent     request handed to the kernel by write()
-//   t4 ts_up_recvd    provider's response received
-//   t5                response built, client write begins
-//   t6                response fully flushed
-//
-//   added = (t1-t0) + (t3-t2) + (t4 -> t6)
-//
-// Excluded on purpose: the provider's own time (t3->t4) and the TCP+TLS handshake
-// (t1->t2, recorded separately as Stats::connect), because the client's own stack
-// pays that same handshake without us, so it cancels.
+// The machinery is detail::Engine (src/engine.hpp); how it fits, GATEWAY-INTERNALS.md;
+// what each timing number means, LATENCY.md, which is normative.
 
-#include <netinet/in.h>
-
-#include <atomic>
-#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <utility>
 #include <vector>
 
 #include "gateway/metrics.hpp"
@@ -49,10 +27,6 @@
 #include "gateway/sink.hpp"
 #include "gateway/stats.hpp"
 #include "gateway/venue.hpp"
-#include "net/http.hpp"
-#include "net/tls.hpp"   // self-guarded by LLMBRIDGE_HAVE_TLS
-#include "net/uring.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
-#include "provider/translate.hpp"
 
 namespace llmbridge
 {
@@ -60,488 +34,109 @@ namespace llmbridge
     /// The field promises identity of "the leading bytes" and not this number.
     inline constexpr size_t kPrefixHashBytes = 4096;
 
-    struct Connection;   // src/core/conn.hpp
-    class UpstreamPool;  // src/core/pool.hpp
-    template <class T> class Registry; // src/core/registry.hpp
+    struct Connection; // src/core/conn.hpp
     namespace detail
     {
-        class IoOps;    // src/core/io.hpp
-        struct IoCaps;
-    } // namespace detail
+        class Engine; // src/engine.hpp
+    }
 
     class Gateway
     {
     public:
         /// How long a request may sit with no bytes from the upstream before the
-        /// gateway gives up (0 = disabled), so a stalled provider cannot pin a client
-        /// and two fds forever. Once streaming, it bounds the gap between events.
+        /// gateway gives up (0 = disabled). Once streaming, it bounds the gap between events.
         static constexpr int64_t kDefaultUpstreamIdleNs = 120LL * 1000 * 1000 * 1000; // 120 s
-
-        /// How long a fresh upstream connect may take, TCP and TLS handshake together,
-        /// before the request fails over or gets a 502 (0 = disabled). Not less than 3s,
-        /// because Linux retransmits a lost SYN at 1s.
+        /// How long a fresh connect may take, TCP and TLS handshake together, before
+        /// the request fails over or gets a 502 (0 = disabled). Linux retransmits a
+        /// lost SYN at 1 s, so not less than 3 s.
         static constexpr int64_t kDefaultConnectNs = 5LL * 1000 * 1000 * 1000; // 5 s
-
-        /// Keep-alive pool bound. Too small and it stops bounding and starts killing
-        /// reuse: 256 cost the non-streaming path 2.4x its throughput, git-bisected.
-        /// Do not lower it without re-running ./bench/saturate.sh with BACKENDS=4.
+        /// Keep-alive pool bound. 256 cost the non-streaming path 2.4x its throughput,
+        /// git-bisected: do not lower it without ./bench/saturate.sh with BACKENDS=4.
         static constexpr size_t kMaxIdleUpstreams = 8192;
-        /// Retired send buffers kept for the next upstream connection; each may be as
-        /// large as the largest request seen, so this bounds resident memory.
+        /// Retired send buffers kept for the next upstream, each as large as the
+        /// largest request seen, so this bounds resident memory.
         static constexpr size_t kWarmBufs = 8;
-        /// Below this a buffer is not worth keeping: the faults it would spare are
-        /// microseconds.
-        static constexpr size_t kWarmMin = 64 * 1024;
-        /// How long a pooled upstream may sit unused. A compromise for one upstream
-        /// and one worker; every pool sees ~1/(workers x venues) of the traffic and
-        /// every crossing of this line costs the next request a full reconnect,
-        /// hence a knob.
+        static constexpr size_t kWarmMin = 64 * 1024; // smaller is not worth keeping
+        /// How long a pooled upstream may sit unused; every crossing of it costs the
+        /// next request a reconnect, hence a knob.
         static constexpr int64_t kDefaultPoolIdleNs = 30LL * 1000 * 1000 * 1000; // 30 s
-
-        /// How often the gateway says how many connections it is holding.
         static constexpr int64_t kDefaultHeartbeatNs = 300LL * 1000 * 1000 * 1000; // 5 min
-        /// How long a client may stay connected without completing one request: a
-        /// handshake that never finishes, a half-sent request, the wrong protocol.
-        /// Generous, because a slow mobile client on a cold handshake is real.
+        /// A client that never completes a request: a stuck handshake, a half-sent
+        /// request, the wrong protocol. Generous for slow mobile clients.
         static constexpr int64_t kClientSetupNs = 30LL * 1000 * 1000 * 1000; // 30 s
-        /// An established client that goes quiet. Deliberately enormous: a descriptor
-        /// bound for an exposed listener, never a load-balancing device. 0 disables it.
+        /// An established client gone quiet. A descriptor bound for an exposed
+        /// listener, not a load-balancing device; 0 disables it.
         static constexpr int64_t kDefaultClientIdleNs = 3LL * 24 * 3600 * 1000 * 1000 * 1000;
 
-        /// `policy` is non-owning and must outlive the Gateway; null means none is
-        /// consulted.
+        /// `policy` is non-owning and must outlive the Gateway; null means none.
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
                 int64_t warmup_ns = 0, UpstreamDialect dialect = UpstreamDialect::OpenAI,
                 IoBackend io = IoBackend::Auto,
                 int64_t upstream_idle_ns = kDefaultUpstreamIdleNs,
                 TlsConfig tls = {}, bool timing_headers = false,
                 Policy* policy = nullptr, std::vector<std::string> strip_headers = {});
-
-        /// Several upstreams, chosen per request by the installed policy. Must not be
-        /// empty, and is fixed for the process lifetime because the pools and every live
-        /// `upstream_slot` index it. `tls` here is the inbound leg only.
+        /// Several upstreams, chosen per request by the policy. Not empty, and fixed for
+        /// the process lifetime. `tls` here is the inbound leg only.
         Gateway(uint16_t listen_port, std::vector<Upstream> upstreams, int64_t warmup_ns,
                 IoBackend io, int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers,
                 Policy* policy, std::vector<std::string> strip_headers);
         ~Gateway();
-
         Gateway(const Gateway&) = delete;
         Gateway& operator=(const Gateway&) = delete;
 
         /// Run the event loop until request_stop() is called. Returns 0.
         int run();
-
-        /// Flips a flag the loop observes within one poll tick.
-        void request_stop() noexcept { _stop.store(true, std::memory_order_relaxed); }
-
-        /// Print this worker's latency histograms on its next sweep; otherwise the
-        /// shutdown profile is the only way to read `accept(TLS)`.
-        void request_stats_dump() noexcept { _dump.store(true, std::memory_order_relaxed); }
-
-        /// Write this worker's histograms to `out`. Safe from the owning worker, or
-        /// from any thread once the worker has stopped and been joined.
+        /// Flips a flag the loop observes within one poll tick; safe from any thread.
+        void request_stop() noexcept;
+        /// Print this worker's histograms on its next sweep; safe from any thread.
+        void request_stats_dump() noexcept;
+        /// Safe from the owning worker, or from any thread once it has been joined.
         void print_profile(std::FILE* out, const char* title) const noexcept;
-
-        const Stats& stats() const noexcept { return _stats; }
-
+        [[nodiscard]] const Stats& stats() const noexcept;
         /// The configured backend (the requested mode; Auto stays Auto).
-        IoBackend io_backend() const noexcept { return _io; }
+        [[nodiscard]] IoBackend io_backend() const noexcept;
+        /// The bound listen port (resolves an ephemeral 0).
+        [[nodiscard]] uint16_t bound_port() const noexcept;
 
-        /// Actual bound listen port (resolves ephemeral when 0 was requested).
-        uint16_t bound_port() const noexcept;
-
-        /// Test seams and operational dials; call before run(). 0 disables pool
-        /// reaping and silences the heartbeat respectively.
-        void set_client_setup_ns(int64_t ns) noexcept { _client_setup_ns = ns; }
-        void set_client_idle_ns(int64_t ns) noexcept { _client_idle_ns = ns; }
-        void set_pool_idle_ns(int64_t ns) noexcept { _pool_idle_ns = ns; }
-        void set_connect_ns(int64_t ns) noexcept { _connect_ns = ns; }
-        void set_heartbeat_ns(int64_t ns) noexcept { _heartbeat_ns = ns; }
-        /// Bytes to reserve and then write through in the two scratch strings at
-        /// run(), before any request. A reserve alone maps nothing, the first write
-        /// still faults every page, so the pages are touched, once, at start. Not
-        /// per upstream connection: touching 16 MB there cost the request that opened
-        /// the connection 8 ms on the live tape, against 0.2 ms without, to spare a
-        /// later request at most 3 ms. 0 (the default) prefaults nothing; the buffers
-        /// still grow and keep their capacity, so only the first pass is cold.
-        void set_prefault_bytes(size_t n) noexcept { _prefault_bytes = n; }
-        /// Optional per-request metadata sink (sink.hpp). Non-owning; call before
-        /// run(). `capture` names up to kSinkCaptureMax request headers whose values
-        /// are copied (bounded) and handed back in RequestRecord::captured.
+        // Test seams and operational dials; call before run(). 0 disables pool reaping
+        // and the heartbeat respectively.
+        void set_client_setup_ns(int64_t ns) noexcept;
+        void set_client_idle_ns(int64_t ns) noexcept;
+        void set_pool_idle_ns(int64_t ns) noexcept;
+        void set_connect_ns(int64_t ns) noexcept;
+        void set_heartbeat_ns(int64_t ns) noexcept;
+        /// Bytes to reserve and touch in the scratch buffers at run(), so the first
+        /// requests do not fault pages in. 0 prefaults nothing.
+        void set_prefault_bytes(size_t n) noexcept;
+        /// Optional per-request sink (sink.hpp), non-owning. `capture` names up to
+        /// kSinkCaptureMax request headers copied into RequestRecord::captured.
         void set_request_sink(RequestSink* sink, std::vector<std::string> capture);
 
-        /// Test seam: does any pooled upstream still hold `needle`? Yes/no only, never
-        /// returning or logging buffer contents, which is the only shape a
-        /// credential-adjacent accessor may have. Exists because a mutation sweep
-        /// showed secure_clear() could be deleted with no test noticing.
+        /// Does any pooled upstream still hold `needle`? Yes or no only: a
+        /// credential-adjacent accessor never returns or logs buffer contents.
         [[nodiscard]] bool pooled_buffer_contains(std::string_view needle) const noexcept;
-        /// Test seam. Like stats(), reads state owned by the loop thread, so it is
-        /// valid only once that thread has been joined.
+        /// Loop-thread state, like stats(): valid once that thread has been joined.
         [[nodiscard]] size_t pooled_upstream_count() const noexcept;
-        /// Test seam: the pool's total cap, kMaxIdleUpstreams unless set; before run().
-        void set_pool_cap_for_test(size_t n) noexcept;
-
-        /// Test seam: the SNI/verify host recorded for an upstream, pinning the
-        /// single-upstream constructor against a read-after-move that once emptied it.
-        [[nodiscard]] std::string_view upstream_sni_host(size_t i) const noexcept
-        {
-            return i < _upstreams.size() ? std::string_view(_upstreams[i].sni_host)
-                                         : std::string_view{};
-        }
-
-        /// Size of the io_uring provided-buffer pool (power of two), 0 for the default;
-        /// call before run(). Lets a test shrink the pool far enough to force -ENOBUFS,
-        /// a branch never reached at the shipped size even at 8192 streams.
-        void set_uring_buf_count_for_test(unsigned n) noexcept { _uring_buf_count = n; }
-        /// SO_SNDBUF for accepted client sockets, 0 for the kernel default; call
-        /// before run(). A fixed value turns off send-buffer autotuning, which on
-        /// loopback can absorb a whole multi-MB stream and so never back up a write.
-        void set_client_sndbuf_for_test(int bytes) noexcept { _client_sndbuf = bytes; }
-        /// Epoll only: at most `bytes` per socket write pass, then the write behaves as
-        /// EAGAIN, so a test can force a partial flush at any size; call before run().
-        void set_epoll_write_cap_for_test(size_t bytes) noexcept { _ep_write_cap = bytes; }
-        /// Test seam: prefault the scratch buffers now, without run(), and report how
-        /// many of `_rebuild`'s pages the kernel has resident (mincore), so a test
-        /// can prove the touch mapped them and a reserve alone would not have.
+        void set_pool_cap_for_test(size_t n) noexcept; // before run()
+        /// The SNI/verify host recorded for upstream `i`, or empty.
+        [[nodiscard]] std::string_view upstream_sni_host(size_t i) const noexcept;
+        /// The io_uring provided-buffer count (a power of two), 0 for the default.
+        void set_uring_buf_count_for_test(unsigned n) noexcept;
+        /// SO_SNDBUF for accepted clients, 0 for the kernel's: a fixed value turns off
+        /// the autotuning that can absorb a whole stream on loopback.
+        void set_client_sndbuf_for_test(int bytes) noexcept;
+        /// Epoll only: at most `bytes` per socket write pass, then it behaves as EAGAIN.
+        void set_epoll_write_cap_for_test(size_t bytes) noexcept;
+        /// Prefault the scratch buffers now and report how much of one is resident.
         size_t prefault_resident_bytes_for_test();
-        /// Buffer rotation, shared by both backends and callable from tests.
+        /// Buffer rotation, callable from tests.
         void retire_wbuf(Connection* u) noexcept;
         void adopt_warm(Connection* u) noexcept;
-        /// Counts a build the scratch could not hold without growing.
-        void note_build(size_t need) noexcept;
-        size_t warm_bufs_for_test() const noexcept { return _warm.size(); }
+        void note_build(size_t need) noexcept; // counts a build the scratch could not hold
+        [[nodiscard]] size_t warm_bufs_for_test() const noexcept;
 
     private:
-        // Naming: ep_* is epoll-only, ur_* is io_uring-only, unprefixed is shared. A
-        // call crossing the prefixes is a bug, because neither backend's teardown,
-        // write-arming or completion handling is valid in the other.
-        // scripts/check_conventions.py enforces it; DESIGN.md "Naming conventions".
-        void ep_add_read(Connection* c) noexcept;
-        void ep_pause_accept() noexcept;
-        void ep_sync_interest(Connection* c) noexcept;
-        void ep_resume_accept() noexcept;
-        void ep_arm_write(Connection* c) noexcept;
-        void ep_disarm_write(Connection* c) noexcept;
-
-        void ep_on_accept() noexcept;
-        void ep_on_client_readable(Connection* c) noexcept;
-        void ep_set_read(Connection* c, bool on) noexcept; // the one writer of read_paused
-        void ep_on_client_writable(Connection* c) noexcept;
-        void ep_on_upstream_writable(Connection* c) noexcept;
-        void ep_on_upstream_readable(Connection* c) noexcept;
-
-
-        // The shared lifecycle, run on either backend through `_ops`. GATEWAY-INTERNALS.md 3d.
-        class EpollIo;
-        class UringIo;
-        friend struct GatewayCoreTest; // gateway/tests/core_test.cpp drives it with a FakeIo
-        void attach(detail::IoOps* io, const detail::IoCaps& caps) noexcept;
-        detail::IoOps* _ops = nullptr;
-        bool _stream_backpressure = false; ///< IoCaps::stream_backpressure of the running backend
-        /// Send what `client` owes; finish on the spot when it all went.
-        void respond(Connection* client) noexcept;
-        /// Bytes reached `c->rbuf`: frame a request if idle, then bound what is buffered.
-        void on_client_bytes(Connection* c) noexcept;
-        void try_frame(Connection* c) noexcept; // stamps t0, frames one request, dispatches it
-        /// Translate or rebuild the framed request, acquire an upstream and send it.
-        void dispatch(Connection* client) noexcept;
-        void gate_client_reads(Connection* c) noexcept; // the pipelining cap pauses, never closes
-        void client_gone(Connection* c) noexcept;       // EOF or a socket error on a client
-        void send_continue(Connection* c) noexcept;     // the interim 100, staged like any reply
-        void finish(Connection* client) noexcept; // a staged reply is on the wire
-        /// New bytes in an upstream's rbuf: the response, framed once, or stream body.
-        void on_upstream_bytes(Connection* u) noexcept;
-        void on_response(Connection* u, const net::http::ResponseHead& h, std::string_view body,
-                         size_t total_len) noexcept; // a whole response: relay or translate
-        enum class UpFail : uint8_t
-        {
-            Eof,
-            Tls,
-            Write,
-        };
-        /// The upstream failed before a response: retry, fail over, else a 502.
-        void upstream_lost(Connection* u, UpFail f) noexcept;
-        void on_upstream_eof(Connection* u, bool tls_failed) noexcept; // EOF or a read error
-        void begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept; // enter streaming
-        void stream_pump(Connection* u) noexcept;         // translate new upstream body bytes
-        void stream_flush(Connection* client) noexcept;   // write them; pause, or cap, a slow client
-        void stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
-        void finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
-        /// A new upstream to `slot`, not yet open.
-        [[nodiscard]] Connection* new_upstream(int slot) noexcept;
-
-        /// Ask the installed policy about a freshly framed request. Callers treat
-        /// `allow == false` as terminal and reply with their own ep_/ur_ responder.
-        /// Only called when a policy exists.
-        Decision policy_decision(Connection* c, const net::http::Message& m) noexcept;
-
-        /// Sink plumbing, shared verbatim by both loops: sink_capture runs at framing,
-        /// capture_model separately because the policy reads the model before
-        /// deciding, sink_emit at every completion, streams and error replies included.
-        /// capture_model returns why the body must be refused, or null.
-        void sink_capture(Connection* c) noexcept;
-        [[nodiscard]] const char* capture_model(Connection* c) noexcept;
-        void sink_emit(Connection* c, int status, bool streamed) noexcept;
-
-        /// Ask the policy for another venue and re-dispatch there. True when the
-        /// request was re-sent, in which case the caller must not also answer the
-        /// client.
-        bool upstream_failed(Connection* client, int status, const char* why) noexcept;
-
-        /// Shared half: may this be re-dispatched, and where? No teardown happens here.
-        [[nodiscard]] Retry failover_target(Connection* client, int status,
-                                            const char* why) noexcept;
-
-        /// At most this many venues per request, so one dead provider is not a
-        /// latency multiplier under a policy that always names another.
-        static constexpr int kMaxFailoverAttempts = 3;
-
-        /// Most bytes one readable event may pull off a socket, epoll's equivalent of
-        /// io_uring's 4 KB provided buffer. ep_drain_read loops to EAGAIN, so a cap in
-        /// the pump is checked once per event after an unbounded pull: one event once
-        /// staged 33 MB for a client that never read. Only a read budget bounds that;
-        /// level-triggered epoll re-notifies, so stopping early costs one wakeup.
-        static constexpr size_t kEpMaxReadPerEvent = 1 << 20; // 1 MiB
-
-        /// The venue a connection is bound to; defined in loop.hpp beside Connection.
-        [[nodiscard]] const Upstream& upstream_of(const Connection* c) const noexcept;
-
-        /// One shared SSL_CTX covers every venue: it holds the trust store, while SNI
-        /// and the verified hostname are per-connection.
-        [[nodiscard]] bool any_upstream_tls() const noexcept
-        {
-            for (const Upstream& u : _upstreams)
-                if (u.tls) return true;
-            return false;
-        }
-
-        /// Heartbeat, pool reaping and every timeout, in one walk of the clients.
-        void sweep_idle() noexcept;
-        void sweep_client(Connection* c, int64_t now, bool busy) noexcept;
-        void fail_request(Connection* client, int code, const char* why) noexcept; // failover, else reply
-
-        /// `slot` indexes the upstream table; the pool it draws from is that venue's.
-        Connection* acquire_upstream(int slot) noexcept;
-        /// Pool `u` if UpstreamPool::release agrees, else close it. `keep_alive`: the
-        /// response, and for a byte-forward the client, allow it; `body_ended`: the
-        /// response reached a message boundary.
-        void release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
-        /// True when `u` is now pooled; logs and counts a refusal.
-        [[nodiscard]] bool pool_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
-        /// A pooled upstream failed before any response, so the provider dropped the
-        /// idle keep-alive: resend the request once on a fresh connection.
-        bool retry_upstream(Connection* u) noexcept;
-        void ep_close_client(Connection* c) noexcept;
-        void ep_close_upstream(Connection* u) noexcept;
-        void abort_pair(Connection* client) noexcept;
-        /// Reply with `code` and abandon any upstream. `why` is for the log, so an
-        /// incident can ask why and not only whether. `detail` is what the client
-        /// sees, and only a 4xx shows it: pass one for the caller's own error or a
-        /// policy's checked message, never its reason, which is free reconnaissance.
-        void error_respond(Connection* client, int code, const char* why,
-                           const char* detail = nullptr) noexcept;
-
-        bool ep_drain_read(Connection* c) noexcept;
-        bool ep_pump_write(Connection* c, bool* done) noexcept;
-
-        /// Keep what the provider said about its own limits, from the response head.
-        static void note_quota(Connection* client, const net::http::ResponseHead& h) noexcept;
-        /// Copy the venue's own request id out of its response head.
-        static void note_venue_req_id(Connection* client, std::string_view head) noexcept;
-        /// Read the kernel's RTT to the venue that just answered.
-        static void note_upstream_rtt(Connection* client, const Connection* u) noexcept;
-        /// Copy the venue's own name for a failure out of its error body, for the
-        /// sink. Does nothing on a 2xx.
-        static void note_upstream_error(Connection* client,
-                                        const net::http::ResponseHead& h,
-                                        std::string_view body) noexcept;
-        /// Warn once when a stream arrives compressed.
-        static void stream_warn_if_encoded(const Connection* client,
-                                           const net::http::ResponseHead& h) noexcept;
-        /// A finished stream's contribution to the latency profile. Shared: a
-        /// histogram fed by one backend only means something different per build.
-        void stream_record_latency(const Connection* client) noexcept;
-        /// End a stream without a terminal [DONE], because it is being aborted. One
-        /// call so the three mutations it needs cannot be split up.
-        void stream_truncate(Connection* client) noexcept;
-        /// Outside the TLS guard because the t2 stamp sites call it in every build; a
-        /// constant `false` without TLS.
-        bool upstream_is_tls(const Connection* u) const noexcept;
-        /// Has this upstream's request left the machine on every transport it uses?
-        /// Recv is armed before send, so a provider answering early can complete a
-        /// response while our request is half-written; pooling it then truncates the
-        /// next client's request. ProxyEarlyResponse reproduces it.
-        bool upstream_request_sent(const Connection* u) const noexcept;
-
-#ifdef LLMBRIDGE_HAVE_TLS
-        // TLS plumbing, both directions. The parameter is `c`, not `u`: these run on
-        // client conns too. GATEWAY-INTERNALS.md 10c.
-        /// Does configuration say this connection must carry TLS? Read from the leg.
-        [[nodiscard]] bool tls_required(const Connection* c) const noexcept;
-        /// Backstop before any write: false means tear the connection down.
-        /// Unreachable today, kept because its precondition is re-established by
-        /// hand at six call sites.
-        [[nodiscard]] bool tls_invariant_ok(Connection* c) noexcept;
-        /// Attach a Session in client role to an upstream conn. False on failure,
-        /// treated like a connect refusal.
-        bool tls_attach_upstream(Connection* u) noexcept;
-        /// Attach a Session in server role to a freshly accepted client conn. False on
-        /// failure, and the caller must then drop the connection: a peer that dialled
-        /// TLS must never be answered in plaintext.
-        bool tls_attach_client(Connection* c) noexcept;
-        /// Move whatever ciphertext the Session has pending into c->tls_out.
-        void tls_pump_out(Connection* c) noexcept;
-        /// Feed ciphertext from the socket; plaintext lands in c->rbuf and the
-        /// handshake advances. On an upstream conn completing it also stamps t2 and
-        /// pushes the pending request. False on a fatal error.
-        bool tls_feed(Connection* c, const char* p, size_t n) noexcept;
-        /// Push un-fed plaintext (`out`'s wire) into the Session.
-        void tls_push_out(Connection* c) noexcept;
-        /// True when `out` is fully on the wire: all plaintext fed and all ciphertext
-        /// flushed. The TLS analogue of ep_pump_write's `done`.
-        bool tls_out_flushed(const Connection* c) const noexcept;
-
-        /// Epoll only: write tls_out to the socket, arming EPOLLOUT on a partial
-        /// write. False = socket error.
-        bool ep_tls_flush(Connection* u, bool* done) noexcept;
-        /// Epoll only: TLS-aware replacement for ep_drain_read on upstream conns.
-        bool ep_tls_drain_read(Connection* u) noexcept;
-
-#ifdef LLMBRIDGE_HAVE_URING
-        /// io_uring only: submit a send for tls_out if non-empty and none in flight;
-        /// handshake flights and request bytes must not interleave on the wire.
-        void ur_tls_flush(Connection* u) noexcept;
-#endif
-#endif
-
-        int run_epoll();
-
-#ifdef LLMBRIDGE_HAVE_URING
-        /// The completion-driven mirror of the epoll state machine. A conn is freed
-        /// only when its `inflight` SQEs all complete.
-        int run_uring();
-        bool ur_next_sqe(struct io_uring_sqe** out) noexcept; // get an SQE, flushing if full
-        [[nodiscard]] bool ur_submit_accept() noexcept;
-        void ur_pause_accept(const char* why) noexcept;
-        [[nodiscard]] bool ur_submit_timer() noexcept;
-        void ur_drop_sq_full(Connection* c) noexcept;
-        bool ur_arm_recv(Connection* c) noexcept; // arm a multishot recv (provided buffers)
-        bool ur_submit_send(Connection* c) noexcept;
-        /// Send `out` to a client conn. Plaintext goes straight out; a TLS conn passes
-        /// through the Session first, because the SQE points at tls_out.
-        void ur_client_send(Connection* c) noexcept;
-        bool ur_submit_connect(Connection* u) noexcept;
-        void ur_submit_cancel(int fd) noexcept; // cancel all in-flight ops on a fd
-        void ur_on_cqe(uint64_t user_data, int res, uint32_t flags) noexcept;
-        void ur_on_accept(int res, uint32_t flags) noexcept;
-        void ur_on_recv(Connection* c, int res, uint32_t flags) noexcept;
-        void ur_on_send(Connection* c, int res) noexcept;
-        void ur_on_connect(Connection* u, int res) noexcept;
-        [[nodiscard]] bool ur_cancel_recv(Connection* c) noexcept; // ends its multishot recv
-        void ur_close(Connection* c) noexcept;
-        void ur_maybe_free(Connection* c) noexcept;
-
-        net::uring::Ring _ring;
-        net::uring::BufRing _bufring; // provided-buffer pool for multishot recv
-        struct __kernel_timespec _uring_ts{};
-        bool _uring_timer_lost = false; // a re-arm found the SQ full; the loop retries it
-        long _uring_inflight = 0; // global in-flight SQEs (drain barrier on stop)
-        bool _draining = false;   // post-stop: completions just decrement, no re-arm
-#endif
-
-        uint16_t _listen_port;
-        /// Never empty: the single-upstream constructor builds one entry, so every
-        /// path can index it without a special case.
-        std::vector<Upstream> _upstreams;
-        int64_t _warmup_ns;
-        /// Settable only so tests can pick a deadline they can wait for: at 30 seconds
-        /// a mutation sweep showed deleting the deadline entirely broke no test.
-        int64_t _client_setup_ns = kClientSetupNs;
-        int64_t _client_idle_ns = kDefaultClientIdleNs;
-        int64_t _pool_idle_ns = kDefaultPoolIdleNs;
-        int64_t _connect_ns = kDefaultConnectNs;
-        size_t _prefault_bytes = 0;
-        /// Reserve `_prefault_bytes` in `s` and touch every page. Shared by both backends.
-        void prefault(std::string& s) const;
-        IoBackend _io;
-        int64_t _upstream_idle_ns;         // 0 = no idle timeout
-
-        void note_connect_failure(int slot, const char* why) noexcept;
-        void request_reresolve(int slot) noexcept;
-        void reresolve_loop() noexcept;
-        void apply_reresolved() noexcept;
-        struct Reresolver
-        {
-            std::thread thread;
-            std::mutex mutex;
-            std::condition_variable cv;
-            std::vector<int> pending;
-            std::vector<std::pair<int, std::vector<std::string>>> done;
-            bool stop = false;
-            std::atomic<bool> ready{false}; ///< `done` is non-empty; the loop's cheap check
-        } _rr;
-        std::vector<uint8_t> _rr_inflight; ///< per slot: a resolution is outstanding
-        TlsConfig _tls; // both legs; each flag inits its own context in the ctor
-        bool _timing_headers = false;      // emit x-llmbridge-* timing on responses
-        /// `const` so there is no setter: swapping it while the loop runs would be a
-        /// data race on the request path. See policy.hpp.
-        Policy* const _policy = nullptr;
-        /// Policy::wants_prefix_hash(), read once in the constructor.
-        bool _wants_prefix_hash = false;
-        RequestSink* _sink = nullptr;
-        std::vector<std::string> _sink_capture_names; ///< lowercased, no colon
-        uint8_t _active_backend = 0;                  ///< 1 epoll, 2 io_uring; set by run
-        /// Header names dropped from every upstream request, lower-cased with the
-        /// colon so they compare against a raw line. Empty in a stock build.
-        std::vector<std::string> _strip_headers;
-#ifdef LLMBRIDGE_HAVE_TLS
-        /// One SSL_CTX per direction, configured oppositely: the upstream context
-        /// verifies a peer, the client context presents a certificate. Named for the
-        /// leg each serves, because on the client leg our TLS role is server.
-        net::tls::Context _tls_upstream_ctx;
-        net::tls::Context _tls_client_ctx;
-#endif
-        unsigned _uring_buf_count = 0;     // 0 = kUrBufCount default (test hook only)
-        int _client_sndbuf = 0;            // 0 = kernel default (test hook only)
-        size_t _ep_write_cap = 0;          // 0 = none (test hook only)
-        int64_t _last_sweep_ns = 0;
-        int64_t _heartbeat_ns = kDefaultHeartbeatNs;
-        /// 0 until the first sweep emits, which it does immediately, so an operator
-        /// learns the heartbeat works without waiting an interval for it.
-        int64_t _last_heartbeat_ns = 0;
-        bool _uring_active = false;
-
-        int _epfd = -1;
-        int _listen_fd = -1;
-        Connection* _listen_conn = nullptr;
-        int64_t _accept_resume_ns = 0; ///< listener paused until then; 0 when accepting
-
-        /// Every Connection is in exactly one: live clients, live upstreams (pooled
-        /// ones too), or closed and awaiting the free (GATEWAY-INTERNALS.md 7).
-        std::unique_ptr<Registry<Connection>> _clients, _upconns, _doomed;
-        std::unique_ptr<UpstreamPool> _pool; ///< keep-alive upstreams, every venue
-        uint64_t _next_client_id = 1;
-        /// The byte-forward rebuild's destination, swapped with the upstream's `out`
-        /// once the upstream is acquired, so the buffers rotate and keep their
-        /// capacity instead of being allocated per request. See request_without.
-        std::string _rebuild;
-        /// Connection buffers are expensive to recreate. Cached as WarmSet.
-        struct WarmSet
-        {
-            std::string out;
-#ifdef LLMBRIDGE_HAVE_TLS
-            std::string tls_out;
-#endif
-        };
-        std::vector<WarmSet> _warm;
-        /// The translated or override-rewritten body on its way into `_rebuild`.
-        std::string _xlate;
-
-        int64_t _t_start = 0;
-        Stats _stats;
-        /// Set cross-thread by the signal/timer thread, observed by the worker loop.
-        /// Relaxed is enough: they gate loop continuation, no other state depends on them.
-        std::atomic<bool> _stop{false};
-        std::atomic<bool> _dump{false};
+        friend struct GatewayCoreTest; // gateway/tests/core_test.cpp
+        std::unique_ptr<detail::Engine> _e;
     };
 } // namespace llmbridge

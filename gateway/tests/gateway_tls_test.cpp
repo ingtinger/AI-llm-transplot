@@ -1621,7 +1621,7 @@ TEST_P(GatewayTls, ClientThatNeverReadsCannotGrowUsWithoutBound)
     const uint64_t peak = _gw->stats().tls_buffered_peak;
     std::fprintf(stderr, "MEASURED tls_buffered_peak = %llu bytes\n",
                  static_cast<unsigned long long>(peak));
-    // The DESIGN bound: one event stages at most kEpMaxReadPerEvent (1 MiB) plus a TLS
+    // The DESIGN bound: one event stages at most EpollIo::kMaxReadPerEvent (1 MiB) plus a TLS
     // record, and the next event cannot start until the client's write makes progress,
     // because a partial write pauses the upstream read.
     //
@@ -1631,7 +1631,7 @@ TEST_P(GatewayTls, ClientThatNeverReadsCannotGrowUsWithoutBound)
     // loaded machine, which read as a flaky test and was an unbounded-growth bug.
     // Measured after the fix, stable across runs and under 12 busy cores:
     // ~1.06 MB on epoll, ~283 KB on io_uring.
-    // 4 MiB: above the ~1.4 MiB one event can stage (kEpMaxReadPerEvent plus a TLS
+    // 4 MiB: above the ~1.4 MiB one event can stage (EpollIo::kMaxReadPerEvent plus a TLS
     // record) and far below what the unbounded version reached.
     //
     // Honest limit of this test: it detects the unbounded version only sometimes,
@@ -1899,7 +1899,7 @@ TEST_P(GatewayTls, ClientTlsWithPlaintextUpstreamStreams)
 // wire", even though that distinction is real and documented on `OutBuf`.
 // Replacing wbuf_on_wire() with woff alone leaves this test passing, because
 // both call sites already establish the same fact by other means: on epoll
-// `*done` is gated on ep_tls_flush's `flushed`, which is set only after tls_out
+// `*done` is gated on EpollIo::tls_flush's `flushed`, which is set only after tls_out
 // drains completely, and on io_uring the pin covers it. So
 // wbuf_on_wire() is defensive today and not load-bearing, and no test at the
 // current call sites can show otherwise. It earns its place by being the correct

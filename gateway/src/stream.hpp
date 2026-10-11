@@ -17,7 +17,7 @@
 #include <string_view>
 
 #include "core/conn.hpp"
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 #include "scan.hpp"
 
 namespace llmbridge::detail

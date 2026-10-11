@@ -8,7 +8,7 @@
 // Bytes between a socket and a connection's plaintext buffers: the TLS Session on
 // either leg, and the sent-request test.
 
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 
 #include "core/limits.hpp"
 #include "request.hpp"
@@ -16,12 +16,11 @@
 #include <cstdint>
 #include <memory>
 
-namespace llmbridge
+namespace llmbridge::detail
 {
-    using namespace detail;
 
     // Compiles to `false` in a build without TLS support.
-    bool Gateway::upstream_is_tls(const Connection* u) const noexcept
+    bool Engine::upstream_is_tls(const Connection* u) const noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         return u->tls != nullptr;
@@ -38,12 +37,12 @@ namespace llmbridge
     // strictly between the socket and those buffers. On a TLS connection `out` counts
     // plaintext fed into the Session (its bytes stay for a resend), and `tls_out`
     // holds the ciphertext on its way to the socket.
-    bool Gateway::tls_required(const Connection* c) const noexcept
+    bool Engine::tls_required(const Connection* c) const noexcept
     {
         return c->is_client ? _tls.client_tls : upstream_of(c).tls;
     }
 
-    bool Gateway::tls_invariant_ok(Connection* c) noexcept
+    bool Engine::tls_invariant_ok(Connection* c) noexcept
     {
         if (c->tls || !tls_required(c)) return true;
 
@@ -53,7 +52,7 @@ namespace llmbridge
         return false;
     }
 
-    bool Gateway::tls_attach_upstream(Connection* u) noexcept
+    bool Engine::tls_attach_upstream(Connection* u) noexcept
     {
         // The venue's own hostname, never _tls.sni_host. init_client drives both SNI
         // and SSL_set1_host from this, so a global value would verify every venue's
@@ -68,7 +67,7 @@ namespace llmbridge
         return true;
     }
 
-    bool Gateway::tls_attach_client(Connection* c) noexcept
+    bool Engine::tls_attach_client(Connection* c) noexcept
     {
         c->tls = std::make_unique<net::tls::Session>();
         if (!c->tls->init_server(_tls_client_ctx))
@@ -82,7 +81,7 @@ namespace llmbridge
         return true;
     }
 
-    void Gateway::tls_pump_out(Connection* u) noexcept
+    void Engine::tls_pump_out(Connection* u) noexcept
     {
         // stage() is safe while a send SQE reads tls_out: it is then the back half.
         // Reserved once for what this pass moves. Growing by append cost a 4 MB
@@ -100,7 +99,7 @@ namespace llmbridge
         if (unsent > _stats.tls_buffered_peak) _stats.tls_buffered_peak = unsent;
     }
 
-    void Gateway::tls_push_out(Connection* u) noexcept
+    void Engine::tls_push_out(Connection* u) noexcept
     {
         // Feed as much plaintext as the Session accepts; its ciphertext lands straight
         // in tls_out's stage, behind any flight already staged: order is the wire's.
@@ -126,12 +125,12 @@ namespace llmbridge
         u->tls->set_sink(nullptr);
     }
 
-    bool Gateway::tls_out_flushed(const Connection* u) const noexcept
+    bool Engine::tls_out_flushed(const Connection* u) const noexcept
     {
         return u->out.idle() && u->tls_out.idle() && !u->tls->has_pending_output();
     }
 
-    bool Gateway::tls_feed(Connection* u, const char* p, size_t n) noexcept
+    bool Engine::tls_feed(Connection* u, const char* p, size_t n) noexcept
     {
         const bool hs_was_done = u->tls->handshake_done();
         if (n > 0 &&
@@ -201,7 +200,7 @@ namespace llmbridge
 
 #endif // LLMBRIDGE_HAVE_TLS
 
-    bool Gateway::upstream_request_sent(const Connection* u) const noexcept
+    bool Engine::upstream_request_sent(const Connection* u) const noexcept
     {
         if (u->send_inflight()) return false; // an SQE still reads the send buffer
         if (!u->out.idle()) return false;     // plaintext not fully handed over
@@ -212,4 +211,4 @@ namespace llmbridge
 #endif
         return true;
     }
-} // namespace llmbridge
+} // namespace llmbridge::detail

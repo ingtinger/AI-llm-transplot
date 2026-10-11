@@ -14,8 +14,9 @@ add_library(gateway STATIC
         src/core/sweep.cpp
         src/core/transport.cpp
         src/core/upstream.cpp
-        src/gateway_epoll.cpp
-        src/gateway_uring.cpp
+        src/facade.cpp
+        src/io/epoll_io.cpp
+        src/io/uring_io.cpp
         src/request.cpp
         src/response.cpp
 )

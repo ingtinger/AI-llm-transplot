@@ -8,7 +8,7 @@
 // The request sink: header capture and the model read at framing, the record at
 // completion.
 
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 
 #include "core/limits.hpp"
 #include "net/sha256.hpp"
@@ -19,9 +19,8 @@
 #include <ctime>
 #include <string_view>
 
-namespace llmbridge
+namespace llmbridge::detail
 {
-    using namespace detail;
 
     // The header names that carry a credential, which is the set this gateway extracts
     // and re-emits: authorization and x-api-key (Bearer / Anthropic), x-goog-api-key
@@ -32,7 +31,7 @@ namespace llmbridge
                lowered == "x-goog-api-key" || lowered == "api-key";
     }
 
-    void Gateway::set_request_sink(RequestSink* sink, std::vector<std::string> capture)
+    void Engine::set_request_sink(RequestSink* sink, std::vector<std::string> capture)
     {
         _sink = sink;
         _sink_capture_names.clear();
@@ -51,7 +50,7 @@ namespace llmbridge
         }
     }
 
-    void Gateway::sink_capture(Connection* c) noexcept
+    void Engine::sink_capture(Connection* c) noexcept
     {
         // The request buffer is reused long before completion, so the sink's header
         // values are copied now, bounded, and the wall clock (the cross-process
@@ -68,7 +67,7 @@ namespace llmbridge
     // a policy installed. A stock build parses nothing here, as before.
     // Split out of sink_capture because a policy needs it too and needs it before the
     // decision, while sink_capture's other work is only ever read at the end.
-    const char* Gateway::capture_model(Connection* c) noexcept
+    const char* Engine::capture_model(Connection* c) noexcept
     {
         const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
         // One walk of the top level for everything a policy or the sink reads: a key
@@ -98,7 +97,7 @@ namespace llmbridge
         return nullptr;
     }
 
-    void Gateway::sink_emit(Connection* c, int status, bool streamed) noexcept
+    void Engine::sink_emit(Connection* c, int status, bool streamed) noexcept
     {
         RequestRecord r;
         r.seq = c->req.f.req_seq;
@@ -159,4 +158,4 @@ namespace llmbridge
         _sink->on_request(r);
     }
 
-} // namespace llmbridge
+} // namespace llmbridge::detail

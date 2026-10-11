@@ -8,7 +8,7 @@
 // Moving a venue to its next address after a failed connect, and re-resolving its
 // name off the loop thread.
 
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 
 #include "core/limits.hpp"
 
@@ -20,11 +20,10 @@
 
 #include "net/upstream.hpp"
 
-namespace llmbridge
+namespace llmbridge::detail
 {
-    using namespace detail;
 
-    void Gateway::note_connect_failure(int slot, const char* why) noexcept
+    void Engine::note_connect_failure(int slot, const char* why) noexcept
     {
         if (slot < 0 || static_cast<size_t>(slot) >= _upstreams.size()) return;
         Upstream& up = _upstreams[static_cast<size_t>(slot)];
@@ -44,7 +43,7 @@ namespace llmbridge
         if (!up.host.empty()) request_reresolve(slot);
     }
 
-    void Gateway::request_reresolve(int slot) noexcept
+    void Engine::request_reresolve(int slot) noexcept
     {
         uint8_t& inflight = _rr_inflight[static_cast<size_t>(slot)];
         if (inflight) return;
@@ -63,7 +62,7 @@ namespace llmbridge
         _rr.cv.notify_one();
     }
 
-    void Gateway::reresolve_loop() noexcept
+    void Engine::reresolve_loop() noexcept
     {
         for (;;)
         {
@@ -94,7 +93,7 @@ namespace llmbridge
         }
     }
 
-    void Gateway::apply_reresolved() noexcept
+    void Engine::apply_reresolved() noexcept
     {
         if (!_rr.ready.load(std::memory_order_acquire)) return;
         std::vector<std::pair<int, std::vector<std::string>>> done;
@@ -126,4 +125,4 @@ namespace llmbridge
         }
     }
 
-} // namespace llmbridge
+} // namespace llmbridge::detail

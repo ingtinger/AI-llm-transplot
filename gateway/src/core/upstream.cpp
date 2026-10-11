@@ -8,7 +8,7 @@
 // The upstream leg on both backends: opening, pooling and retrying a connection, the
 // response and what a venue said in it, and where a request goes after a failure.
 
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 
 #include "core/io.hpp"
 #include "core/limits.hpp"
@@ -22,14 +22,13 @@
 #include <cstring>
 #include <string_view>
 
-namespace llmbridge
+namespace llmbridge::detail
 {
-    using namespace detail;
 
     // What the provider said about its own limits, kept from the response head.
     // Shared by both backends and by the streaming and non-streaming paths, so the
     // four cannot disagree about what a refusal meant.
-    void Gateway::note_quota(Connection* client, const net::http::ResponseHead& h) noexcept
+    void Engine::note_quota(Connection* client, const net::http::ResponseHead& h) noexcept
     {
         client->req.f.quota_exhausted = static_cast<uint8_t>(h.quota_exhausted);
         client->req.f.retry_after_s = h.retry_after_s;
@@ -37,7 +36,7 @@ namespace llmbridge
 
     // Bedrock is first: a Claude-via-Bedrock response carries x-amzn and
     // Anthropic's own id together, and the AWS one is what CloudTrail indexes.
-    void Gateway::note_venue_req_id(Connection* client, std::string_view head) noexcept
+    void Engine::note_venue_req_id(Connection* client, std::string_view head) noexcept
     {
         client->req.f.venue_req_id.set({});
         static constexpr std::string_view kNames[] = {"x-amzn-requestid", "request-id",
@@ -51,7 +50,7 @@ namespace llmbridge
         }
     }
 
-    void Gateway::note_upstream_rtt(Connection* client, const Connection* u) noexcept
+    void Engine::note_upstream_rtt(Connection* client, const Connection* u) noexcept
     {
         // At the head, when the venue has acknowledged the whole request, and on the
         // socket under TLS. One getsockopt, after t4 is stamped so it is not inside it.
@@ -60,7 +59,7 @@ namespace llmbridge
         client->req.f.upstream_min_rtt_us = rtt.min_us;
     }
 
-    void Gateway::note_upstream_error(Connection* client, const net::http::ResponseHead& h,
+    void Engine::note_upstream_error(Connection* client, const net::http::ResponseHead& h,
                                       std::string_view body) noexcept
     {
         client->req.f.upstream_error.set({});
@@ -69,7 +68,7 @@ namespace llmbridge
         client->req.f.upstream_error.set(scan_error_type(body));
     }
 
-    bool Gateway::pool_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept
+    bool Engine::pool_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept
     {
         using R = UpstreamPool::Refusal;
         switch (_pool->release(*u, keep_alive, body_ended, upstream_request_sent(u), now_ns()))
@@ -91,7 +90,7 @@ namespace llmbridge
         }
     }
 
-    Connection* Gateway::new_upstream(int slot) noexcept
+    Connection* Engine::new_upstream(int slot) noexcept
     {
         // The venue's address now, never a cached one: the ip may have rotated. One
         // that does not parse fails the acquire, on both backends.
@@ -107,7 +106,7 @@ namespace llmbridge
         return u;
     }
 
-    Connection* Gateway::acquire_upstream(int slot) noexcept
+    Connection* Engine::acquire_upstream(int slot) noexcept
     {
         // Only this venue's pool: a connection to one provider cannot serve a request
         // bound for another, and handing one over would send the request, and its
@@ -143,7 +142,7 @@ namespace llmbridge
         return u;
     }
 
-    bool Gateway::retry_upstream(Connection* u) noexcept
+    bool Engine::retry_upstream(Connection* u) noexcept
     {
         // A pooled reuse, not yet retried, that failed before any response byte: the
         // provider almost certainly dropped it idle without running the request.
@@ -182,7 +181,7 @@ namespace llmbridge
         return true;
     }
 
-    void Gateway::release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept
+    void Engine::release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept
     {
         if (!pool_upstream(u, keep_alive, body_ended))
         {
@@ -195,7 +194,7 @@ namespace llmbridge
     }
 
     // One decision and one log text per cause, on both backends.
-    void Gateway::upstream_lost(Connection* u, UpFail f) noexcept
+    void Engine::upstream_lost(Connection* u, UpFail f) noexcept
     {
         static constexpr const char* kWhy[] = {"upstream EOF", "upstream TLS failed", "upstream write failed"};
         static constexpr const char* kExhausted[] = {"upstream EOF, retry exhausted",
@@ -208,7 +207,7 @@ namespace llmbridge
         if (!upstream_failed(client, 502, kWhy[i])) error_respond(client, 502, kExhausted[i]);
     }
 
-    void Gateway::on_upstream_eof(Connection* u, bool tls_failed) noexcept
+    void Engine::on_upstream_eof(Connection* u, bool tls_failed) noexcept
     {
         u->peer_eof = true; // never pooled now, whatever finishes the exchange
         Connection* client = u->peer;
@@ -224,7 +223,7 @@ namespace llmbridge
 
     // New bytes in `u->rbuf`. The head is parsed once, by the framer; its Body kind
     // frames the rest, streamed or whole.
-    void Gateway::on_upstream_bytes(Connection* u) noexcept
+    void Engine::on_upstream_bytes(Connection* u) noexcept
     {
         Connection* client = u->peer;
         // Stray bytes on an idle pooled upstream are the tail of an exchange that is
@@ -265,7 +264,7 @@ namespace llmbridge
         on_response(u, h, r.body, r.total_len);
     }
 
-    void Gateway::on_response(Connection* u, const net::http::ResponseHead& h,
+    void Engine::on_response(Connection* u, const net::http::ResponseHead& h,
                               std::string_view body, size_t total_len) noexcept
     {
         Connection* client = u->peer;
@@ -322,7 +321,7 @@ namespace llmbridge
         respond(client);
     }
 
-    bool Gateway::upstream_failed(Connection* client, int status, const char* why) noexcept
+    bool Engine::upstream_failed(Connection* client, int status, const char* why) noexcept
     {
         const Retry r = failover_target(client, status, why);
         if (!r.retry) return false;
@@ -341,7 +340,7 @@ namespace llmbridge
         return true;
     }
 
-    Retry Gateway::failover_target(Connection* client, int status, const char* why) noexcept
+    Retry Engine::failover_target(Connection* client, int status, const char* why) noexcept
     {
         // Every precondition here is about safety, not policy. Re-sending a request the
         // client has already begun receiving would duplicate output; re-sending one we
@@ -385,4 +384,4 @@ namespace llmbridge
         return r;
     }
 
-} // namespace llmbridge
+} // namespace llmbridge::detail

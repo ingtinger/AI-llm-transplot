@@ -15,13 +15,12 @@
 
 #include "core/conn.hpp"
 #include "core/pool.hpp"
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 #include "net/secure.hpp"
 
 namespace llmbridge::detail
 {
     constexpr size_t kInitialBuf = 4096;
-    constexpr int kEpMaxEvents = 1024;
     constexpr int kPollTickMs = 200; // so request_stop() is observed promptly
     constexpr size_t kMaxClientBuffered = net::http::kMaxHeaderLen + net::http::kMaxBodyLen; // no legal request is larger
     constexpr size_t kStreamBufCap = 8 << 20; // owed to a stream's client, where reads cannot pause

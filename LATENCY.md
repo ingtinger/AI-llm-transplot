@@ -114,8 +114,8 @@ assigns the stamp attributed to it.
 |---|---|---|---|---|
 | **t0** | `ts_req_recvd` | `ReqState` | the client's request is fully framed. Taken just **before** the parse that frames it, on both backends, so the parse is request-path work; a parse that finds the request incomplete discards it, so network wait is never charged | `try_frame` (shared) |
 | **t1** | `ts_req_built` | `ReqState` | the upstream request bytes exist: translation, auth mapping and re-serialisation done, nothing sent | `dispatch` (shared) |
-| **t2** | `ts_wire_ready` | `ReqState` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `dispatch`, `tls_feed` (shared), `ep_on_upstream_writable` / `ur_on_connect` |
-| **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel. Several sites (plaintext, TLS-flushed, partial-write completion) all meaning "fully sent" | `dispatch` (shared), `ep_on_upstream_writable`, `ep_tls_drain_read` / `ur_on_send` |
+| **t2** | `ts_wire_ready` | `ReqState` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `dispatch`, `tls_feed` (shared), `EpollIo::on_upstream_writable` / `UringIo::on_connect` |
+| **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel. Several sites (plaintext, TLS-flushed, partial-write completion) all meaning "fully sent" | `dispatch` (shared), `EpollIo::on_upstream_writable`, `EpollIo::tls_drain_read` / `UringIo::on_send` |
 | **t4** | `ts_up_recvd` | `ReqState` | the provider's response arrived. **Non-streaming:** the body is framed, stamped at the start of the read that completed it, before the parse, on both backends. **Streaming:** the response *head* is framed, before any data chunk (see §3; this is not the first token) | `on_upstream_bytes` (shared) |
 | **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `on_response` (shared) |
 | **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `finish` (shared) |
@@ -177,8 +177,8 @@ Two consequences of that table worth reading off it:
   If you add a fifth send path, it must stamp t3 or the request silently reports
   a zero upstream write.
 
-`gateway.hpp` and the gateway sources use this same t0–t6 labelling in their comments,
-so `connect-us` reads one way whichever file you trust.
+The gateway sources use this same t0–t6 labelling in their comments, and this
+document is the only table of it, so `connect-us` reads one way whichever file you trust.
 
 Two intervals are the gateway's compute; one is connection setup; one is the
 upstream write; one is the provider; and the response write/flush sits at the

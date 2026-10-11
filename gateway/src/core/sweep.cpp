@@ -7,16 +7,15 @@
 
 // The periodic sweep: heartbeat, pool reaping and every timeout, in one pass.
 
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 
 #include "core/io.hpp"
 #include "core/limits.hpp"
 #include "core/registry.hpp"
 #include "stream.hpp"
 
-namespace llmbridge
+namespace llmbridge::detail
 {
-    using namespace detail;
 
     // Plaintext not yet on the wire or ciphertext not yet written, sends in flight included.
     static bool owes_client(const Connection* c) noexcept
@@ -31,7 +30,7 @@ namespace llmbridge
     // one walk of its clients per tick. A client yet to be answered gets a real 504; a
     // live stream (headers already sent) is cut without a terminal [DONE], so the
     // client sees a truncated stream, not a fabricated clean finish.
-    void Gateway::sweep_idle() noexcept
+    void Engine::sweep_idle() noexcept
     {
         const int64_t now = now_ns();
         if (now - _last_sweep_ns < 50'000'000LL) return;
@@ -79,7 +78,7 @@ namespace llmbridge
 
     // Each deadline is independent of the others: the setup deadline holds even with
     // the upstream timeout off, so a peer cannot hold a connection by sending nothing.
-    void Gateway::sweep_client(Connection* c, int64_t now, bool busy) noexcept
+    void Engine::sweep_client(Connection* c, int64_t now, bool busy) noexcept
     {
         // Never framed a request. Measured before this existed: 50 half-open
         // connections, each holding a slot with a partial request, and none closed.
@@ -136,4 +135,4 @@ namespace llmbridge
         abort_pair(c);
     }
 
-} // namespace llmbridge
+} // namespace llmbridge::detail

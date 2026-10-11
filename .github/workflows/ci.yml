@@ -13,16 +13,16 @@ concurrency:
 
 jobs:
   # Runs first and finishes in under a second: it needs no compiler and no build.
-  # Guards the ep_/ur_ backend split, which is what stops a call landing in the
-  # wrong event loop: the two backends' teardown and I/O are not interchangeable,
-  # and one such crossing shipped undetected before this existed.
+  # Guards the boundary between the shared request lifecycle (gateway/src/core) and
+  # the two backends (gateway/src/io): core makes no socket call and includes no
+  # backend header, and neither backend leans on the other.
   conventions:
     name: naming conventions
     timeout-minutes: 5
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Check backend prefixes and namespaces
+      - name: Check the backend boundary and namespaces
         run: python3 scripts/check_conventions.py
       # Cheap last line of defence, not a gitleaks replacement. `private/` (live-key
       # demo scripts, price observatory) shares this working tree with the public

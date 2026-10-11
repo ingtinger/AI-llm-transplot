@@ -1,4 +1,4 @@
-# Gateway internals: two backends, one request lifecycle
+# Gateway internals: one request lifecycle, two backends
 
 How a request actually moves through `llmbridge`, on both event-loop backends.
 `DESIGN.md` is the architecture summary and `LATENCY.md` defines every timing
@@ -6,12 +6,13 @@ number; this document is the mechanism: which buffer holds what, who owns each
 piece of mutable state, when a connection may be freed, and where a credential
 is scrubbed.
 
-It exists because the gateway is implemented **twice**. `Gateway` runs the whole
-lifecycle on epoll and again on io_uring, fourteen method pairs at 60 to 81
-percent token similarity. That is the single most likely place for a fix to land
-on one side only, and io_uring is the default on Ubuntu 24.04, so a one-sided fix
-usually breaks the shipped path. Reading one backend and assuming the other
-matches is the mistake this document exists to prevent.
+The lifecycle is written once, in `gateway/src/core/`, as methods of
+`detail::Engine`, and reaches a socket only through `IoOps`. Each backend,
+`EpollIo` (`gateway/src/io/epoll_io.cpp`) and `UringIo` (`gateway/src/io/uring_io.cpp`),
+owns its loop and its syscalls and calls back into the shared methods as completions
+arrive. `Gateway` is a facade over the `Engine`. What still differs between the
+backends is how I/O is issued and how completion is discovered (sections 4 and 5),
+and one deliberate choice under a slow streaming client (6c).
 
 ## 1. The cast
 
@@ -73,7 +74,7 @@ Ask `tls_out_flushed()` for the second question.
 |---|---|
 | `stage()` | where new bytes go. Never behind bytes already on the wire: a drained front is reset first, keeping its capacity. Every builder appends here |
 | `wire()` | what the transport writes next, out of the front |
-| `pin()` / `sent(n)` | an io_uring send holds the front from submit (`ur_submit_send`) to completion (`ur_on_send`); epoll never pins, so there it is one buffer |
+| `pin()` / `sent(n)` | an io_uring send holds the front from submit (`UringIo::submit_send`) to completion (`UringIo::on_send`); epoll never pins, so there it is one buffer |
 | `take()` | everything staged, for a resend: moved, or copied while a send still reads it |
 
 While the front is pinned, `stage()` is the back half, and `sent()` folds it in when
@@ -153,9 +154,8 @@ closes the client instead of staging a second reply into the first.
 ### 3d. The seam: `IoOps`
 
 The shared lifecycle reaches a socket only through `detail::IoOps`
-(`gateway/src/core/io.hpp`), which each backend implements over its own primitives
-(`Gateway::EpollIo`, `Gateway::UringIo`). `run_epoll()` and `run_uring()` attach
-theirs before the first event, so a shared method such as `error_respond`,
+(`gateway/src/core/io.hpp`), which each backend implements (`EpollIo`, `UringIo`).
+A backend's `run()` attaches itself before the first event, so a shared method such as `error_respond`,
 `acquire_upstream`, `retry_upstream`, `release_upstream`, `upstream_failed`,
 `abort_pair`, `begin_stream`, `stream_on_upstream_eof` or `finalize_stream` is
 written once and runs on both.
@@ -165,7 +165,7 @@ written once and runs on both.
 | `send` | write now; `Queued` arms `EPOLLOUT` | one send SQE; always `Queued` unless nothing is owed |
 | `connect` | non-blocking `connect()`, `EPOLLIN` and `EPOLLOUT` | socket, resolve, a connect SQE |
 | `set_read` | `EPOLLIN` off or on | cancel the multishot recv; re-arm it on resume |
-| `close` | `ep_close_client` / `ep_close_upstream` | `ur_close` |
+| `close` | `Engine::forget`, then `::close` | `Engine::forget`, then cancel; freed at `inflight == 0` |
 
 A send that completes at once is a return value (`Sent::Done`), never a callback, so
 no handler runs re-entered. `IoCaps::stream_backpressure` says whether the backend
@@ -188,62 +188,58 @@ that disconnects with a request, reply or stream still owed counts as an error o
 either backend (`client_gone`). `gateway/tests/core_test.cpp` drives the shared methods with
 a `FakeIo`, so a send that does not complete happens exactly when a test says so.
 
-## 4. The epoll backend
+## 4. The epoll backend (`gateway/src/io/epoll_io.cpp`)
 
-Level-triggered epoll with optimistic writes. The loop owns the syscalls.
+`EpollIo` owns the epoll instance, its loop and its syscalls, and nothing else.
+Level-triggered, with optimistic writes.
 
 ```
   epoll_wait
       |
-      +-- listen fd readable ------> ep_on_accept()      accept() in a loop
-      |
-      +-- client fd readable ------> ep_on_client_readable()
-      |                                read() -> rbuf -> try_frame() -> dispatch()
-      |
-      +-- client fd writable ------> ep_on_client_writable()
-      |                                respond(), or stream_flush()
-      |
-      +-- upstream fd readable ----> ep_on_upstream_readable()
-      |                                read() -> rbuf -> frame -> respond
-      |
-      +-- upstream fd writable ----> ep_on_upstream_writable()
-      |                                connect completed, or drain out
+      +-- listener readable -------> on_accept()             accept4() in a loop
+      +-- client fd readable ------> on_client_readable()    read() -> on_client_bytes()
+      +-- client fd writable ------> on_client_writable()    respond(), or stream_flush()
+      +-- upstream fd readable ----> on_upstream_readable()  read() -> on_upstream_bytes()
+      +-- upstream fd writable ----> on_upstream_writable()  connect completed, or drain out
       |
       v
-  sweep_idle()          reap idle pooled upstreams, drop half-open clients
+  sweep_idle()          reap idle pooled upstreams, every timeout
       |
       v
   free everything on _doomed        <- see section 7
 ```
 
-**Optimistic write.** A response is written immediately and `EPOLLOUT` is armed
-only on `EAGAIN`, so the common case costs one syscall. Arming unconditionally
-would cost two `epoll_ctl` calls and an extra wakeup per request.
+**Optimistic write.** A reply is written at once and `EPOLLOUT` is armed only on
+`EAGAIN`, so the common case costs one syscall; `send()` disarms it again whenever
+everything went. A fresh upstream is registered once, `EPOLLIN | EPOLLOUT` together:
+its connect completing is its first writable event.
 
-**Back-pressure.** When a client cannot keep up mid-stream, epoll **pauses the
-upstream's `EPOLLIN`** (`stream_flush` through `set_read`), so the provider stops sending and the
-kernel applies flow control for us. `read_paused` tracks it, and the
-`ep_` prefix is what keeps io_uring from touching it.
+**One writer of the interest mask.** `sync_interest()` computes the mask from
+`read_paused` and `write_armed`, so arming a write cannot undo a pause.
 
-## 5. The io_uring backend
+**Back-pressure.** `set_read` drops `EPOLLIN`; `EPOLLHUP` and `EPOLLERR` still fire, so a
+close is never missed. Reads are bounded per event (`kMaxReadPerEvent`, 1 MiB): a drain
+to `EAGAIN` once staged 33 MB for a client that never read.
 
-Completion-driven, `SINGLE_ISSUER | DEFER_TASKRUN`, with multishot accept and
-recv into a shared provided-buffer ring.
+## 5. The io_uring backend (`gateway/src/io/uring_io.cpp`)
+
+`UringIo` owns the ring, the provided-buffer ring and its loop. Completion-driven,
+`SINGLE_ISSUER | DEFER_TASKRUN`, with multishot accept and recv into the shared buffers.
 
 ```
   submit SQEs                          reap CQEs
       |                                    |
-      +-- IORING_OP_ACCEPT (multishot) ----+--> ur_on_accept()
-      +-- IORING_OP_RECV   (multishot) ----+--> ur_on_recv()
-      +-- IORING_OP_SEND               ----+--> ur_on_send()
-      +-- IORING_OP_CONNECT            ----+--> ur_on_connect()
-      +-- IORING_OP_TIMEOUT            ----+--> periodic tick
+      +-- IORING_OP_ACCEPT (multishot) ----+--> on_accept()
+      +-- IORING_OP_RECV   (multishot) ----+--> on_recv()     -> on_client_bytes() / on_upstream_bytes()
+      +-- IORING_OP_SEND               ----+--> on_send()     -> finish() / stream_flush()
+      +-- IORING_OP_CONNECT            ----+--> on_connect()
+      +-- IORING_OP_TIMEOUT            ----+--> periodic tick: sweep_idle()
       +-- IORING_OP_ASYNC_CANCEL       ----+--> (control, not counted)
 ```
 
-Buffer ring: `kUrBufCount = 4096` buffers of `kUrBufSize = 4096` bytes. Multishot
-recv lands data in the ring instead of a per-connection buffer, so the kernel
-picks the buffer and we recycle it after copying out.
+4096 buffers of 4096 bytes. Multishot recv lands data in the ring instead of a
+per-connection buffer, so the kernel picks the buffer and it is recycled once copied
+out. If the setup fails, `Engine::run` runs `EpollIo` instead.
 
 Three constraints shape everything else here:
 
@@ -254,6 +250,10 @@ Three constraints shape everything else here:
 3. **Completions arrive after the code has moved on**, so an object can be
    logically dead while the kernel still holds a reference to it.
 
+A full submission queue is flushed once and retried. If it is still full, a send
+or recv closes the pair (`drop_sq_full`), a connect fails the acquire, and a lost
+timer is re-armed on the next loop.
+
 ### The pin: one owner
 
 `send_inflight()` means exactly "an SQE referencing this connection's wire buffer
@@ -262,31 +262,19 @@ pinned.
 
 | | |
 |---|---|
-| **pinned** | `ur_submit_send()` only, the sole place a send SQE is submitted |
-| **unpinned** | `ur_on_send()` on completion, and `ur_on_cqe()` for a doomed connection's |
+| **pinned** | `UringIo::submit_send()` only, the sole place a send SQE is submitted |
+| **unpinned** | `UringIo::on_send()` on completion, and `on_cqe()` for a doomed connection's |
 | **read** | by anyone deciding whether to submit now or let the completion do it |
 
 Callers must never pin. Two of them used to set the old flag, under different
-rules, and the io_uring stream flush setting it before calling into `ur_tls_flush()`,
-whose first line refuses to run when it is already set, meant the first SSE flush
-on a TLS connection did nothing and the stream hung forever, on io_uring only.
+rules, and the stream flush setting it before calling into the TLS flush, whose
+first line refuses to run when it is already set, meant the first SSE flush on a
+TLS connection did nothing and the stream hung forever, on io_uring only.
 
-### Streaming output stages behind the pin
+New stream output goes to `stage()`, the back half while a send reads the front,
+and goes out with the next send.
 
-New stream output goes to `stage()`, the back half while a send reads the front, and
-goes out with the next send. Past `kStreamBufCap` (8 MiB unsent) the stream is
-dropped.
-
-**This is the one place the two backends deliberately differ.** Under a slow
-client, epoll applies back-pressure by pausing the upstream read; io_uring bounds
-the unsent bytes and drops the stream past the cap. Know which one you are reasoning
-about before quoting streaming behaviour to a customer.
-
-
-### 5b. The two `inflight` flags, and who owns each
-
-Both live on `Connection` and both are io_uring-only. They are not the same
-thing and confusing them has cost real bugs.
+### 5b. `inflight` and `recv_armed`
 
 **`int inflight`**: submitted-but-uncompleted SQEs referencing this connection.
 One protocol with `doomed` (section 7): doomed says we want the object gone,
@@ -294,16 +282,13 @@ inflight says whether the kernel agrees yet.
 
 | | where |
 |---|---|
-| incremented | the three `ur_submit_*` functions, each at its tail immediately before `return true`, so an early return cannot leak a slot and strand the object forever |
-| decremented | exactly one place, `ur_on_cqe()`, and only when the completion is not armed: a multishot op carrying `F_MORE` is still outstanding and has not released its slot |
-| read | `ur_maybe_free()`, the only thing allowed to conclude that freeing is safe |
+| incremented | `arm_recv`, `submit_send` and `connect`, each only once its SQE is filled, so an early return cannot strand the object |
+| decremented | exactly one place, `on_cqe()`, and only when the completion is not armed: a multishot op carrying `F_MORE` is still outstanding |
+| read | `maybe_free()`, the only thing allowed to conclude that freeing is safe |
 
-Multishot recv lands data in a shared provided-buffer pool, so there is no
-per-connection recv buffer to account for.
-
-**The pin** on the wire buffer, above: an SQE references this connection's *send*
-buffer. Two concurrent SENDs on one fd would interleave, and an SQE is immutable
-once submitted, so the buffer it points at must not move while it is pinned.
+**`recv_armed`**: a multishot recv is live. A pause (`set_read(c, false)`) cancels it
+by its `user_data`; its last completion, `-ECANCELED`, re-arms it if reads resumed
+meanwhile, and a resume with no recv live arms one at once.
 
 ## 6. Streaming (SSE)
 
@@ -337,7 +322,8 @@ Three flags carry the state, and their meanings are precise:
   client sees a cut-off stream instead of a fabricated clean finish. So
   `stream_ended && close_after_resp` is the truncated case and
   `stream_ended && !close_after_resp` the clean one.
-- **`read_paused`** is epoll-only back-pressure, described above.
+- **`read_paused`** is written only by a backend's `set_read`: a stream's upstream on
+  epoll, and a client past the pipelining cap on either backend.
 
 `stream_ended` also gates `finalize_stream`. Without it the gateway resumes
 reading from an upstream that will never speak again, and the client socket is
@@ -360,8 +346,8 @@ it did not, so read it, never infer it.
 `stream_truncate()` makes the three mutations together (`stream_ended`,
 `close_after_resp`, `++errors`) because five call sites once wrote them by hand,
 which is how a sixth ends up setting two of the three. The `stream_ended` latch is
-load-bearing: `{ep,ur}_stream_flush` finalize only when it is set, and without it
-they resume reading from an upstream that will never speak again, holding the client
+load-bearing: `stream_flush` finalizes only when it is set, and without it
+it resumes reading from an upstream that will never speak again, holding the client
 until the idle sweep. `CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTheClient`
 is the test that fails without it. The `TRUNCATED` warning is logged there too, in
 the one shared place: the abort paths bypass the finalize, and a truncated stream is
@@ -392,7 +378,10 @@ io_uring uses `set_read` only for the pipelining cap on a client (3d).
 This is where a mistake is a use-after-free in a process holding customer
 credentials, so the rules are worth stating exactly.
 
-**Both backends defer the free**, for different reasons:
+A close is two halves. `Engine::forget()` is the bookkeeping, the same on both
+backends: unpair, deregister, drop from the pool, mark `doomed`, move to `_doomed`.
+The backend's `close()` does the rest. **Both backends defer the free**, for
+different reasons:
 
 | | why deferred | freed when |
 |---|---|---|
@@ -400,16 +389,15 @@ credentials, so the rules are worth stating exactly.
 | **io_uring** | a submitted SQE references the object, and the kernel does not care that we decided to close | `inflight` reaches 0, possibly several loop iterations later |
 
 ```
-  ep_close_client / ep_close_upstream        ur_close()
-        doomed = true                          doomed = true
-        push to _doomed                        push to _doomed
-              |                                shutdown + IORING_OP_ASYNC_CANCEL
-              v                                      |
-   end of batch: delete every _doomed                v
-                                          ur_on_cqe: --inflight
+  EpollIo::close()                       UringIo::close()
+        Engine::forget()                       Engine::forget()
+        ::close(fd)                            shutdown + IORING_OP_ASYNC_CANCEL
+              |                                      |
+              v                                      v
+   end of batch: delete every _doomed      on_cqe: --inflight
                                                      |
                                                      v
-                                          ur_maybe_free(): free iff
+                                          maybe_free(): free iff
                                           doomed && inflight == 0
 ```
 
@@ -418,20 +406,11 @@ Every `Connection` is in exactly one `Registry` (`gateway/src/core/registry.hpp`
 holds its own index, so a close moves it in O(1), and the destructor and the
 io_uring drain walk the registries instead of following `peer` to find upstreams.
 
-`inflight` counts submitted-but-uncompleted SQEs for one connection:
-
-- **incremented** by the three `ur_submit_*` functions, each at its tail
-  immediately before `return true`, so an early return cannot strand the object
-- **decremented** in exactly one place, `ur_on_cqe()`, and only when the
-  completion is not armed: a multishot op carrying `F_MORE` is still outstanding
-- **read** by `ur_maybe_free()`, the only thing allowed to conclude freeing is safe
-
 **The unconditional frees are safe for two different structural reasons.** epoll
-never increments `inflight`, so it is always 0. io_uring ends `run_uring()` with
-`while (_uring_inflight > 0) { submit_and_wait(1); }`, draining to zero before it
-returns, and `_uring_inflight` moves in lockstep with every connection's count.
-A runtime check at those sites was added and removed: unreachable, untestable,
-and therefore protection in appearance only.
+never increments `inflight`, so it is always 0. `UringIo::run()` ends with a drain
+that reaps until no SQE is outstanding, and its count moves in lockstep with every
+connection's. A runtime check at those sites was added and removed: unreachable,
+untestable, and therefore protection in appearance only.
 
 ## 8. Connection pooling
 
@@ -478,8 +457,8 @@ provider that answers early, a 413 or 401 on the headers of a large body, hands
 us a complete response while the request is still half-written. Pooling that
 connection scrubs and later overwrites a buffer the transport has not finished
 with, and leaves a truncated request on the wire for the next client to inherit.
-`upstream_request_sent()` is the predicate, checked by both backends before
-anything else in release, and the connection is closed instead. It fails closed
+`upstream_request_sent()` is the predicate, checked in `UpstreamPool::release`
+before the pool takes it, and the connection is closed instead. It fails closed
 because the provider's view of that connection is not something we can
 reconstruct. Reproduced on both backends by `ProxyEarlyResponse`, where the next
 client's request was silently dropped, and mutation-guarded on each backend
@@ -648,13 +627,17 @@ Documentation drifts; these do not.
 
 | rule | enforced by |
 |---|---|
-| no call crosses the `ep_`/`ur_` prefixes | `scripts/check_conventions.py`, CI |
-| an unprefixed method really is shared | same |
-| namespaces mirror directories | same |
-| LATENCY.md's stamp table names real functions | same |
+| `core/` includes no backend header (`<sys/epoll.h>`, `<linux/io_uring.h>`, `net/uring.hpp`, `io/*`) | `scripts/check_conventions.py`, CI |
+| `core/` makes no socket call (`::read`, `::write`, `::send`, `::accept`, `::close`, `epoll_ctl`) | same |
+| `io/epoll*` never mentions io_uring, and `io/uring*` never mentions epoll | same |
+| each of those rules still catches a planted violation | same, before it checks the tree |
+| one backend calls the other | the compiler: they are separate `final` classes |
+| namespaces mirror directories | `scripts/check_conventions.py` |
+| LATENCY.md's stamp table names real functions that assign the stamp | same |
 | constants are `kPascalCase`, types `PascalCase`, `ALL_CAPS` is macros only | same |
+| the shared lifecycle behaves under a send that does not complete | `gateway/tests/core_test.cpp`, with a `FakeIo` |
 
-The last one matters most and is the newest. A green suite proves nothing it
+A green suite proves nothing it
 checks regressed; it does not prove it checks anything in particular. The
 mutation harness breaks each invariant on purpose and reports whether any test
 notices. It has found guards that were decoration, and test gaps in code that
