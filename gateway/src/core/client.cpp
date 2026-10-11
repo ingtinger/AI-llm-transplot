@@ -5,10 +5,11 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// The policy seam on a freshly framed request.
+// The policy seam on a freshly framed request, and replying to a client.
 
 #include "gateway/gateway.hpp"
 
+#include "core/io.hpp"
 #include "core/limits.hpp"
 #include "request.hpp"
 #include "response.hpp"
@@ -52,6 +53,53 @@ namespace llmbridge
         // Never log `facts`: the head carries the client's Authorization.
         ++_stats.policy_denied;
         return d;
+    }
+
+    void Gateway::respond(Connection* client) noexcept
+    {
+        switch (_ops->send(*client))
+        {
+            case Sent::Done: _ops->finish(*client); return;
+            case Sent::Failed: abort_pair(client); return;
+            case Sent::Queued: return; // the completion finishes it
+        }
+    }
+
+    void Gateway::abort_pair(Connection* client) noexcept
+    {
+        if (!client) return;
+        _ops->close(*client); // and its upstream
+        ++_stats.errors;
+    }
+
+    void Gateway::fail_request(Connection* client, int code, const char* why) noexcept
+    {
+        if (!upstream_failed(client, code, why)) error_respond(client, code, why);
+    }
+
+    void Gateway::error_respond(Connection* client, int code, const char* why,
+                                const char* detail) noexcept
+    {
+        if (!client || client->doomed) return;
+        // A client-caused refusal is DEBUG; anything we or the provider caused is WARN.
+        // An authentication refusal names where it came from.
+        const std::string peer = (code == 401 || code == 403) ? peer_of(client->fd)
+                                                              : std::string{};
+        LB_WARN(ReqId{client->req.f.req_seq}, " reply ", code, " ", why, " on ", *client,
+                peer.empty() ? "" : " peer=", peer);
+        // A reply already begun cannot be followed by a second one: close instead.
+        if (client->req.f.phase >= Phase::Streaming || !client->out.idle())
+        {
+            abort_pair(client);
+            return;
+        }
+        // We're replying to the client ourselves, so drop any in-flight upstream.
+        if (Connection* u = unpair(client)) _ops->close(*u);
+        append_error(client->out.stage(), code, detail);
+        client->req.f.phase = Phase::Replying;
+        client->close_after_resp = true; // closes once the reply flushes
+        ++_stats.errors;
+        respond(client);
     }
 
 } // namespace llmbridge

@@ -270,7 +270,7 @@ continuously fuzzed:
   - **The status line is `HTTP/1.x SP 3DIGIT`**, then SP and a reason phrase or the
     end of the line; the reason phrase is optional because servers omit it. Bytes left
     in front of a reply (`JUNKHTTP/1.1 200 OK`) are refused, not absorbed, and
-    `{ep,ur}_release_upstream` also clears the buffer: this is the second lock. A
+    `release_upstream` also clears the buffer: this is the second lock. A
     status of `2000` or `200x` no longer reads as 200.
   - **Keep-alive.** `Connection` is a comma-separated token list on both legs: any
     `close` token closes, and `keep-alive` keeps an HTTP/1.0 message open, which
