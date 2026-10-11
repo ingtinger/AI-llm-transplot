@@ -304,6 +304,8 @@ namespace
         // After each complete reply, wait `ms`, then close: the end of a close-delimited
         // body arrives as its own event, after the body has gone on.
         void set_close_after_reply_ms(int ms) { _close_after_reply_ms = ms; }
+        // Hold the first reply until `*go` (at most 10 s), so a client can pipeline behind it.
+        void hold_first_reply(const std::atomic<bool>* go) { _first_go = go; }
         int requests_seen() const { return _requests_seen.load(); }
         void clear_last_request()
         {
@@ -434,6 +436,8 @@ namespace
                 if (!_sequence.empty())
                     resp = _sequence[static_cast<size_t>(nth) % _sequence.size()];
                 if (_chunked_chunks > 0) resp = to_chunked(resp, _chunked_chunks);
+                for (int i = 0; nth == 0 && _first_go && !_first_go->load() && i < 1000; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 if (_stall == 1) // never answer; hold the connection open
                 {
                     while (!_stop) { timespec ts{0, 20000000}; nanosleep(&ts, nullptr); }
@@ -517,6 +521,7 @@ namespace
         std::atomic<int> _accepted{0};
         int _stall = 0;
         int _close_after_reply_ms = 0;
+        const std::atomic<bool>* _first_go = nullptr;
         bool _reply_before_read = false;
         int _reset_after_reply_ms = 0;
         int _rcvbuf = 0;
@@ -570,6 +575,20 @@ namespace
                 off += static_cast<size_t>(n);
             }
             return true;
+        }
+        // Write until the gateway stops taking bytes for `timeout_ms`; how many it took.
+        size_t send_until_blocked(const std::string& s, int timeout_ms)
+        {
+            size_t off = 0;
+            while (off < s.size())
+            {
+                pollfd p{_fd, POLLOUT, 0};
+                if (::poll(&p, 1, timeout_ms) <= 0) break;
+                const ssize_t n = ::send(_fd, s.data() + off, s.size() - off, MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (n <= 0) break;
+                off += static_cast<size_t>(n);
+            }
+            return off;
         }
         // Dribble the bytes out in tiny chunks to force the gateway's framer through
         // the NeedMore path (partial reads mid-request).
@@ -729,6 +748,7 @@ namespace
             if (::poll(&p, 1, timeout_ms) <= 0) return false;
             return ::read(_fd, tmp, sizeof(tmp)) == 0;
         }
+        void shutdown_both() { ::shutdown(_fd, SHUT_RDWR); } // another thread may use the fd
         void close() { if (_fd >= 0) { ::close(_fd); _fd = -1; } }
         ~Client() { close(); }
 
@@ -2411,6 +2431,8 @@ TEST_P(ProxyBackend, RoundTripAndKeepAlive)
 
 // Reading continues while a request is in flight, and nothing bounded what a client
 // could pipeline behind it: one slow upstream let a client grow the buffer until OOM.
+// Past the cap the gateway stops reading the client, and the kernel's flow
+// control holds the rest.
 TEST_P(ProxyBackend, BytesPipelinedBehindARequestInFlightAreBounded)
 {
     _backend.set_stall(1); // read the request, never reply
@@ -2418,15 +2440,69 @@ TEST_P(ProxyBackend, BytesPipelinedBehindARequestInFlightAreBounded)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
-    const std::string junk(1 << 20, 'x');
-    bool refused = false;
-    for (int i = 0; i < 40 && !refused; ++i) refused = !c.send(junk);
-    EXPECT_TRUE(refused || c.wait_closed(3000)) << "40 MiB pipelined without the gateway closing";
-    c.close();
+    const std::string flood(64u << 20, 'x');
+    const size_t took = c.send_until_blocked(flood, 1000);
+    EXPECT_LT(took, 40u << 20) << "the gateway kept reading past its cap";
+    EXPECT_FALSE(c.wait_closed(200)) << "a pause, not a close";
     Client d; // and the worker still serves others
     ASSERT_TRUE(d.connect(_proxy_port));
+    c.close();
     shutdown();
-    EXPECT_GE(_gw->stats().errors, 1u);
+    EXPECT_GE(_gw->stats().client_read_pauses, 1u);
+}
+
+// A client that pipelines legitimate requests past the cap behind a slow one is
+// paused while it waits, then served in order; nothing is closed and nothing fails.
+TEST_P(ProxyBackend, PipeliningPastTheCapIsPausedAndEveryRequestServed)
+{
+    std::atomic<bool> stalled{false};
+    _backend.hold_first_reply(&stalled);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // 40 MiB behind the first request: more than the 16 MiB + 32 KiB cap and every
+    // socket buffer on the way together, so the client's writes block on a pause.
+    constexpr int kBehind = 40;
+    const std::string body(1u << 20, 'x');
+    std::string all = make_request();
+    for (int i = 0; i < kBehind; ++i) all += make_request(body);
+    std::thread writer([&] {
+        const size_t took = c.send_until_blocked(all, 1000);
+        stalled = true; // the gateway stopped reading: let the first reply go
+        if (took < all.size()) c.send(all.substr(took));
+    });
+    bool served = true;
+    for (int i = 0; i <= kBehind && served; ++i)
+    {
+        served = body_of(c.recv_response(10000)) == kRespBody;
+        EXPECT_TRUE(served) << "response " << i;
+    }
+    c.shutdown_both(); // a writer still blocked on a stalled gateway fails, and returns
+    writer.join();
+    c.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().client_read_pauses, 1u);
+    EXPECT_EQ(_gw->stats().requests, static_cast<uint64_t>(kBehind + 1));
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// A client that disconnects while its reply is still being written is an error on
+// both backends. epoll counted it; io_uring, whose reply had already let go of the
+// upstream, closed it as if it were idle.
+TEST_P(ProxyBackend, AClientGoneMidReplyCountsAsAnErrorOnBothBackends)
+{
+    _backend.set_response(http_ok(std::string(8u << 20, 'a')));
+    _client_sndbuf = 4096;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port, 4096));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_FALSE(c.recv_some(3000).empty()); // the reply has begun
+    c.close();                               // with megabytes still owed
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 0u);
+    EXPECT_EQ(_gw->stats().errors, 1u);
 }
 
 // Out of file descriptors, accept() fails while the connection stays queued: the
@@ -2435,6 +2511,15 @@ TEST_P(ProxyBackend, BytesPipelinedBehindARequestInFlightAreBounded)
 TEST_P(ProxyBackend, RunningOutOfDescriptorsDoesNotSpinTheWorker)
 {
     start(0, true, UpstreamDialect::OpenAI, GetParam());
+    {
+        // One request before the table fills: UBSan checks the type behind the first
+        // call through IoOps by probing memory with a pipe, which fails with no
+        // descriptor left, and reports a valid object as a bad one.
+        Client w;
+        ASSERT_TRUE(w.connect(_proxy_port));
+        ASSERT_TRUE(w.send(make_request()));
+        ASSERT_EQ(w.recv_status(3000), 200);
+    }
     rlimit old{};
     ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &old), 0);
     int open_fds = 0;
