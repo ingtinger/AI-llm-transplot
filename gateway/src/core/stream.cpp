@@ -8,7 +8,7 @@
 // A stream's life on either backend: entering it, the upstream's EOF, the finalize,
 // the encoding warning, the latency record and the one way to truncate.
 
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 
 #include "core/io.hpp"
 #include "core/limits.hpp"
@@ -16,13 +16,12 @@
 #include "response.hpp"
 #include "stream.hpp"
 
-namespace llmbridge
+namespace llmbridge::detail
 {
-    using namespace detail;
 
     // Token counts cannot be read from a compressed stream. request_without drops
     // Accept-Encoding, so the provider compressed unasked; say so.
-    void Gateway::stream_warn_if_encoded(const Connection* client,
+    void Engine::stream_warn_if_encoded(const Connection* client,
                                          const net::http::ResponseHead& h) noexcept
     {
         if (!h.encoded) return;
@@ -34,7 +33,7 @@ namespace llmbridge
     // request-path and the handshake do not care what shape the response takes, so a
     // stream records them like any other request. resp_path and added-total it cannot
     // have: both end at the instant a response was built. See LATENCY.md section 4.
-    void Gateway::stream_record_latency(const Connection* client) noexcept
+    void Engine::stream_record_latency(const Connection* client) noexcept
     {
         if (now_ns() - _t_start < _warmup_ns) return;
         // t4 stands in for the absent t5; only the request-side fields are read.
@@ -52,7 +51,7 @@ namespace llmbridge
 
     // The upstream answered text/event-stream: stage the client's SSE head, then
     // translate or forward the body as it arrives.
-    void Gateway::begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept
+    void Engine::begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept
     {
         Connection* client = u->peer;
         client->req.f.streaming = true;
@@ -90,7 +89,7 @@ namespace llmbridge
     }
 
     // New body bytes in `u->rbuf`: translate or forward them into the client's buffer.
-    void Gateway::stream_pump(Connection* u) noexcept
+    void Engine::stream_pump(Connection* u) noexcept
     {
         Connection* client = u->peer;
         if (!client) return _ops->close(*u);
@@ -111,7 +110,7 @@ namespace llmbridge
     // Write what the stream owes the client. Behind a slow client a backend that can
     // pauses the upstream's reads (GATEWAY-INTERNALS.md 6c); a stream that ended and
     // drained finalizes.
-    void Gateway::stream_flush(Connection* client) noexcept
+    void Engine::stream_flush(Connection* client) noexcept
     {
         const uint64_t sent = client->sent_bytes;
         const Sent s = _ops->send(*client);
@@ -142,7 +141,7 @@ namespace llmbridge
 
     // The upstream closed: translate what remains, emit the terminal [DONE] if the
     // framing allows, and flush toward the finalize.
-    void Gateway::stream_on_upstream_eof(Connection* u) noexcept
+    void Engine::stream_on_upstream_eof(Connection* u) noexcept
     {
         Connection* client = u->peer;
         if (!client)
@@ -158,7 +157,7 @@ namespace llmbridge
         stream_flush(client);
     }
 
-    void Gateway::finalize_stream(Connection* client) noexcept
+    void Engine::finalize_stream(Connection* client) noexcept
     {
         // Reuse is the whole point: a streaming request otherwise costs a fresh
         // upstream connect, the dominant term in time-to-first-token.
@@ -192,7 +191,7 @@ namespace llmbridge
         on_client_bytes(client); // a pipelined next request may already be in rbuf
     }
 
-    void Gateway::stream_truncate(Connection* client) noexcept
+    void Engine::stream_truncate(Connection* client) noexcept
     {
         // One call for the three mutations and the log line: GATEWAY-INTERNALS.md 6b.
         // CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTheClient guards
@@ -206,4 +205,4 @@ namespace llmbridge
         ++_stats.errors;                  // and it counts as a failure, not a finish
     }
 
-} // namespace llmbridge
+} // namespace llmbridge::detail

@@ -4164,7 +4164,7 @@ TEST_F(ProxyIT, UringSurvivesProvidedBufferExhaustion)
     // The point of the test. If this fires, the pool never actually ran dry and the
     // assertions above passed without touching the recovery path, so either the
     // hook stopped working or the kernel no longer reports -ENOBUFS here, and the
-    // recovery branch in ur_on_recv is dead code that needs re-examining.
+    // recovery branch in UringIo::on_recv is dead code that needs re-examining.
     EXPECT_GT(enobufs, 0u)
         << "pool of 1 buffer across " << kClients
         << " streams did not produce -ENOBUFS; this test is not exercising what it claims";
@@ -8075,7 +8075,7 @@ TEST_P(ProxyPoolHygiene, BytesArrivingOnAnIdlePooledUpstreamDropTheConnection)
 {
     // The upstream answers A, the gateway pools the connection, and a late reply
     // then lands on it. Before the fix, epoll appended those bytes to the upstream's
-    // rbuf and left them there; ep_acquire_upstream does not clear rbuf, so client B
+    // rbuf and left them there; acquire_upstream does not clear rbuf, so client B
     // was served this. The io_uring twin already closed the connection here.
     _backend.set_late_bytes("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nLEAKED!!!", 50);
     start(0, true, UpstreamDialect::OpenAI, GetParam());

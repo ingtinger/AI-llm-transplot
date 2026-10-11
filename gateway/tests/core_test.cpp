@@ -13,6 +13,7 @@
 #include "core/limits.hpp"
 #include "core/pool.hpp"
 #include "core/registry.hpp"
+#include "engine.hpp"
 #include "gateway/gateway.hpp"
 
 #include <gtest/gtest.h>
@@ -28,46 +29,38 @@ namespace llmbridge
     using detail::IoCaps;
     using detail::Sent;
 
-    /// Gateway's friend: reaches the shared lifecycle the backends call.
+    /// Gateway's friend: reaches the Engine, whose lifecycle the backends call.
     struct GatewayCoreTest
     {
         Gateway& g;
+        detail::Engine& e = *g._e;
 
         void attach(detail::IoOps& io, bool backpressure)
         {
-            g.attach(&io, IoCaps{.stream_backpressure = backpressure});
+            e.attach(&io, IoCaps{.stream_backpressure = backpressure});
         }
         Connection* client()
         {
             auto* c = new Connection();
             c->fd = ::eventfd(0, EFD_CLOEXEC);
             c->id = 1;
-            g._clients->add(c);
+            e._clients->add(c);
             return c;
         }
         /// Connected and registered, as a pooled or freshly connected one would be.
         Connection* upstream(int slot = 0)
         {
-            Connection* u = g.new_upstream(slot);
+            Connection* u = e.new_upstream(slot);
             u->fd = ::eventfd(0, EFD_CLOEXEC);
             u->connected = u->wire_ready = true;
-            g._upconns->add(u);
+            e._upconns->add(u);
             return u;
         }
-        /// What a backend's close does to the bookkeeping; the fd closes at teardown.
+        /// A backend's close, less the fd, which closes at teardown.
         void forget(Connection& c)
         {
             if (c.doomed) return;
-            Connection* other = unpair(&c);
-            if (c.is_client) g._clients->remove(&c);
-            else
-            {
-                g._pool->remove(c);
-                g._upconns->remove(&c);
-            }
-            c.doomed = true;
-            g._doomed->add(&c);
-            if (other && c.is_client) forget(*other);
+            if (Connection* other = e.forget(&c)) forget(*other);
         }
         /// A request framed on `c` and dispatched on `u`, its bytes on `u`'s wire.
         void dispatch(Connection* c, Connection* u)
@@ -81,20 +74,20 @@ namespace llmbridge
             pair(c, u);
         }
 
-        void error_respond(Connection* c, int code) { g.error_respond(c, code, "test"); }
-        Connection* acquire(int slot) { return g.acquire_upstream(slot); }
-        bool retry(Connection* u) { return g.retry_upstream(u); }
-        void release(Connection* u, bool keep_alive) { g.release_upstream(u, keep_alive, true); }
-        bool failover(Connection* c) { return g.upstream_failed(c, 502, "test"); }
-        void begin_stream(Connection* u, const net::http::ResponseHead& h) { g.begin_stream(u, h); }
-        void upstream_eof(Connection* u) { g.stream_on_upstream_eof(u); }
-        void finalize(Connection* c) { g.finalize_stream(c); }
-        void abort_pair(Connection* c) { g.abort_pair(c); }
-        void bytes(Connection* c) { g.on_client_bytes(c); }
-        void upstream_bytes(Connection* u) { g.on_upstream_bytes(u); }
-        void flush(Connection* c) { g.stream_flush(c); }
-        void pump(Connection* u) { g.stream_pump(u); }
-        void gone(Connection* c) { g.client_gone(c); }
+        void error_respond(Connection* c, int code) { e.error_respond(c, code, "test"); }
+        Connection* acquire(int slot) { return e.acquire_upstream(slot); }
+        bool retry(Connection* u) { return e.retry_upstream(u); }
+        void release(Connection* u, bool keep_alive) { e.release_upstream(u, keep_alive, true); }
+        bool failover(Connection* c) { return e.upstream_failed(c, 502, "test"); }
+        void begin_stream(Connection* u, const net::http::ResponseHead& h) { e.begin_stream(u, h); }
+        void upstream_eof(Connection* u) { e.stream_on_upstream_eof(u); }
+        void finalize(Connection* c) { e.finalize_stream(c); }
+        void abort_pair(Connection* c) { e.abort_pair(c); }
+        void bytes(Connection* c) { e.on_client_bytes(c); }
+        void upstream_bytes(Connection* u) { e.on_upstream_bytes(u); }
+        void flush(Connection* c) { e.stream_flush(c); }
+        void pump(Connection* u) { e.stream_pump(u); }
+        void gone(Connection* c) { e.client_gone(c); }
         const Stats& stats() const { return g.stats(); }
         size_t pooled() const { return g.pooled_upstream_count(); }
     };

@@ -26,13 +26,13 @@ provider/   dialect translation (OpenAI ⇄ Anthropic / Gemini / Cohere)   (no I
   ├─ json.hpp        hand-rolled, scoped JSON parser + escaping builder
   └─ translate.hpp   string→string translation functions, one .cpp per venue
 gateway/    the event-loop proxy that ties net + provider together
-  ├─ engine.cpp         Gateway: construction, teardown, run(), warm buffers
+  ├─ facade.cpp         Gateway, the public class: forwards to the Engine
+  ├─ engine.{hpp,cpp}   detail::Engine: construction, teardown, run(), warm buffers
   ├─ resolve.cpp        next address after a failed connect, re-resolution thread
-  ├─ core/              the shared methods, by concern: transport (TLS), sink,
-  │                     sweep, stream, upstream, client, pool; conn.hpp is Connection,
-  │                     req.hpp a request, limits.hpp the shared constants
-  ├─ gateway_epoll.cpp  every ep_ method and run_epoll()
-  ├─ gateway_uring.cpp  every ur_ method and run_uring()
+  ├─ core/              the one request lifecycle, by concern: client, upstream,
+  │                     stream, transport (TLS), sink, sweep, pool; io.hpp is IoOps,
+  │                     conn.hpp Connection, req.hpp a request, limits.hpp constants
+  ├─ io/                the backends: EpollIo and UringIo, each its loop and syscalls
   └─ request, response, scan, stream   the helpers, by concern (src/ only)
 app/        the CLI daemon (llmbridge --listen ... --upstream ... --upstream-dialect ...)
 ```
@@ -45,61 +45,42 @@ into the loop. Nothing above `net/` has a third-party dependency.
 
 Namespaces mirror the directory, with no exceptions:
 `net/...` → `llmbridge::net[::http|::tls|::uring]`, `provider/...` →
-`llmbridge::provider[::json]`, `gateway/...` → `llmbridge`.
+`llmbridge::provider[::json]`, `gateway/...` → `llmbridge`, with the gateway's
+internals in `llmbridge::detail`.
 
-**Inside `Gateway`, the backend a function belongs to is part of its name:**
+**The backend boundary is a directory, not a prefix.** The request lifecycle is
+written once, in `gateway/src/core/`, as methods of `detail::Engine`; each backend is
+a `final` class in `gateway/src/io/` (`EpollIo`, `UringIo`) that owns its loop and its
+syscalls and reaches the lifecycle through the methods it calls back. The lifecycle
+reaches a backend only through `IoOps` (`core/io.hpp`): `send`, `connect`, `set_read`,
+`close`, and `IoCaps` for the one behaviour they deliberately do not share. Calling
+one backend from the other is a compile error, so the rules that matter are about
+what crosses the boundary:
 
-| prefix | meaning |
+| rule | why |
 |---|---|
-| `ep_` | epoll-only, reachable solely from `run_epoll()` |
-| `ur_` | io_uring-only, reachable solely from `run_uring()` |
-| *(none)* | genuinely shared by both loops (`sweep_idle`, the `tls_*` pump helpers) |
+| `core/` includes no backend header: `<sys/epoll.h>`, `<linux/io_uring.h>`, `net/uring.hpp`, `io/*` | a backend header in core is how backend code leaks back into the shared path |
+| `core/` makes no socket call: `::read`, `::write`, `::send`, `::accept`, `::close`, `epoll_ctl` | the shared path cannot depend on how a backend completes I/O |
+| `io/epoll*` never mentions io_uring, `io/uring*` never mentions epoll, comments included | a backend reasoned about in the other's terms is how a fix lands on the wrong side |
 
-The prefix is also the file: `ep_` methods are defined in `gateway_epoll.cpp`, `ur_`
-methods in `gateway_uring.cpp`, and unprefixed ones in `engine.cpp` and `core/`, so a
-fix that lands on one side shows in the diff as a file that its twin did not touch.
-
-Two rules make this worth the verbosity:
-
-1. **A call crossing the prefixes is a bug, and `grep 'ur_[a-z_]*(' | grep ep_`
-   finds it.** Neither backend's teardown, write-arming or completion handling is
-   valid in the other. Exactly one such crossing existed when the convention was
-   introduced (`ur_forward()` calling the *epoll* error responder) and it had
-   been invisible for as long as the epoll half was unprefixed.
-2. **Twins share a verb.** `ep_stream_flush` / `ur_stream_flush`,
-   `ep_finish_client` / `ur_finish_client`. Before this, the same role was called
-   `stream_flush` on one side and `u_stream_kick` on the other, so a grep for the
-   counterpart returned nothing and the pairing had to be rediscovered by reading.
-
-**Constants carry the same claim, capitalised:** `kEpMaxReadPerEvent` is epoll's,
-`kUrBufCount` is io_uring's, and a bare `kInitialBuf` is shared. This earns its
-keep because the two backends bound memory by different means: epoll pauses its
-upstream read when a client write goes partial, io_uring has no pause path at all and
-drops the stream past `kStreamBufCap`. A constant that reads as shared invites a fix
-on the wrong side, and a one-sided fix usually lands on the side that does not ship.
-
-The uring prefix is `ur_`, not `u_`, because `u` is the conventional parameter name
-for an *upstream* connection. `void u_tls_kick_send(Connection* u)` used both
-meanings of `u` in one signature.
+This replaced the `ep_`/`ur_` prefixes, which existed because the lifecycle used to be
+written twice inside one class: a call crossing them was a bug, and a checker walked
+the call graph to find one. With one lifecycle and two classes the compiler enforces
+the separation, and the checker enforces the boundary instead.
 
 **This is enforced, not merely documented.** `scripts/check_conventions.py` runs as the
-first CI job (no compiler, ~90 ms) and fails the build on six things: a call crossing
-the prefixes; an **unprefixed** method reachable from only one backend; a constant whose
-backend prefix disagrees with where it is used (a `kUr*` read from an `ep_` method, or a
-bare one used solely by one side); a header whose
-namespace does not mirror its directory; and a stale attribution in LATENCY.md's stamp
-table (each timing stamp names the function that assigns it, and that function must
-exist and must actually assign it); and an identifier whose casing breaks the rules
-below (a constant that is not `kPascalCase`, or worse is `ALL_CAPS`, or a type that is
-not `PascalCase`). The table names functions instead of line
-numbers on purpose: line references rot on any edit above them, so the doc would
-need re-checking on every commit, and a reference that needs re-checking every
-commit is one nobody re-checks. Function names move only under a rename, which is
-exactly when the table should be revisited anyway. The middle check is the one that earns
-its keep. A crossing grep cannot catch a mislabelled method, because the offending name
-has no prefix to grep for. That is exactly how `abort_pair` survived the rename that
-introduced this convention. Each check is verified against a deliberately reintroduced
-instance of the defect it exists to catch.
+first CI job (no compiler, under a second) and fails the build on: a boundary rule
+above; a header whose namespace does not mirror its directory; a stale attribution in
+LATENCY.md's stamp table (each timing stamp names the function that assigns it, as
+`Class::method` or a name only one class defines, and that function must exist and
+must actually assign it); and an identifier whose casing breaks the rules below (a
+constant that is not `kPascalCase`, or worse is `ALL_CAPS`, or a type that is not
+`PascalCase`). The table names functions instead of line numbers on purpose: line
+references rot on any edit above them, so the doc would need re-checking on every
+commit, and a reference that needs re-checking every commit is one nobody re-checks.
+Before it checks the tree, the checker runs each boundary rule against a planted
+violation and fails if any goes unnoticed, so a rule that stops matching cannot report
+a clean tree forever.
 
 Elsewhere: `kPascalCase` constants, `_member` privates, `PascalCase` types and enum
 values, `snake_case` functions, `ts_*` for timestamps, and `X_to_Y_request` /
@@ -167,7 +148,7 @@ flight after you'd like to free it. The backend tracks an in-flight op count per
 connection and defers the free until the count reaches zero (a "doomed" list),
 handles multishot CQEs that carry `F_MORE` alongside a terminal result, and re-arms
 on transient conditions. This is the most safety-critical code in the repo and is
-commented inline in `gateway/src/gateway_uring.cpp`.
+commented inline in `gateway/src/io/uring_io.cpp`.
 
 ## Request lifecycle (proxy)
 

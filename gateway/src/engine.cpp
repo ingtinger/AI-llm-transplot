@@ -5,10 +5,10 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// Gateway's construction, teardown and run(), the sequencer, the profile print and
+// The Engine's construction, teardown and run(), the sequencer, the profile print and
 // the warm-buffer rotation: what is neither one request's path nor one backend's.
 
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 
 #include "core/io.hpp"
 #include "core/limits.hpp"
@@ -16,7 +16,7 @@
 #include "net/secure.hpp"
 #include "request.hpp"
 
-#include <sys/epoll.h>
+#include <arpa/inet.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -28,59 +28,36 @@
 #include <stdexcept>
 #include <string_view>
 
+#include "io/epoll_io.hpp"
+#include "io/uring_io.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
 #include "net/socket_util.hpp"
-#include "net/uring.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
 
-namespace llmbridge
+namespace llmbridge::detail
 {
-    using namespace detail;
+    // Total order across all workers, independent of any clock.
+    //
+    // std::atomic, not volatile: volatile provides neither atomicity nor
+    // inter-thread ordering in C++ (it is for memory-mapped I/O), and workers are
+    // std::threads sharing this process, so a plain or volatile counter would be a
+    // data race that hands two requests the same number.
+    //
+    // relaxed is sufficient and is the cheapest correct choice: every atomic has a
+    // single total modification order, so fetch_add yields unique, increasing
+    // values in the order the increments occurred. We need uniqueness and
+    // ordering of the counter itself, not ordering of surrounding memory, so no
+    // fences are warranted.
+    //
+    // Why this exists at all: two requests can share a nanosecond, and clocks on
+    // different hosts cannot be trusted to sub-millisecond agreement without PTP.
+    // (t0, seq) is a total order that needs neither. This is the sequencer
+    // pattern: an exchange defines order by arrival at a sequencing point, not by
+    // comparing timestamps, and it is why the tape for inference should sequence
+    // instead of timestamp.
+    std::atomic<uint64_t> g_seq{0};
 
-    namespace detail
-    {
-        // Total order across all workers, independent of any clock.
-        //
-        // std::atomic, not volatile: volatile provides neither atomicity nor
-        // inter-thread ordering in C++ (it is for memory-mapped I/O), and workers are
-        // std::threads sharing this process, so a plain or volatile counter would be a
-        // data race that hands two requests the same number.
-        //
-        // relaxed is sufficient and is the cheapest correct choice: every atomic has a
-        // single total modification order, so fetch_add yields unique, increasing
-        // values in the order the increments occurred. We need uniqueness and
-        // ordering of the counter itself, not ordering of surrounding memory, so no
-        // fences are warranted.
-        //
-        // Why this exists at all: two requests can share a nanosecond, and clocks on
-        // different hosts cannot be trusted to sub-millisecond agreement without PTP.
-        // (t0, seq) is a total order that needs neither. This is the sequencer
-        // pattern: an exchange defines order by arrival at a sequencing point, not by
-        // comparing timestamps, and it is why the tape for inference should sequence
-        // instead of timestamp.
-        std::atomic<uint64_t> g_seq{0};
-    } // namespace detail
-
-    // The single-upstream form, kept because it is what most callers want and because
-    // rewriting every existing call site to build a one-entry vector would be churn
-    // with no reader benefit. Outbound TLS still arrives through TlsConfig here; the
-    // table form takes it per upstream.
-    Gateway::Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
-                     int64_t warmup_ns, UpstreamDialect dialect, IoBackend io,
-                     int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers,
-                     Policy* policy, std::vector<std::string> strip_headers)
-        : Gateway(listen_port,
-                  std::vector<Upstream>{Upstream{.ip = std::move(upstream_ip),
-                                                 .port = upstream_port,
-                                                 .tls = tls.upstream_tls,
-                                                 .sni_host = tls.sni_host,
-                                                 .dialect = dialect}},
-                  warmup_ns, io, upstream_idle_ns, tls, timing_headers, policy,
-                  std::move(strip_headers))
-    {
-    }
-
-    Gateway::Gateway(uint16_t listen_port, std::vector<Upstream> upstreams, int64_t warmup_ns,
-                     IoBackend io, int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers,
-                     Policy* policy, std::vector<std::string> strip_headers)
+    Engine::Engine(uint16_t listen_port, std::vector<Upstream> upstreams, int64_t warmup_ns,
+                   IoBackend io, int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers,
+                   Policy* policy, std::vector<std::string> strip_headers)
         : _listen_port(listen_port), _upstreams(std::move(upstreams)), _warmup_ns(warmup_ns),
           _io(io), _upstream_idle_ns(upstream_idle_ns), _tls(std::move(tls)),
           _timing_headers(timing_headers), _policy(policy),
@@ -109,7 +86,7 @@ namespace llmbridge
         _upconns = std::make_unique<Registry<Connection>>();
         _doomed = std::make_unique<Registry<Connection>>();
         _pool = std::make_unique<UpstreamPool>();
-        _pool->init(_upstreams.size(), kMaxIdleUpstreams);
+        _pool->init(_upstreams.size(), Gateway::kMaxIdleUpstreams);
         _rr_inflight.assign(_upstreams.size(), 0);
         // Normalize once, at construction: lower-case with the colon, so the hot path
         // compares against a raw header line with no per-request work.
@@ -151,13 +128,8 @@ namespace llmbridge
         // peer-closed socket returns EPIPE instead of killing us. Idempotent, so
         // safe to set here (covers the daemon and the test harness alike).
         std::signal(SIGPIPE, SIG_IGN);
-        _epfd = ::epoll_create1(0);
-        if (_epfd < 0) throw std::runtime_error("epoll_create1() failed");
         _listen_fd = net::make_listener(_listen_port);
         if (_listen_fd < 0) throw std::runtime_error("failed to bind listen port");
-        _listen_conn = new Connection();
-        _listen_conn->fd = _listen_fd;
-        ep_add_read(_listen_conn);
         LB_INFO("listening port=", _listen_port, " upstreams=",
                 static_cast<int64_t>(_upstreams.size()),
                 _tls.client_tls ? " inbound=tls" : " inbound=plaintext");
@@ -175,7 +147,7 @@ namespace llmbridge
         // Resolve the event-loop backend: io_uring for Uring/Auto when the kernel
         // supports it, else epoll. Uring requested but unavailable -> epoll.
 #ifdef LLMBRIDGE_HAVE_URING
-        const bool uring_ok = net::uring::available();
+        const bool uring_ok = UringIo::available();
         if (_io == IoBackend::Uring || _io == IoBackend::Auto) _uring_active = uring_ok;
         if (_io == IoBackend::Uring && !uring_ok)
             LB_WARN("io_uring requested but unavailable; falling back to epoll");
@@ -189,7 +161,7 @@ namespace llmbridge
         LB_INFO("backend requested=", want, " active=", _uring_active ? "io_uring" : "epoll");
     }
 
-    Gateway::~Gateway()
+    Engine::~Engine()
     {
         {
             std::lock_guard<std::mutex> g(_rr.mutex);
@@ -207,17 +179,15 @@ namespace llmbridge
         _upconns->clear(free_conn);
         _doomed->clear(free_conn);
         if (_listen_fd >= 0) ::close(_listen_fd);
-        if (_epfd >= 0) ::close(_epfd);
-        delete _listen_conn;
     }
 
-    const Upstream& Gateway::upstream_of(const Connection* c) const noexcept
+    const Upstream& Engine::upstream_of(const Connection* c) const noexcept
     {
         const size_t i = (c->upstream_slot >= 0) ? static_cast<size_t>(c->upstream_slot) : 0;
         return _upstreams[i < _upstreams.size() ? i : 0];
     }
 
-    uint16_t Gateway::bound_port() const noexcept
+    uint16_t Engine::bound_port() const noexcept
     {
         if (_listen_fd < 0) return 0;
         sockaddr_in addr{};
@@ -226,7 +196,7 @@ namespace llmbridge
         return ntohs(addr.sin_port);
     }
 
-    bool Gateway::pooled_buffer_contains(std::string_view needle) const noexcept
+    bool Engine::pooled_buffer_contains(std::string_view needle) const noexcept
     {
         if (needle.empty()) return false;
         bool found = false;
@@ -236,11 +206,11 @@ namespace llmbridge
         return found;
     }
 
-    size_t Gateway::pooled_upstream_count() const noexcept { return _pool->size(); }
+    size_t Engine::pooled_upstream_count() const noexcept { return _pool->size(); }
 
-    void Gateway::set_pool_cap_for_test(size_t n) noexcept { _pool->set_cap(n); }
+    void Engine::set_pool_cap(size_t n) noexcept { _pool->set_cap(n); }
 
-    void Gateway::print_profile(std::FILE* out, const char* title) const noexcept
+    void Engine::print_profile(std::FILE* out, const char* title) const noexcept
     {
         std::ostringstream os;
         os << "\n=== llmbridge " << title << " ===\n";
@@ -264,7 +234,7 @@ namespace llmbridge
         std::fputs(os.str().c_str(), out);
     }
 
-    void Gateway::prefault(std::string& s) const
+    void Engine::prefault(std::string& s) const
     {
         if (s.capacity() >= _prefault_bytes) return;
         // resize writes every byte, which is what maps the pages; clear keeps them.
@@ -272,7 +242,7 @@ namespace llmbridge
         s.clear();
     }
 
-    size_t Gateway::prefault_resident_bytes_for_test()
+    size_t Engine::prefault_resident_bytes_for_test()
     {
         prefault(_rebuild);
         prefault(_xlate);
@@ -288,9 +258,9 @@ namespace llmbridge
         return resident;
     }
 
-    void Gateway::retire_wbuf(Connection* u) noexcept
+    void Engine::retire_wbuf(Connection* u) noexcept
     {
-        if (u->is_client || _warm.size() >= kWarmBufs || u->out.capacity() < kWarmMin) return;
+        if (u->is_client || _warm.size() >= Gateway::kWarmBufs || u->out.capacity() < Gateway::kWarmMin) return;
         // A closing connection may still hold a request, credential included; the pool
         // scrub runs at release, and a connection closed mid-request never got there.
         // The ciphertext is the same request encrypted, so it is scrubbed too. Freed
@@ -305,7 +275,7 @@ namespace llmbridge
         _warm.push_back(std::move(set));
     }
 
-    void Gateway::adopt_warm(Connection* u) noexcept
+    void Engine::adopt_warm(Connection* u) noexcept
     {
         if (_warm.empty()) return;
         WarmSet set = std::move(_warm.back());
@@ -317,18 +287,18 @@ namespace llmbridge
         ++_stats.warm_reuses;
     }
 
-    void Gateway::attach(detail::IoOps* io, const detail::IoCaps& caps) noexcept
+    void Engine::attach(IoOps* io, const IoCaps& caps) noexcept
     {
         _ops = io;
         _stream_backpressure = caps.stream_backpressure;
     }
 
-    void Gateway::note_build(size_t need) noexcept
+    void Engine::note_build(size_t need) noexcept
     {
         if (_rebuild.capacity() < need) ++_stats.cold_builds;
     }
 
-    int Gateway::run()
+    int Engine::run()
     {
         prefault(_rebuild);
         prefault(_xlate);
@@ -343,9 +313,14 @@ namespace llmbridge
             _warm.push_back(std::move(spare));
         }
 #ifdef LLMBRIDGE_HAVE_URING
-        if (_uring_active) return run_uring();
+        if (_uring_active)
+        {
+            UringIo io(*this);
+            if (io.ready()) return io.run(); // else it said why, and epoll runs instead
+        }
 #endif
-        return run_epoll();
+        EpollIo io(*this);
+        return io.run();
     }
 
-} // namespace llmbridge
+} // namespace llmbridge::detail

@@ -446,7 +446,7 @@ Compile-time constants that change benchmark results:
 | `kMaxIdleUpstreams` | 8192 | **Do not lower without re-running `saturate.sh BACKENDS=4`.** At 256 it stopped being a bound and became a reuse killer: 32,210 achieved vs 77,282. git-bisected. |
 | `kIdleUpstreamNs` | 30 s | idle pooled-upstream eviction; the real reclaim mechanism |
 | `kStreamBufCap` | 8 MiB | per-stream output cap (io_uring back-pressure) |
-| `kUrBufCount` / `kUrBufSize` | 4096 × 4 KiB | io_uring provided-buffer pool. Measured irrelevant to the streaming tail; an 8× increase changed nothing. |
+| `kBufCount` / `kBufSize` (io_uring) | 4096 × 4 KiB | io_uring provided-buffer pool. Measured irrelevant to the streaming tail; an 8× increase changed nothing. |
 
 
 ## 5. Provenance of published numbers

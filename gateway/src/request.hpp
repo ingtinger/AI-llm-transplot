@@ -20,7 +20,7 @@
 
 #include "gateway/dialect.hpp"
 #include "core/conn.hpp"
-#include "gateway/gateway.hpp"
+#include "engine.hpp"
 #include "provider/translate.hpp"
 
 namespace llmbridge::detail

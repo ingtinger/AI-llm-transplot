@@ -6,33 +6,28 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Enforce the naming conventions that keep the two event-loop backends apart.
+"""Enforce the boundary between the shared request lifecycle and its two backends,
+and the repository's naming and documentation conventions.
 
-Gateway implements the whole request lifecycle twice: once on epoll, once on
-io_uring, and the two halves are 60-81% similar. Neither backend's teardown,
-write-arming or completion handling is valid in the other, so a call that crosses
-from one into the other is a bug. The ep_/ur_ prefixes exist to make that
-mechanically checkable; this script is what makes them an invariant instead of a
-habit. See DESIGN.md "Naming conventions".
+The lifecycle is written once, in gateway/src/core/, against IoOps; each backend
+(gateway/src/io/) owns its loop and its syscalls and nothing else. See DESIGN.md
+"Naming conventions" and GATEWAY-INTERNALS.md section 11.
 
-Three checks, each of which has caught a real defect:
+  1. Includes: core/ never includes <sys/epoll.h>, <linux/io_uring.h>,
+     net/uring.hpp or io/*. A backend header in core is how backend code leaks back in.
+  2. Syscalls: core/ never calls ::read, ::write, ::send, ::accept, ::close or
+     epoll_ctl. The lifecycle reaches a socket only through IoOps.
+  3. Namespace: a header's namespace mirrors its directory.
+  4. LATENCY.md: every timing stamp is attributed to a method that assigns it.
+  5. Casing: kPascalCase constants, PascalCase types, ALL_CAPS only for macros.
+  5b. Backends stay apart: io/epoll* never mentions io_uring and io/uring* never
+     mentions epoll, in code or comments. Calling one backend from the other is
+     already a compile error; this keeps either from depending on the other's rules.
+  6. Release version agrees with CHANGELOG.md; comment density under the limit.
 
-  1. Crossing, a ep_* function calling a ur_* one, or vice versa.
-                  Caught ur_forward() calling the epoll error responder, which had
-                  been invisible for as long as the epoll half was unprefixed.
-
-  2. Unmarked, an unprefixed Gateway method reachable from only one backend.
-                  Unprefixed is supposed to mean "shared", so a one-sided unprefixed
-                  method is a mislabelled backend-specific one. This is the check
-                  that matters most: a crossing grep alone cannot catch it, because
-                  the offending name has no prefix to grep for. Caught abort_pair,
-                  which a prefix-only check had missed.
-
-  3. Namespace, a header whose namespace does not mirror its directory.
-                  Caught llmbridge::http (should nest under net) and llmbridge::json
-                  (should nest under provider).
-
-Pure stdlib, no build required. Exits non-zero on any violation.
+Every boundary rule is run against planted violations first, so a rule that stops
+matching fails the run instead of passing everything. Pure stdlib, no build required.
+Exits non-zero on any violation.
 """
 
 import re
@@ -40,48 +35,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# Gateway is defined across every .cpp under gateway/src: the shared methods by
-# concern, then one file per backend. They are read as one text, since a crossing is
-# a call from a method in one file to a method in another, and the reachability walk
-# needs every method in view. A glob, so a new file cannot be left out of the check.
-GATEWAY_FILES = sorted((ROOT / "gateway" / "src").rglob("*.cpp"))
-
-
-def gateway_text():
-    """(text, locate): the files' comment-stripped text joined, and a function
-    mapping a line in it back to `file:line`."""
-    parts, starts, at = [], [], 0
-    for f in GATEWAY_FILES:
-        body = strip_comments(f.read_text(encoding="utf-8"))
-        parts.append(body)
-        starts.append((at, f))
-        at += body.count("\n") + 1
-
-    def locate(line):
-        for begin, f in reversed(starts):
-            if line > begin:
-                return f"{f.relative_to(ROOT)}:{line - begin}"
-        return f"{GATEWAY_FILES[0].relative_to(ROOT)}:{line}"
-    return "\n".join(parts), locate
-
-# Methods that are legitimately unprefixed despite not being called from both
-# backends: entry points, accessors, and the ctor. Anything else that is
-# one-sided is a naming bug, not an exception. Extend this list only with a
-# reason, never to silence check 2.
-UNPREFIXED_ALLOWED = {
-    "Gateway",       # constructor
-    "run",           # dispatches to run_epoll / run_uring
-    "run_epoll",     # names its own backend
-    "run_uring",     # names its own backend
-    "request_stop",
-    "stats",
-    "bound_port",
-    # Called from the destructor, which runs whichever backend was used, and from
-    # the epoll batch loop. The reachability walk below starts at run_epoll /
-    # run_uring, so it cannot see the destructor and reports this as epoll-only.
-    # It is genuinely shared; the check is right to ask, and this is the answer.
-    "free_doomed_safe",
-}
+SRC = ROOT / "gateway" / "src"
+# The classes whose methods are the gateway: the shared Engine and the two backends.
+CLASSES = ("Engine", "EpollIo", "UringIo")
 
 
 def strip_comments(text):
@@ -117,15 +73,75 @@ def comment_density(text):
     return com, code
 
 
-def method_spans(text):
-    """{name: (start_line, first_line_idx, last_line_idx)} for Gateway:: definitions.
+# ------------------------------------------------------------------ boundary rules
+CORE_INCLUDES = re.compile(r'^\s*#\s*include\s*[<"](sys/epoll\.h|linux/io_uring\.h|net/uring\.hpp|io/[^">]*)[">]', re.M)
+CORE_SYSCALLS = re.compile(r"(::(read|write|send|accept4?|close)\s*\(|\bepoll_ctl\s*\()")
+MENTIONS_URING = re.compile(r"(?i)\b(io_)?uring|IORING")
+MENTIONS_EPOLL = re.compile(r"(?i)\bepoll")
 
-    Brace-matched, so a free function defined between two methods is not charged
-    to whichever method happens to precede it, an error that produced a false
-    finding when this analysis was first done by hand.
-    """
+
+def boundary_violations(rel, text):
+    """Rules 1, 2 and 5b for one file, `rel` relative to gateway/src."""
+    out = []
+    code = strip_comments(text)
+    if rel.startswith("core/"):
+        for m in CORE_INCLUDES.finditer(code):
+            n = code[: m.start()].count("\n") + 1
+            out.append(f"{rel}:{n}: BOUNDARY: core includes `{m.group(1)}`; only io/ may")
+        for m in CORE_SYSCALLS.finditer(code):
+            n = code[: m.start()].count("\n") + 1
+            out.append(f"{rel}:{n}: BOUNDARY: core calls `{m.group(1).strip('( ')}`; "
+                       f"reach the socket through IoOps")
+    name = rel.rsplit("/", 1)[-1]
+    if rel.startswith("io/epoll"):
+        other = MENTIONS_URING
+    elif rel.startswith("io/uring"):
+        other = MENTIONS_EPOLL
+    else:
+        other = None
+    if other:
+        for m in other.finditer(text):
+            n = text[: m.start()].count("\n") + 1
+            out.append(f"{rel}:{n}: BOUNDARY: {name} mentions `{m.group(0)}`, the other backend")
+    return out
+
+
+# Each rule must catch its plant, or the run fails: a rule that silently stops
+# matching would otherwise report a clean tree forever.
+PLANTS = [
+    ("core/x.cpp", '#include <sys/epoll.h>\n'),
+    ("core/x.cpp", '#include "net/uring.hpp"\n'),
+    ("core/x.hpp", '#include "io/epoll_io.hpp"\n'),
+    ("core/x.cpp", 'void f(int fd) { ::close(fd); }\n'),
+    ("core/x.cpp", 'void f(int fd) { (void)::write(fd, "", 0); }\n'),
+    ("core/x.cpp", 'void f(int e, int fd) { epoll_ctl(e, 1, fd, nullptr); }\n'),
+    ("io/epoll_io.cpp", '// unlike io_uring, a send completes here\n'),
+    ("io/uring_io.cpp", 'int x = EPOLLIN;\n'),
+]
+CLEAN = [
+    ("core/x.cpp", '#include "core/io.hpp"\nvoid f(Conn& c) { _ops->close(c); }\n// io_uring and epoll\n'),
+    ("io/epoll_io.cpp", '// what is left during a pause\n'),
+]
+
+
+def self_test():
+    failures = []
+    for rel, text in PLANTS:
+        if not boundary_violations(rel, text):
+            failures.append(f"checker: the boundary rules missed a planted violation in {rel}: {text!r}")
+    for rel, text in CLEAN:
+        if boundary_violations(rel, text):
+            failures.append(f"checker: the boundary rules flagged clean code in {rel}: {text!r}")
+    return failures
+
+
+def method_spans(text):
+    """{"Class::name": (start_line, first_line_idx, last_line_idx)} for the gateway's
+    classes, brace-matched so a free function between two methods is not charged to
+    the one before it."""
     spans = {}
-    for m in re.finditer(r"^[ \t]*(?:[\w:<>,\*&\s]+?)\bGateway::(\w+)\s*\(", text, re.M):
+    pat = r"^[ \t]*(?:[\w:<>,\*&\s]+?)\b(%s)::(\w+)\s*\(" % "|".join(CLASSES)
+    for m in re.finditer(pat, text, re.M):
         open_brace = text.find("{", m.end() - 1)
         if open_brace < 0:
             continue
@@ -138,7 +154,7 @@ def method_spans(text):
                 if depth == 0:
                     break
             i += 1
-        spans[m.group(1)] = (
+        spans[f"{m.group(1)}::{m.group(2)}"] = (
             text[: m.start()].count("\n") + 1,
             text[:open_brace].count("\n"),
             text[:i].count("\n"),
@@ -146,91 +162,33 @@ def method_spans(text):
     return spans
 
 
-def backend_strict(name):
-    """Backend by prefix only, used for the crossing check.
-
-    Deliberately excludes run_epoll/run_uring: they are the dispatch layer, and
-    run_uring() legitimately tails into run_epoll() when io_uring init or the
-    provided-buffer ring is unavailable. Treating them as crossing endpoints
-    flags that documented fallback.
-    """
-    if name.startswith("ep_"):
-        return "ep"
-    if name.startswith("ur_"):
-        return "ur"
-    return None
-
-
-def backend_reach(name):
-    """Backend for reachability, including the two loop entry points.
-
-    sweep_idle is called from run_epoll and from ur_on_cqe and is genuinely
-    shared; without run_epoll counting as an epoll-side caller it would look
-    one-sided and be reported as unmarked.
-    """
-    if name == "run_epoll":
-        return "ep"
-    if name == "run_uring":
-        return "ur"
-    return backend_strict(name)
-
-
 def main():
-    failures = []
+    failures = self_test()
 
-    # ---------------------------------------------------------------- 1 & 2
-    text, locate = gateway_text()
-    lines = text.splitlines()
-    spans = method_spans(text)
-    if len(spans) < 40:
-        print(f"error: only {len(spans)} Gateway methods parsed: the extractor is broken, "
-              f"not the code. Refusing to report a clean run.", file=sys.stderr)
+    # ---------------------------------------------------------------- 1, 2, 5b
+    sources = sorted(SRC.rglob("*.cpp")) + sorted(SRC.rglob("*.hpp"))
+    n_core = n_io = 0
+    for f in sources:
+        rel = f.relative_to(SRC).as_posix()
+        n_core += rel.startswith("core/")
+        n_io += rel.startswith("io/")
+        failures += [f"gateway/src/{v}" for v in boundary_violations(rel, f.read_text(encoding="utf-8"))]
+    if n_core < 10 or n_io < 4:
+        print(f"error: the boundary rules saw {n_core} core and {n_io} io files; the tree "
+              f"or this check moved.", file=sys.stderr)
         return 2
 
-    callees = {name: set() for name in spans}
-    for name, (_, first, last) in spans.items():
-        for idx in range(first, min(last + 1, len(lines))):
-            for called in re.findall(r"\b(\w+)\s*\(", lines[idx]):
-                if called != name and called in spans:
-                    callees[name].add((called, idx + 1))
-
-    # 1. crossings: prefixed functions only (see backend_strict)
-    for caller, calls in callees.items():
-        cb = backend_strict(caller)
-        if cb is None:
-            continue
-        for called, line in sorted(calls):
-            tb = backend_strict(called)
-            if tb is not None and tb != cb:
-                failures.append(
-                    f"{locate(line)}: CROSSING: {caller}() calls "
-                    f"{called}(); {cb} and {tb} teardown/IO are not interchangeable")
-
-    # 2. unprefixed methods reachable from only one backend. Transitively: once the
-    # lifecycle is shared, a backend reaches most shared methods through other shared
-    # ones, never by a direct call.
-    reached_by = {name: set() for name in spans}
-    for side in ("ep", "ur"):
-        todo = [n for n in spans if backend_reach(n) == side]
-        seen = set(todo)
-        while todo:
-            for called, _ in callees[todo.pop()]:
-                if called in seen or backend_reach(called):
-                    continue
-                seen.add(called)
-                reached_by[called].add(side)
-                todo.append(called)
-    for name, (decl_line, _, _) in sorted(spans.items()):
-        if backend_reach(name) or name in UNPREFIXED_ALLOWED:
-            continue
-        sides = reached_by[name]
-        if len(sides) == 1:
-            only = "epoll" if "ep" in sides else "io_uring"
-            pfx = "ep_" if "ep" in sides else "ur_"
-            failures.append(
-                f"{locate(decl_line)}: UNMARKED: {name}() is reachable "
-                f"only from {only}, but an unprefixed name means shared. Rename to "
-                f"{pfx}{name}, or add it to UNPREFIXED_ALLOWED with a reason")
+    # The gateway's methods, comment-stripped, for the stamp attributions below.
+    parts = [strip_comments(f.read_text(encoding="utf-8")) for f in sorted(SRC.rglob("*.cpp"))]
+    text = "\n".join(parts)
+    spans = method_spans(text)
+    if len(spans) < 60:
+        print(f"error: only {len(spans)} gateway methods parsed: the extractor is broken, "
+              f"not the code. Refusing to report a clean run.", file=sys.stderr)
+        return 2
+    by_bare = {}
+    for full in spans:
+        by_bare.setdefault(full.split("::")[1], []).append(full)
 
     # ---------------------------------------------------------------- 3
     for header in sorted(ROOT.glob("*/include/**/*.hpp")):
@@ -267,19 +225,21 @@ def main():
         for m in row.finditer(doc):
             stamp, ident, sites = m.group(1), m.group(2), m.group(3)
             doc_line = doc[: m.start()].count("\n") + 1
-            fns = re.findall(r"`(\w+)`", sites)
+            fns = re.findall(r"`([\w:]+)`", sites)
             if not fns:
                 failures.append(f"LATENCY.md:{doc_line}: STAMP: {stamp} (`{ident}`) names "
                                 f"no assigning function")
                 continue
             seen += 1
             for f in fns:
-                if f not in spans:
+                # `Class::method`, or a bare name only one class defines.
+                full = [f] if f in spans else by_bare.get(f, [])
+                if len(full) != 1:
                     failures.append(
                         f"LATENCY.md:{doc_line}: STAMP: {stamp} cites `{f}()`, which is "
-                        f"not a Gateway method (renamed or removed?)")
+                        f"{'ambiguous' if full else 'not a gateway method (renamed or removed?)'}")
                     continue
-                _, lo, hi = spans[f]
+                _, lo, hi = spans[full[0]]
                 body = "\n".join(lines[lo:hi + 1])
                 if not re.search(rf"\b{ident}\s*=", body):
                     failures.append(
@@ -341,54 +301,6 @@ def main():
               f"types; the extractor is broken, not the code.", file=sys.stderr)
         return 2
 
-    # ---------------------------------------------------------------- 5b
-    # Constant backend prefixes, the same claim the ep_/ur_ method prefixes make:
-    # kEp* is epoll's, kUr* is io_uring's, bare means shared. Worth enforcing because
-    # the two backends bound memory by different means (epoll pauses reads, io_uring
-    # drops past kStreamBufCap), so a constant read as shared invites a fix on the
-    # wrong side, which is this codebase's most likely defect.
-    #
-    # Only contradictions are reported: a prefixed constant used from the other
-    # backend, or a bare one used exclusively by one. A constant used only from free
-    # functions or file scope has no evidence either way and is left alone.
-    gtext, _ = gateway_text()
-    glines = gtext.splitlines()
-    spans = method_spans(gtext)
-    hdr = strip_comments((ROOT / "gateway" / "include" / "gateway" / "gateway.hpp")
-                         .read_text(encoding="utf-8"))
-    consts = set(const_re.findall(hdr)) | set(const_re.findall(gtext))
-    # The helpers under gateway/src hold constants too, and a kEp*/kUr* placed
-    # there is still read from a Gateway method, which is where the evidence is.
-    for helper in sorted((ROOT / "gateway" / "src").rglob("*.hpp")):
-        consts |= set(const_re.findall(strip_comments(helper.read_text(encoding="utf-8"))))
-    consts = {c for c in consts if re.fullmatch(r"k[A-Z]\w*", c)}
-    n_checked = 0
-    for name in sorted(consts):
-        used = set()
-        for i, line in enumerate(glines):
-            if "constexpr" in line or not re.search(r"\b%s\b" % name, line):
-                continue
-            for fname, (_, first, last) in spans.items():
-                if first <= i <= last:
-                    b = backend_reach(fname)
-                    if b:
-                        used.add(b)
-        n_checked += 1
-        want = "ep" if name.startswith("kEp") else "ur" if name.startswith("kUr") else None
-        if want and used - {want}:
-            failures.append(
-                f"gateway/src: BACKEND: constant `{name}` claims {want} but is used from "
-                f"{sorted(used - {want})}; rename it or stop crossing")
-        elif not want and len(used) == 1:
-            b = used.pop()
-            failures.append(
-                f"gateway/src: BACKEND: constant `{name}` is used only from {b}_ methods; "
-                f"name it k{b.capitalize()}{name[1:]} so the side is readable")
-    if n_checked < 15:
-        print(f"error: backend-prefix check inspected only {n_checked} constants; "
-              f"the extractor is broken, not the code.", file=sys.stderr)
-        return 2
-
     # ------------------------------------------------- release version agreement
     # project(version) feeds write_basic_package_version_file, so a stale value makes
     # find_package(llmbridge <ver> required) fail against a correct install. It went
@@ -435,15 +347,13 @@ def main():
               f"{'s' if len(failures) != 1 else ''}):\n", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
-        print("\nSee DESIGN.md \"Naming conventions\".", file=sys.stderr)
+        print("\nSee DESIGN.md \"Naming conventions\" and GATEWAY-INTERNALS.md 11.", file=sys.stderr)
         return 1
 
-    twins = sum(1 for n in spans if n.startswith("ep_") and "ur_" + n[3:] in spans)
-    print(f"convention check OK: {len(spans)} Gateway methods, {twins} ep_/ur_ twin pairs, "
-          f"0 crossings, 0 unmarked, namespaces mirror directories, "
-          f"LATENCY.md stamp refs resolve, release version agrees, "
+    print(f"convention check OK: {len(spans)} gateway methods, 0 boundary violations in "
+          f"{n_core} core and {n_io} io files ({len(PLANTS)} plants caught), namespaces "
+          f"mirror directories, LATENCY.md stamp refs resolve, release version agrees, "
           f"{n_consts} constants + {n_types} types correctly cased, "
-          f"{n_checked} constant backend prefixes agree with use, "
           f"comment density under {DENSITY_LIMIT} everywhere ({n_dense_warn} over {DENSITY_WARN})")
     return 0
 
