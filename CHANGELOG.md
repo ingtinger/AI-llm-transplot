@@ -8,6 +8,76 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.92.0]. 2026-10-12
+
+### Fixed
+
+- **A streamed request body reaches a TLS venue whole.** The session tickets a TLS 1.3
+  venue sends after its handshake arrive as records with no response byte in them,
+  and the first one ended the body as though the venue had answered: the rest was read
+  and dropped, the venue waited for a body short of its `Content-Length`, and the
+  client got no reply until a timeout. Only a response byte ends the body now. A
+  plaintext venue was not affected.
+- **A streamed body's upload is the client's time again, not ours.** t3 was stamped
+  again as each part of the body went, so the whole upload was reported as the
+  gateway's: in `x-llmbridge-upwrite-us`, in `request-path` and in `added-total`, while
+  `client_upload_ns` and `x-llmbridge-client-upload-us` read about 0. For a 10 MB
+  transcript at 100 Mbit/s `request-path` printed 839 ms, the upload, overflowing the
+  histogram; it now prints 25 to 27 ms on epoll and 15 ms on io_uring, the scan, copy
+  and send of the parts, where the same body held reads 15 to 27 ms (LATENCY.md 2b).
+  - t3 is the request's first complete send, of its head and the body that came with
+    it, once per attempt: a stale retry's fresh connection takes its own.
+  - `client_upload_ns` runs from the request's first byte to the body's last.
+  - The provider's wait, `x-llmbridge-upstream-us` and `x-llmbridge-upstream-ttfb-us`,
+    starts at the body's last byte handed to the kernel.
+  - Our work on each later part, the scan, the copy and the send, is summed into
+    `request-path` and `added-total`.
+- The request after a streamed body on the same connection reported an upload
+  reaching back into that body's; it times its own, after a body cut short by an early
+  response too.
+
+### Added
+
+- `RequestRecord` (`gateway/sink.hpp`) gains four fields at its end: `ts_body_end` (the
+  body's last byte in), `ts_body_sent` (its last byte in the kernel, where the
+  provider's wait begins), `body_work_ns` (our work on its parts after t3) and
+  `body_streamed`. A held body reads t0, t3, 0 and false, so one formula serves every
+  request. Existing fields keep their places.
+- **`x-llmbridge-body-work-us`**: with `--timing-headers`, on a request whose body
+  streamed, our work on its later parts. A held body's reply does not carry it.
+- `timing_split()` takes the body's last send and the work after t3, both defaulted
+  to 0, which is a held body.
+
+### Changed
+
+- **Behaviour change:** for a streamed body, `x-llmbridge-upwrite-us`, `request-path`
+  and `added-total` no longer hold the client's upload; `client_upload_ns` and
+  `x-llmbridge-client-upload-us` do; `x-llmbridge-upstream-us` and
+  `x-llmbridge-upstream-ttfb-us` start at its last byte sent, as they did. This
+  replaces 0.90.0's "t3 the last piece sent".
+- A held body (under 16 KiB, translated, sent while a policy is installed, or an
+  OpenAI client's with `--stream-openai-body off`) reports what it did: every stamp,
+  header, histogram sample and sink field is unchanged.
+
+### Tests
+
+- `ProxyBodyStream.*` on both backends, against a throttled body: the upload lands in
+  `client_upload_ns`, and `upwrite`, `request-path` and the histograms hold only our
+  work, the histogram's sample being the sink's number; a stream's timing headers
+  match the sink; a held body's new fields are t0, t3 and 0 and its headers and
+  histogram what they were; a last part whose write came up short (the epoll write
+  cap; io_uring always) ends the body without moving t3; a stale retry stamps the
+  fresh attempt; the upload runs from the head to the last byte and the next request,
+  after a whole or a cut-short body, starts its own; on and off read the same upload.
+  All fail on both backends against 0.91.0, and each of the retry reset, the first-byte
+  restarts, the once-only t3, the provider wait and the body work fails its tests when
+  removed.
+- `GatewayTls.AStreamedBodyReachesATlsVenueWhole` fails on both backends against
+  0.91.0; `GatewayTls.AStreamedBodysLaterPartsDoNotMoveT3` covers the TLS flush paths.
+- `TimingSplit.AStreamedBodysWaitStartsAtItsLastByteAndItsWorkIsOurs`,
+  `AHeldBodysSplitIsUnchanged`.
+
+
 ## [0.91.0]. 2026-10-11
 
 ### Changed
