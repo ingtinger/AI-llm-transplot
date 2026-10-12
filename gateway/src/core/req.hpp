@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <string>
 #include <string_view>
@@ -20,6 +21,7 @@
 #include "gateway/sink.hpp"
 #include "gateway/venue.hpp"
 #include "net/http.hpp"
+#include "provider/body_scan.hpp"
 #include "provider/openai.hpp"
 
 namespace llmbridge
@@ -75,6 +77,7 @@ namespace llmbridge
         uint8_t connections = 0;
         uint8_t expect = 0; ///< the first Expect: 0 none, 1 another, 2 100-continue
         bool content_length = false;
+        Span content_type; ///< the first Content-Type value, as sent
     };
 
     /// Everything a request owns that is trivially copyable. Never assigned field by
@@ -149,6 +152,13 @@ namespace llmbridge
         FixedStr<64> served_model;   ///< cut at 64: longer ids are Bedrock ARNs
         FixedStr<kSinkCaptureBytes> captured[kSinkCaptureMax];
         HeadFacts head;
+        /// A body forwarded as it arrives (GATEWAY-INTERNALS.md 12): bytes of it staged
+        /// upstream, more still due, the request still at the front of rbuf for a
+        /// resend, and each chunk checked by BodyScan first (an OpenAI client).
+        uint32_t body_sent = 0;
+        bool body_streaming = false;
+        bool body_in_rbuf = false;
+        bool body_scanned = false;
     };
     static_assert(std::is_trivially_copyable_v<ReqState>);
     static_assert(std::is_trivially_destructible_v<ReqState>);
@@ -162,6 +172,11 @@ namespace llmbridge
         net::http::ChunkDecoder chunkdec;        ///< the upstream's chunked stream body
         provider::openai::StreamUsage stream_usage; ///< usage a byte-forwarded stream states
         std::string sse_scratch;                 ///< one stream step's decoded bytes
+        /// Client bytes still owed to a request that is over, dropped as they arrive;
+        /// then close if the reply said so. Survive begin(): they precede the next frame.
+        uint64_t discard = 0;
+        bool close_on_drain = false;
+        std::unique_ptr<provider::BodyScan> scan; ///< made at the first streamed body
 
         /// The one per-request reset; the sequence number is the first thing set, so
         /// even a framing error's reply carries its own.

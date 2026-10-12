@@ -7,7 +7,9 @@
 
 // Tests for the hand-rolled JSON parser/builder (provider/json.hpp).
 
+#include "provider/body_scan.hpp"
 #include "provider/json.hpp"
+#include "provider/translate.hpp"
 
 #include <gtest/gtest.h>
 
@@ -670,7 +672,8 @@ TEST(JsonBounds, NodeCapIsExactAndRefusesTheTinyValueFlood)
 
 TEST(JsonBounds, ScratchCapacityPastTheBudgetIsReleased)
 {
-    using llmbridge::provider::json::detail::kScratchKeep;
+    const size_t kScratchKeep = llmbridge::provider::json::detail::retain_bytes().load();
+    ASSERT_EQ(kScratchKeep, size_t{4} << 20) << "the default";
     auto& sc = llmbridge::provider::json::detail::scratch();
     // Small documents keep their capacity: that is what the scratch is for.
     std::string small = "[0";
@@ -689,6 +692,15 @@ TEST(JsonBounds, ScratchCapacityPastTheBudgetIsReleased)
     EXPECT_LE(sc.values.capacity() * sizeof(Value), kScratchKeep);
     EXPECT_LE(sc.members.capacity() * sizeof(llmbridge::provider::json::Member), kScratchKeep);
     EXPECT_LE(sc.keys.capacity() * sizeof(std::string_view), kScratchKeep);
+
+    // A deployment of large bodies keeps them: the same document leaves its capacity.
+    llmbridge::provider::json::set_retain_bytes(size_t{64} << 20);
+    (void)parse(wide, ok);
+    ASSERT_TRUE(ok);
+    EXPECT_GE(sc.values.capacity(), 300000u);
+    llmbridge::provider::json::set_retain_bytes(kScratchKeep);
+    (void)parse(wide, ok);
+    EXPECT_LE(sc.values.capacity() * sizeof(Value), kScratchKeep);
 }
 
 // ── One escaper ──────────────────────────────────────────────────────────────
@@ -764,24 +776,128 @@ TEST(JsonBuilder, EscaperMatchesTheReferenceOnEveryByteAndRandomStrings)
 
 TEST(JsonArena, ADroppedDocumentParksItsArenaForTheNextParse)
 {
-    auto& spare = llmbridge::provider::json::detail::spare_arena();
-    spare.reset();
+    auto& spare = llmbridge::provider::json::detail::spare_arenas();
+    for (auto& a : spare.a) a.reset();
+    spare.n = 0;
     bool ok = false;
-    const llmbridge::provider::json::detail::Arena* first = nullptr;
+    const llmbridge::provider::json::detail::Arena *outer = nullptr, *inner = nullptr;
     {
         const Value v = parse(std::string_view(R"({"a":[1,2,3]})"), ok);
         ASSERT_TRUE(ok);
-        EXPECT_EQ(spare, nullptr);
+        EXPECT_EQ(spare.n, 0u);
         {
             const Value w = parse(std::string_view("[1]"), ok); // a second live document
             ASSERT_TRUE(ok);
         }
-        first = spare.get();
-        EXPECT_NE(first, nullptr) << "w's arena is parked";
+        ASSERT_EQ(spare.n, 1u) << "w's arena is parked";
+        inner = spare.a[0].get();
     }
-    EXPECT_EQ(spare.get(), first) << "one is kept; v's is freed, not leaked";
+    ASSERT_EQ(spare.n, 2u) << "both are kept: a parse inside a parse allocates none";
+    outer = spare.a[1].get();
+    // The outer document gets its own arena back, and its block list with it.
     const Value again = parse(std::string_view(R"({"b":true})"), ok);
     ASSERT_TRUE(ok);
-    EXPECT_EQ(spare, nullptr) << "the parked arena was taken";
+    EXPECT_EQ(spare.n, 1u);
+    EXPECT_EQ(spare.a[0].get(), inner);
+    EXPECT_NE(outer, nullptr);
     EXPECT_TRUE(again.find("b")->boolean);
+    for (int k = 0; k < 6; ++k) // more live documents than slots: the extra ones are freed
+    {
+        std::vector<Value> live;
+        for (int j = 0; j < 6; ++j) live.push_back(parse(std::string_view("[1]"), ok));
+    }
+    EXPECT_EQ(spare.n, 4u);
+}
+
+// ── BodyScan: a body checked as it arrives ──────────────────────────────────────
+
+namespace
+{
+    using llmbridge::provider::BodyScan;
+
+    // What the gateway refuses when it holds the whole body: not JSON, or top-level
+    // keys its readers could read another way than the provider.
+    bool held_verdict(const std::string& s)
+    {
+        bool ok = false;
+        (void)parse(s, ok, llmbridge::provider::json::Keys::Any);
+        return ok && llmbridge::provider::top_level_facts(s).keys == llmbridge::provider::KeyCheck::Ok;
+    }
+
+    // Fed in pieces of `step` bytes (0: whole); true when it is Done.
+    bool scanned(const std::string& s, size_t step, BodyScan& b)
+    {
+        b.reset();
+        size_t have = 0;
+        do
+        {
+            have = step ? std::min(s.size(), have + step) : s.size();
+            const BodyScan::Verdict v = b.feed(std::string_view(s).substr(0, have), have == s.size());
+            if (v != BodyScan::Verdict::More) return v == BodyScan::Verdict::Done;
+            EXPECT_LE(b.safe(), have);
+        } while (have < s.size());
+        return false;
+    }
+} // namespace
+
+TEST(BodyScan, AgreesWithTheHeldBodyInEveryPieceSize)
+{
+    std::string deep(64, '[');
+    deep += std::string(64, ']');
+    std::string many = "{";
+    for (int i = 0; i < 257; ++i) many += (i ? ",\"k" : "\"k") + std::to_string(i) + "\":1";
+    many += "}";
+    const std::vector<std::string> cases = {
+        R"({"model":"m","messages":[{"role":"user","content":"hi \u00e9\n\"x\\"}],"stream":true})",
+        R"( {"a":[1,-0.5,2e10,0E-1,true,false,null],"b":{"c":{}},"d":[]} )",
+        R"({"model":"a","model":"b"})", R"({"stream_options":{"x":1,"x":2}})",
+        R"({"x":{"model":1,"model":2}})", R"({"mo\u0064el":1})", R"([{"a":1,"a":1}])",
+        R"(1)", R"("s")", R"({"a":01})", R"({"a":1.})", R"({"a":-})", R"({"a":1e+})", R"({"a":nul})",
+        R"({"a":"\x"})", R"({"a":"\u12z4"})", "{\"a\":\"\x01\"}", R"({"a":1,})", R"([1,])",
+        R"({"a" 1})", R"({"a":1}})", R"({"a":1} x)", R"({"a":[1 2]})", "", " ", deep, "[" + deep + "]", many,
+    };
+    for (const std::string& s : cases)
+        for (const size_t step : {size_t{0}, size_t{1}, size_t{2}, size_t{3}, size_t{7}})
+        {
+            BodyScan b;
+            EXPECT_EQ(scanned(s, step, b), held_verdict(s)) << s << " in pieces of " << step;
+        }
+}
+
+// The bytes it lets go never hold a key whose check is still to come, so a repeated
+// key never leaves, however the body is cut.
+TEST(BodyScan, AnOpenTopLevelKeyIsHeldBack)
+{
+    const std::string s = R"({"model":"m","messages":[],"model":"x"})";
+    const size_t repeat = s.rfind(R"("model")");
+    for (size_t cut = 1; cut < s.size(); ++cut)
+    {
+        BodyScan b;
+        b.reset();
+        const BodyScan::Verdict v = b.feed(std::string_view(s).substr(0, cut), false);
+        if (v == BodyScan::Verdict::Refused) continue;
+        EXPECT_LE(b.safe(), repeat) << "cut at " << cut;
+        EXPECT_EQ(b.feed(s, true), BodyScan::Verdict::Refused);
+    }
+}
+
+TEST(BodyScan, RandomBodiesAgreeWithTheHeldVerdict)
+{
+    const std::string alphabet = "{}[]\":,0123456789-+.eEtrufalsn \\u/bx\n";
+    const std::vector<std::string> seeds = {R"({"model":"m","messages":[{"role":"user","content":"x"}]})",
+                                            R"({"a":[1,2.5e-3,true,null,"\u00e9"],"stream_options":{"b":1}})"};
+    uint32_t r = 12345;
+    const auto next = [&r] { r = r * 1103515245u + 12345u; return r >> 8; };
+    for (int i = 0; i < 20000; ++i)
+    {
+        std::string s = seeds[next() % seeds.size()];
+        for (int m = 0, n = 1 + next() % 3; m < n; ++m)
+        {
+            const size_t at = next() % (s.size() + 1);
+            if (next() % 2) s.insert(s.begin() + static_cast<long>(at), alphabet[next() % alphabet.size()]);
+            else if (at < s.size()) s.erase(at, 1);
+        }
+        BodyScan b;
+        EXPECT_EQ(scanned(s, 1 + next() % 9, b), held_verdict(s)) << s;
+    }
 }

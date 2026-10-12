@@ -4,6 +4,7 @@
 # translation is enabled.
 
 add_library(provider STATIC
+        src/body_scan.cpp
         src/openai.cpp
         src/registry.cpp
         src/translate_anthropic.cpp

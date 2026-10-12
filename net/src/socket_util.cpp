@@ -31,6 +31,12 @@ namespace llmbridge::net
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     }
 
+    void set_reset_on_close(int fd) noexcept
+    {
+        const linger lg{1, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    }
+
     void set_nosigpipe(int fd) noexcept
     {
 #ifdef SO_NOSIGPIPE

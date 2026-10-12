@@ -218,15 +218,26 @@ continuously fuzzed:
     two-second loop stall. Real bodies run 27 B per value at their densest (an
     agent-tool-heavy summary; chat history runs 150+), so a full 16 MiB (`kMaxBodyLen`)
     legitimate body is ~620 K values: 2^20 leaves 1.7x headroom and bounds the worst
-    parse near 64 MB of nodes.
+    parse near 64 MB of nodes. Measured again at v0.90.0 on 10 MB bodies
+    (`protocol_micro --large`): a chat transcript is 50 K values, a turn of base64
+    images 57. Only a body made of nothing but deep tool schemas comes near, at 13 B
+    a value (790 K at 10 MB), and no request carries 10 MB of schemas, so the cap stays.
   - **An allocation per parse.** A dropped document's arena, emptied of blocks, is
-    parked in one per-thread slot and taken by the next parse, so a parse no longer
+    parked in a per-thread slot and taken by the next parse, so a parse no longer
     allocates the arena and its block list. Allocations per translated request went
     16 to 12, per 20-delta stream 59 to 7, per further delta 2 to 0
-    (`gateway_alloc_test`).
+    (`gateway_alloc_test`). Since v0.90.0 there are four slots, taken last in first
+    out, so a translator that parses a nested document inside the body's (a tool
+    call's arguments) gets its arena back too.
   - **Keeping hostile scratch.** The per-thread scratch stacks are emptied after each
-    parse and freed outright when one exceeds 4 MiB (`kScratchKeep`, the same budget as
-    `BlockPool`), so one wide document no longer pins its peak for the thread's life.
+    parse and freed outright when one exceeds the retain budget, the same budget as
+    `BlockPool`, so one wide document no longer pins its peak for the thread's life.
+    The budget is 4 MiB by default and `--retain-mb` (`json::set_retain_bytes`) up to
+    the 16 MiB body cap: a deployment of large bodies keeps a worker's buffers warm,
+    and a 10 MB translated transcript then allocates nothing after warm-up (10 MB of
+    nothing but tool schemas, whose document is three times the body, still does).
+    The cost is up to that much resident memory per worker, arena and scratch each,
+    held whether or not the next body is large: 12 MB measured after 10 MB of schemas.
 - **HTTP framer** (`net/http.hpp`): header size is capped (`kMaxHeaderLen`), body size
   is capped (`kMaxBodyLen`, blocking a `Content-Length: 9999999999` memory-exhaustion
   trickle), and framing is smuggling-safe. **Content-Length only**; a `Transfer-Encoding`

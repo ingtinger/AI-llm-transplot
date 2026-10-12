@@ -153,6 +153,17 @@ namespace llmbridge::detail
         // request was translated for this dialect and carries its credential.
         UpstreamConn* uf = new_upstream(u->venue);
         if (!uf) return false;
+        // A streamed body was staged in pieces, so it is rebuilt from the client's buffer.
+        if (client->req.f.body_in_rbuf &&
+            build_forward(std::string_view(client->rbuf.data(), client->msg.header_len),
+                          client->msg.header_len, client->req.f.head, _strip_headers,
+                          upstream_of(u).host_hdr, upstream_of(u).base_path,
+                          body_so_far(client).substr(0, client->req.f.body_sent), uf->out.stage(),
+                          client->msg.body_len))
+        {
+            delete uf;
+            return false;
+        }
         uf->retried = true; // this request's one allowed retry is now spent
 #ifdef LLMBRIDGE_HAVE_TLS
         if (upstream_of(uf).tls && !tls_attach_upstream(uf))
@@ -168,7 +179,7 @@ namespace llmbridge::detail
         }
         client->req.f.upstream_ip = uf->up_addr.sin_addr.s_addr;
         // Plaintext, re-pushed through the new session; a send still reading it gets a copy.
-        uf->out.stage() = u->out.take();
+        if (!client->req.f.body_in_rbuf) uf->out.stage() = u->out.take();
         _upconns->add(uf);
         ++_stats.upstream_conns_opened;
         ++_stats.upstream_retries;
@@ -229,6 +240,7 @@ namespace llmbridge::detail
         // over; kept, they would be the next client's response.
         if (!client) return _ops->close(*u);
         client->req.f.ts_progress = now_ns();
+        if (client->req.f.body_in_rbuf) end_body_stream(client, u);
         if (client->req.f.streaming) return stream_pump(u);
 
         const int64_t t4 = now_ns(); // before the parse, so it counts in the response path

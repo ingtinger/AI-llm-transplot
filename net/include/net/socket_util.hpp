@@ -17,6 +17,7 @@ namespace llmbridge::net
 {
     bool set_nonblocking(int fd) noexcept; // false on fcntl failure
     void set_nodelay(int fd) noexcept;     // TCP_NODELAY: a proxy never wants Nagle's delay
+    void set_reset_on_close(int fd) noexcept; // SO_LINGER 0: close() sends RST, drops unsent bytes
     void set_nosigpipe(int fd) noexcept;   // SO_NOSIGPIPE; no-op on Linux, which ignores SIGPIPE
     int make_listener(uint16_t port, int backlog = 1024) noexcept; // 0.0.0.0:port, -1 on error
 

@@ -204,6 +204,14 @@ namespace llmbridge::detail
 
     } // namespace
 
+    // The media type alone: parameters and case do not change what it is.
+    bool json_media_type(std::string_view content_type) noexcept
+    {
+        const std::string_view t = net::http::detail::trim_ows(content_type.substr(0, content_type.find(';')));
+        return net::http::detail::same_ci(t, "application/json") ||
+               (t.size() > 5 && net::http::detail::same_ci(t.substr(t.size() - 5), "+json"));
+    }
+
     bool HeadReader::operator()(const net::http::HeaderLine& h) noexcept
     {
         using net::http::Field;
@@ -226,6 +234,9 @@ namespace llmbridge::detail
             case Field::XGoogApiKey: cred(f.x_goog_api_key); break;
             case Field::AnthropicVersion: cred(f.anthropic_version); break;
             case Field::ContentLength: f.content_length = true; break;
+            case Field::ContentType:
+                if (f.content_type.empty()) f.content_type = span(h.value);
+                break;
             case Field::Expect:
                 // RFC 9110 10.1.1: answer a 100 or a final status before reading the body.
                 if (f.expect == 0)
@@ -398,8 +409,8 @@ namespace llmbridge::detail
     /// as 1.1 so the upstream connection can be pooled.
     const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
                               const std::vector<std::string>& strip, std::string_view host_hdr,
-                              std::string_view base_path, std::string_view body_override,
-                              std::string& into)
+                              std::string_view base_path, std::string_view body,
+                              std::string& into, size_t declared)
     {
         using net::http::Field;
         into.clear();
@@ -416,15 +427,15 @@ namespace llmbridge::detail
         const std::string_view target = rl.substr(sp1 + 1, sp2 - sp1 - 1);
         if (!target_path_ok(target)) return "request target not origin-form";
         const std::string_view version = rl.substr(sp2 + 1);
-        const std::string_view body = body_override.empty() ? msg.substr(header_len) : body_override;
 
         const size_t need = header_len + host_hdr.size() + base_path.size() + body.size() + 64;
         if (into.capacity() < need) into.reserve(need + need / 8);
         into.append(rl.substr(0, sp1 + 1)).append(base_path).append(target).append(" ");
         into.append(version == "HTTP/1.0" ? std::string_view("HTTP/1.1") : version).append("\r\n");
         if (!host_hdr.empty()) into.append("Host: ").append(host_hdr).append("\r\n");
-        // A bodyless request that carried no length keeps carrying none.
-        if (f.content_length || !body.empty()) net::http::append_content_length(into, body.size());
+        // A bodyless request that carried no length keeps carrying none. A body still
+        // arriving declares all of it.
+        if (f.content_length || declared) net::http::append_content_length(into, declared);
         const auto listed = [&](std::string_view name) {
             for (uint8_t i = 0; i < f.connections; ++i)
                 if (net::http::has_token(f.connection[i].in(msg), name)) return true;
@@ -457,7 +468,8 @@ namespace llmbridge::detail
         HeadFacts f;
         const std::string_view head = msg.substr(0, header_len < 4 ? 0 : header_len - 4);
         if (!net::http::walk_headers(head, HeadReader{msg, strip, f})) { into.clear(); return false; }
-        return build_forward(msg, header_len, f, strip, host_hdr, base_path, body_override, into) == nullptr;
+        const std::string_view body = body_override.empty() ? msg.substr(header_len) : body_override;
+        return build_forward(msg, header_len, f, strip, host_hdr, base_path, body, into, body.size()) == nullptr;
     }
 
     /// Everything between a client request and the bytes for a translated venue, written

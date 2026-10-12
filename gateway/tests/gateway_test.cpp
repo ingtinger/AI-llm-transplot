@@ -310,6 +310,19 @@ namespace
         // Hold the first reply until `*go` (at most 10 s), so a client can pipeline behind it.
         void hold_first_reply(const std::atomic<bool>* go) { _first_go = go; }
         int requests_seen() const { return _requests_seen.load(); }
+        /// Request bytes read over all connections, so far.
+        size_t bytes_seen() const { return _bytes_seen.load(); }
+        int accepted() const { return _accepted.load(); }
+        /// On the first connection, after its first reply, read what arrives of the next
+        /// request once, then close: a pooled connection the provider dropped mid-body.
+        void set_drop_first_mid_second(bool b) { _drop_mid_second = b; }
+        /// Each request a connection ended before completing, as far as it got.
+        std::vector<std::string> incomplete_requests()
+        {
+            check_joined("incomplete_requests");
+            std::lock_guard<std::mutex> lk(_mu);
+            return _incomplete;
+        }
         void clear_last_request()
         {
             std::lock_guard<std::mutex> lk(_mu);
@@ -411,15 +424,30 @@ namespace
                 ::close(c);
                 return;
             }
-            int served_here = 0;
+            int served_here = 0, done_here = 0;
             while (!_stop)
             {
                 llmbridge::net::http::Message m;
                 while (llmbridge::net::http::parse_request(buf, m) != llmbridge::net::http::FrameStatus::Complete)
                 {
                     ssize_t n = ::read(c, tmp, sizeof(tmp));
-                    if (n <= 0) { ::close(c); return; }
+                    if (n <= 0)
+                    {
+                        if (!buf.empty())
+                        {
+                            std::lock_guard<std::mutex> lk(_mu);
+                            _incomplete.push_back(buf);
+                        }
+                        ::close(c);
+                        return;
+                    }
+                    _bytes_seen.fetch_add(static_cast<size_t>(n));
                     buf.append(tmp, static_cast<size_t>(n));
+                    if (_drop_mid_second && conn_index == 0 && done_here == 1)
+                    {
+                        ::close(c);
+                        return;
+                    }
                 }
                 {
                     std::lock_guard<std::mutex> lk(_mu);
@@ -427,6 +455,7 @@ namespace
                     _all_requests.append(buf.data(), m.total_len);
                 }
                 const int nth = _requests_seen.fetch_add(1, std::memory_order_relaxed);
+                ++done_here;
                 buf.erase(0, m.total_len);
                 if (_drop_second_ms > 0 && served_here++ == 1)
                 {
@@ -537,6 +566,9 @@ namespace
         int _reset_after_reply_ms = 0;
         int _rcvbuf = 0;
         std::atomic<int> _requests_seen{0};
+        std::atomic<size_t> _bytes_seen{0};
+        bool _drop_mid_second = false;
+        std::vector<std::string> _incomplete;
         std::string _last_request;
         std::string _all_requests;
         std::atomic<bool> _stop{false};
@@ -808,6 +840,7 @@ namespace
             if (_heartbeat_ns >= 0) _gw->set_heartbeat_ns(_heartbeat_ns);
             if (_connect_ns >= 0) _gw->set_connect_ns(_connect_ns);
             if (_client_sndbuf >= 0) _gw->set_client_sndbuf_for_test(_client_sndbuf);
+            if (!_stream_openai_body) _gw->set_stream_openai_body(false);
             _proxy_port = _gw->bound_port();
             // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
@@ -843,6 +876,7 @@ namespace
         int64_t _heartbeat_ns = -1;
         int64_t _connect_ns = -1; // set before start(), like the heartbeat
         int _client_sndbuf = -1;  // set before start(); pins SO_SNDBUF on accepted clients
+        bool _stream_openai_body = true; // set before start()
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
@@ -11030,4 +11064,199 @@ TEST_P(ProxyVenueTable, ACohereErrorFinishIsABadGateway)
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyVenueTable,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));
+
+// ── A body forwarded as it arrives ─────────────────────────────────────────────
+
+namespace
+{
+    // The two halves of an OpenAI request: its head and the body's first part, then the
+    // rest. `rest` closes the object.
+    struct Halves
+    {
+        std::string first, rest;
+        size_t total() const { return first.size() + rest.size(); }
+        size_t sent_body() const { return first.size() - (first.find("\r\n\r\n") + 4); }
+        size_t body() const { return sent_body() + rest.size(); }
+    };
+    Halves openai_halves(const std::string& rest, size_t pad = 64 * 1024)
+    {
+        const std::string part = R"({"model":"gpt-4o","messages":[{"role":"user","content":")" +
+                                 std::string(pad, 'p') + R"("}])";
+        const size_t body = part.size() + rest.size();
+        return {"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                "Content-Length: " + std::to_string(body) + "\r\n\r\n" + part,
+                rest};
+    }
+    template <class Pred> bool wait_for(Pred p, int ms = 3000)
+    {
+        for (int i = 0; i < ms / 5; ++i)
+        {
+            if (p()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return p();
+    }
+} // namespace
+
+class ProxyBodyStream : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+// A large body was held until its last byte, so the provider saw nothing for one whole
+// upload time. A byte-forwarded body now goes up as it arrives: the venue has the head
+// and the first part while the client is still sending, and the request is whole.
+TEST_P(ProxyBodyStream, TheVenueGetsTheBodyBeforeItsLastByte)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }))
+        << "nothing reached the venue before the body was complete";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    const std::string up = _backend.last_request();
+    const std::string body = h.first.substr(h.first.find("\r\n\r\n") + 4) + h.rest;
+    EXPECT_EQ(up.substr(up.find("\r\n\r\n") + 4), body);
+    EXPECT_NE(up.find("\r\nContent-Length: " + std::to_string(body.size()) + "\r\n"), std::string::npos) << up;
+    EXPECT_NE(up.find("\r\nHost: 127.0.0.1:"), std::string::npos);
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// Off, an OpenAI client's body is held to its last byte, exactly as before.
+TEST_P(ProxyBodyStream, OffHoldsTheBodyToItsLastByte)
+{
+    _backend.set_response(http_ok("{}"));
+    _stream_openai_body = false;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(_backend.bytes_seen(), 0u) << "a byte left before the body was complete";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_bodies, 0u);
+}
+
+// The 400 for a repeated top-level key is decided as the bytes pass, before they go:
+// the venue never gets the repeat, gets a body short of its length, and is reset.
+TEST_P(ProxyBodyStream, ARepeatedKeyAfterStreamingBeganIsNeverForwarded)
+{
+    for (const bool last : {false, true})
+    {
+        TestBackend backend;
+        backend.set_response(http_ok("{}"));
+        backend.start();
+        Gateway gw(0, "127.0.0.1", backend.port(), 0, UpstreamDialect::OpenAI, GetParam());
+        std::thread loop([&] { gw.run(); });
+        // The repeat in the middle of the last send, or as its very last bytes.
+        const Halves h = openai_halves(last ? R"(,"model":"x"})"
+                                            : R"(,"model":"x","pad":")" + std::string(32 * 1024, 'q') + "\"}");
+        Client c;
+        ASSERT_TRUE(c.connect(gw.bound_port()));
+        ASSERT_TRUE(c.send(h.first));
+        ASSERT_TRUE(wait_for([&] { return backend.bytes_seen() > 16 * 1024; }));
+        ASSERT_TRUE(c.send(h.rest));
+        const std::string r = c.recv_response();
+        EXPECT_EQ(Client::status_of(r), 400) << r;
+        EXPECT_NE(r.find("repeats a top-level key"), std::string::npos) << r;
+        gw.request_stop();
+        loop.join();
+        backend.stop();
+        EXPECT_EQ(backend.requests_seen(), 0) << "the venue got a complete request";
+        const auto cut = backend.incomplete_requests();
+        ASSERT_EQ(cut.size(), 1u) << "last=" << last;
+        EXPECT_LT(cut[0].size() - (cut[0].find("\r\n\r\n") + 4), h.body()) << "last=" << last;
+        EXPECT_EQ(cut[0].find(R"("model":"x")"), std::string::npos) << "the repeat went upstream";
+        EXPECT_EQ(gw.stats().upstream_conns_opened, 1u);
+        EXPECT_EQ(gw.stats().streamed_body_refusals, 1u);
+    }
+}
+
+// Any byte that is not JSON stops it the same way, the last one included.
+TEST_P(ProxyBodyStream, AnInvalidByteAfterStreamingBeganIsNeverForwarded)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5])");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 400) << r;
+    EXPECT_NE(r.find("not valid JSON"), std::string::npos) << r;
+    ASSERT_TRUE(wait_for([&] { return _backend.incomplete_requests().size() == 1; }));
+    EXPECT_EQ(_backend.requests_seen(), 0);
+    const std::string cut = _backend.incomplete_requests()[0];
+    EXPECT_EQ(cut.size() - (cut.find("\r\n\r\n") + 4), h.sent_body()) << "the bad chunk went upstream";
+}
+
+// A pooled connection the provider dropped while the body was still arriving: the
+// retry on a fresh connection carries the head and every byte forwarded so far, and the
+// rest follows it there.
+TEST_P(ProxyBodyStream, AStaleRetryResendsTheWholeBody)
+{
+    _backend.set_response(http_ok("{}"));
+    _backend.set_drop_first_mid_second(true);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(c.recv_status(), 200);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.accepted() == 2; })) << "no retry on a fresh connection";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.substr(up.find("\r\n\r\n") + 4), h.first.substr(h.first.find("\r\n\r\n") + 4) + h.rest);
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_retries, 1u);
+}
+
+// The provider answered before the body was in: the rest of it is read and dropped, and
+// the client's connection carries its next request.
+TEST_P(ProxyBodyStream, AnEarlyResponseLeavesTheClientConnectionInStep)
+{
+    _backend.set_reply_before_read(true);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_EQ(c.recv_status(), 200);
+    ASSERT_TRUE(c.send(h.rest + make_request()));
+    EXPECT_EQ(c.recv_status(), 200) << "the next request on the connection";
+    shutdown();
+    EXPECT_GE(_gw->stats().upstream_unsent, 1u);
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 2u) << "the cut upstream was not pooled";
+}
+
+// A file upload is not JSON: an OpenAI client's multipart body is forwarded unscanned.
+TEST_P(ProxyBodyStream, ABodyThatIsNotDeclaredJsonIsForwardedUnscanned)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const std::string body = "--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\n" +
+                             std::string(40 * 1024, '\x01') + "\r\n--b--\r\n";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send("POST /v1/files HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary=b\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body.substr(0, 20000)));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 0; }));
+    ASSERT_TRUE(c.send(body.substr(20000)));
+    ASSERT_EQ(c.recv_status(), 200);
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.substr(up.size() - body.size()), body);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyBodyStream,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));

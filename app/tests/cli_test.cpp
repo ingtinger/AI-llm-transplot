@@ -50,6 +50,8 @@ Flags override the file wherever they appear. In parentheses: the file key.
   --duration SECONDS          stop after this long and print the profile, 0 = until signalled (runtime.duration_s)
   --warmup SECONDS            leave the first seconds out of the histograms (runtime.warmup_s)
   --prefault-mb MB            prefault every request buffer to this size (runtime.prefault_mb)
+  --retain-mb MB              JSON parse storage a worker keeps between bodies, up to the 16 MB body cap (runtime.retain_mb)
+  --stream-openai-body MODE   forward an OpenAI client's body as it arrives, each chunk checked first: on|off (runtime.stream_openai_body)
 File only:
   upstream.strip_headers      header names dropped from every upstream request
   -h, --help                  print this and exit

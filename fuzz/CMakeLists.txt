@@ -57,6 +57,14 @@ target_link_options(fuzz_config PRIVATE -fsanitize=fuzzer,address,undefined)
 target_include_directories(fuzz_config PRIVATE ${PROJECT_SOURCE_DIR}/app)
 target_link_libraries(fuzz_config PRIVATE gateway provider)
 
+# A body forwarded as it arrives against the same body held: gateway/src for the
+# request builder, compiled into `gateway`.
+add_executable(fuzz_body_stream fuzz_body_stream.cpp)
+target_compile_options(fuzz_body_stream PRIVATE -g -O1 -UNDEBUG -fsanitize=fuzzer,address,undefined)
+target_link_options(fuzz_body_stream PRIVATE -fsanitize=fuzzer,address,undefined)
+target_include_directories(fuzz_body_stream PRIVATE ${PROJECT_SOURCE_DIR}/gateway/src)
+target_link_libraries(fuzz_body_stream PRIVATE gateway provider)
+
 # The inbound TLS handshake: the first surface an unauthenticated remote peer
 # reaches. Only in a TLS build, because there is no server Session without one.
 if (LLMBRIDGE_TLS)

@@ -168,6 +168,48 @@ reports its own request-path + response-path stamps) while LiteLLM is
 self-report. The streaming benchmark below does not have this asymmetry.
 
 
+### Large request bodies (v0.90.0)
+
+An agent's context reaches megabytes: a long transcript, many tool schemas, base64
+images. `bigbody` (`bench/bigbody.cpp`) sends one body through a running gateway at
+a set rate (one client, 100 Mbit/s here), and its in-process venue stamps its first
+byte, its last byte and the reply on one clock (`bench/run_large_body.sh`, or `LARGE=1
+bench/run_bench.sh`). One worker, 9 runs after a warm-up, p50 in ms from the
+client's first byte:
+
+| body | path | venue first byte | venue last byte | reply |
+|---|---|---|---|---|
+| 1 MB transcript | byte-forward, held (0.89.0, and `--stream-openai-body off`) | 80.0 | 80.3 | 80.7 |
+| | byte-forward, streamed | **0.32** | 79.4 | **79.6** |
+| 4 MB transcript | held | 338.1 | 340.5 | 342.0 |
+| | streamed | **0.18** | 336.1 | **336.3** |
+| 10 MB transcript | held | 843.4 | 851.9 | 854.8 |
+| | streamed | **0.15** | 839.5 | **839.6** |
+| 10 MB tool schemas | held | 838.0 | 844.9 | 847.6 |
+| | streamed | **0.49** | 834.7 | **834.9** |
+| 10 MB images | held | 838.2 | 846.1 | 848.7 |
+| | streamed | **0.19** | 834.2 | **834.5** |
+| 10 MB transcript | translated to Anthropic | 869.8 | 877.4 | 880.1 |
+| 10 MB tool schemas | translated | 929.0 | 936.6 | 939.1 |
+| | translated, `--retain-mb 16` | 915.1 | 922.1 | 924.7 |
+
+- **Streamed, the venue's first byte is the head's**, not the body's last: 0.15 to
+  0.5 ms instead of the whole upload. The reply comes 1 ms sooner at 1 MB and 15 ms
+  sooner at 10 MB, the time the held body took to send on; the upload itself is the
+  client's and no gateway can shorten it. The scan before each piece costs 1.2 ms of
+  loop time per MB of prose and 3.2 per MB of schemas, spread over the upload.
+- **Resident memory** of the worker after the 10 MB runs: 50.7 MB held, 30.9 MB
+  streamed, because no 10 MB copy of the body waits in an upstream buffer.
+- **A translated body still waits for its last byte**, then pays the translation:
+  30 ms for the 10 MB transcript and 90 ms for 10 MB of schemas (75 ms with
+  `--retain-mb 16`, which costs that worker 12 MB more resident memory; the
+  transcript's document fits the default 4 MiB and gains nothing).
+- `protocol_micro --large` times the pieces alone: at 10 MB, translation p50 18 ms
+  (transcript) and 67 ms (schemas), the top-level key check 4.4 and 9.4 ms, the
+  streamed scan 12 and 32 ms. A 10 MB transcript allocates nothing at `--retain-mb 16`;
+  10 MB of schemas, whose document is about three times the body, still allocates 43
+  times.
+
 ## B. Streaming (SSE): time to first token and delivered tokens
 
 > Every latency figure in this document is defined in [LATENCY.md](LATENCY.md):

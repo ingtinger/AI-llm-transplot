@@ -26,6 +26,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# LARGE=1: large bodies at a throttled rate instead (bench/run_large_body.sh).
+if [ "${LARGE:-0}" = 1 ]; then exec bench/run_large_body.sh "$@"; fi
+
 LAT_MS="${1:-200}"
 DUR="${2:-20}"
 WARMUP="${3:-5}"

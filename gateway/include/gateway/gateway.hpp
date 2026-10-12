@@ -108,6 +108,10 @@ namespace llmbridge
         /// Bytes to reserve and touch in the scratch buffers at run(), so the first
         /// requests do not fault pages in. 0 prefaults nothing.
         void set_prefault_bytes(size_t n) noexcept;
+        /// Forward an OpenAI client's body as it arrives, each chunk checked first (default on).
+        void set_stream_openai_body(bool on) noexcept;
+        /// Parse storage each worker keeps between bodies (default 4 MiB). Process-wide.
+        void set_retain_bytes(size_t n) noexcept;
         /// Optional per-request sink (sink.hpp), non-owning. `capture` names up to
         /// kSinkCaptureMax request headers copied into RequestRecord::captured.
         void set_request_sink(RequestSink* sink, std::vector<std::string> capture);
@@ -118,6 +122,7 @@ namespace llmbridge
         /// Loop-thread state, like stats(): valid once that thread has been joined.
         [[nodiscard]] size_t pooled_upstream_count() const noexcept;
         void set_pool_cap_for_test(size_t n) noexcept; // before run()
+        void set_stream_body_min_for_test(size_t n) noexcept; // smallest streamed body, 16 KiB
         /// The SNI/verify host recorded for upstream `i`, or empty.
         [[nodiscard]] std::string_view upstream_sni_host(size_t i) const noexcept;
         /// The io_uring provided-buffer count (a power of two), 0 for the default.
