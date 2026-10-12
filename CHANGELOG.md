@@ -22,16 +22,25 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   again as each part of the body went, so the whole upload was reported as the
   gateway's: in `x-llmbridge-upwrite-us`, in `request-path` and in `added-total`, while
   `client_upload_ns` and `x-llmbridge-client-upload-us` read about 0. For a 10 MB
-  transcript at 100 Mbit/s `request-path` printed 839 ms, the upload, overflowing the
-  histogram; it now prints 25 to 27 ms on epoll and 15 ms on io_uring, the scan, copy
-  and send of the parts, where the same body held reads 15 to 27 ms (LATENCY.md 2b).
-  - t3 is the request's first complete send, of its head and the body that came with
-    it, once per attempt: a stale retry's fresh connection takes its own.
-  - `client_upload_ns` runs from the request's first byte to the body's last.
+  transcript at 100 Mbit/s `request-path` printed 839 ms, the upload; it now prints 25
+  to 27 ms on epoll and 15 ms on io_uring, the scan, copy and send of the parts, where
+  the same body held reads 15 to 27 ms (LATENCY.md 2b). That is still past the
+  histogram's 2.62 ms range, so a multi-MB body's sample, held or streamed, prints
+  `[overflow!]`, but it is our work now and not the upload.
+  - t3 is the attempt's first send, the head and the body there at dispatch, in the
+    kernel, counted in wire bytes: parts queued behind it while it is backed up, or
+    that came during a cold venue's TLS handshake, do not move it. A stale retry's
+    fresh connection takes its own.
+  - `client_upload_ns` runs from the request's first byte to the body's last, and on
+    a connection's first request `client_conn_setup_ns` runs there too, so it still
+    holds the upload and subtracting one from the other still works.
   - The provider's wait, `x-llmbridge-upstream-us` and `x-llmbridge-upstream-ttfb-us`,
-    starts at the body's last byte handed to the kernel.
-  - Our work on each later part, the scan, the copy and the send, is summed into
-    `request-path` and `added-total`.
+    starts at the body's last byte handed to the kernel, and `first-token` at the
+    body's last byte in: it held the upload too, about 300 ms of a 300 ms upload
+    against 4 ms for the same request held.
+  - Our work on each part pumped after t3, the scan, the copy and the send, is summed
+    into `request-path` and `added-total`; a part pumped before t3 is inside
+    `connect-us` or `upwrite-us` already.
 - The request after a streamed body on the same connection reported an upload
   reaching back into that body's; it times its own, after a body cut short by an early
   response too.
@@ -47,17 +56,23 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   streamed, our work on its later parts. A held body's reply does not carry it.
 - `timing_split()` takes the body's last send and the work after t3, both defaulted
   to 0, which is a held body.
+- `Gateway::set_upstream_sndbuf_for_test()`: SO_SNDBUF on upstream connections, as
+  `set_client_sndbuf_for_test()` sets it on clients.
 
 ### Changed
 
-- **Behaviour change:** for a streamed body, `x-llmbridge-upwrite-us`, `request-path`
-  and `added-total` no longer hold the client's upload; `client_upload_ns` and
-  `x-llmbridge-client-upload-us` do; `x-llmbridge-upstream-us` and
-  `x-llmbridge-upstream-ttfb-us` start at its last byte sent, as they did. This
-  replaces 0.90.0's "t3 the last piece sent".
-- A held body (under 16 KiB, translated, sent while a policy is installed, or an
-  OpenAI client's with `--stream-openai-body off`) reports what it did: every stamp,
-  header, histogram sample and sink field is unchanged.
+- **Behaviour change:** for a streamed body, `x-llmbridge-upwrite-us`, `request-path`,
+  `added-total` and `first-token` no longer hold the client's upload;
+  `client_upload_ns` and `x-llmbridge-client-upload-us` do, and so does
+  `client_conn_setup_ns` on a connection's first request, which now runs to the
+  body's last byte; `x-llmbridge-upstream-us` and `x-llmbridge-upstream-ttfb-us`
+  start at its last byte sent, as they did. This replaces 0.90.0's "t3 the last piece
+  sent".
+- A held body reports what it did: every stamp, header, histogram sample and sink
+  field is unchanged. A body is held when it is under 16 KiB, compressed, translated,
+  sent while a policy is installed, an OpenAI client's with
+  `--stream-openai-body off`, or already whole when its head was framed, whatever its
+  size; `body_streamed` says which, and a reader should go by it and not by size.
 
 ### Tests
 
@@ -72,8 +87,16 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   All fail on both backends against 0.91.0, and each of the retry reset, the first-byte
   restarts, the once-only t3, the provider wait and the body work fails its tests when
   removed.
+- `ProxyBodyStream.PartsQueuedBehindTheFirstSendDoNotMoveT3` holds the venue's reads
+  until every part is queued behind a first send that cannot drain;
+  `GatewayTls.PartsStagedDuringTheHandshakeDoNotMoveT3` stages them during a held
+  handshake; `ProxyBodyStream.OnAndOffReadTheSameFirstToken`; a fresh connection's
+  setup holds its streamed upload. Each fails on both backends without its fix, the
+  TLS one also with the first send measured after the whole push, and the first with
+  the body work counted before t3.
 - `GatewayTls.AStreamedBodyReachesATlsVenueWhole` fails on both backends against
   0.91.0; `GatewayTls.AStreamedBodysLaterPartsDoNotMoveT3` covers the TLS flush paths.
+  The suite's sink is a fixture member, joined before it goes.
 - `TimingSplit.AStreamedBodysWaitStartsAtItsLastByteAndItsWorkIsOurs`,
   `AHeldBodysSplitIsUnchanged`.
 
