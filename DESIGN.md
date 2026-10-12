@@ -270,6 +270,28 @@ continuously fuzzed:
     blank line, so a credential written into the body is never found. It splits on
     CRLF only, so a bare CR survives inside a value: anything re-emitted must pass
     `header_value_safe` first.
+  - **One walk of a request head.** `parse_request` takes a visitor, and the gateway's
+    (`HeadReader`) reads the credentials (`Authorization`, `x-api-key`, `api-key`,
+    `x-goog-api-key`, `anthropic-version`; the first of each, a stripped one unseen),
+    `Expect` and every `Connection` value in the framing walk, as offsets into the
+    head. The translated request is written from them straight into the scratch; the
+    Bearer scheme matches in any case.
+  - **What a byte-forward drops.** The hop-by-hop headers (`Connection`, `Keep-Alive`,
+    `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`) and any header a `Connection` line
+    names belong to the client's hop; forwarded, `Connection: close` kept the venue's
+    connection out of the pool and `Upgrade` invited a 101 the gateway cannot relay.
+    `Host`, `Content-Length`, `Expect` and `Accept-Encoding` are dropped too, and an
+    HTTP/1.0 request line goes as HTTP/1.1. Whether the venue's connection is pooled
+    is the venue's response alone. A head with more than four `Connection` lines is
+    refused rather than forwarded with a listed header kept.
+  - **What a relayed response keeps** (`net/http_write.hpp`). A reply the gateway
+    re-frames (a translated provider error, a chunked byte-forward, a stream's head)
+    keeps the upstream's `Retry-After`, `retry-after-ms`, rate-limit headers
+    (`x-ratelimit-*`, `anthropic-ratelimit-*`, `ratelimit*`) and request ids
+    (`x-request-id`, `request-id`, `x-amzn-requestid`), verbatim; a byte-forwarded
+    body also keeps its `Content-Type` and `Content-Encoding`. Nothing else crosses.
+    One status table names every code; a code it does not list keeps its number and
+    takes its class's phrase, so a policy's 422 is a 422, never a 502.
 - **Response framing** (`parse_response`). The request path frames by Content-Length
   only, because there the bytes are the client's and a TE/CL disagreement with the
   upstream is the classic desync. On the response path we are the client of a
@@ -278,8 +300,8 @@ continuously fuzzed:
   show it). So the response framer accepts both, and refuses:
   - both framings at once (RFC 9112 §6.3), whichever is right;
   - a 1xx: framing `100 Continue` as the reply orphans the real response on a pooled
-    connection, where it becomes the next client's bytes (`request_without` also
-    drops `Expect`);
+    connection, where it becomes the next client's bytes (a byte-forward also
+    drops the client's `Expect`);
   - neither framing header on a response that has a body: read-until-close cannot be
     pooled. A streamed response is diverted on its head before this, so
     close-delimited SSE is unaffected.
@@ -403,9 +425,12 @@ mistranslated into an OpenAI response it cannot parse.
 The model separates the two axes:
 
 - **client dialect**: the wire format the caller speaks, read per request from the
-  target (`/v1/messages` is Anthropic, `/v1/chat/completions` is OpenAI, and so on).
-  The caller reveals it by which endpoint it calls; an unknown target defaults to
-  OpenAI so nothing that worked before changes.
+  method and the full target by exact route (`client_wire`), the query stripped: a
+  POST to a path ending in `/v1/messages` or `/v1/messages/count_tokens`, or any method
+  under `/v1/messages/batches`, is Anthropic; a POST ending in `:generateContent` or
+  `:streamGenerateContent` is Gemini; a POST ending in `/v2/chat` is Cohere. Anything
+  else is OpenAI, so `/v1/threads/{id}/messages` is, and an unknown target behaves as
+  it did before dialects existed.
 - **venue dialect**: the body format the venue speaks, a static property.
 
 The translation to run is a function of the pair (`resolve_translation`, in
