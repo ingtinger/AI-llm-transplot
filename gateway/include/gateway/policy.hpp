@@ -29,6 +29,11 @@ namespace llmbridge
         /// Top-level `"stream": true` and `stream_options.include_usage`; anything else is false.
         bool stream = false;
         bool include_usage = false;
+        /// False when decide() runs on the head of a body still arriving (decides_on_head):
+        /// `model` is a top-level `model` that has closed in the bytes so far, else empty;
+        /// `stream` and `include_usage` are false; `prefix_hash` is over the same bytes as
+        /// a held body's, the gateway waiting for them. confirm() gets the whole body's.
+        bool body_whole = true;
     };
 
     inline constexpr size_t kMaxDenyMessage = 256;
@@ -98,6 +103,10 @@ namespace llmbridge
         /// value goes as the venue's own key header and is the only credential sent: absent,
         /// empty, repeated or unsafe is a 400, never another header. Copied, like `model`.
         std::string_view credential_header{};
+
+        /// A decision on the head only: allowed, but nothing goes upstream before the
+        /// body's last byte. Ignored on a whole body and from confirm().
+        bool hold = false;
     };
 
     /// A venue did not answer (refused connect, failed write, EOF before the response, idle
@@ -141,6 +150,28 @@ namespace llmbridge
         virtual Retry on_failure(const FailureFacts&) noexcept { return {}; }
 
         virtual bool wants_prefix_hash() const noexcept { return false; }
+
+        /// Opt in to deciding on the head of a large body, read once at construction.
+        /// decide() then runs before the body is whole (RequestFacts::body_whole false),
+        /// and the body may go to the venue as it arrives, its last byte withheld until
+        /// confirm(). Off, every policy request is decided on its whole body, as before.
+        virtual bool decides_on_head() const noexcept { return false; }
+
+        /// Once per request decided on its head, with the whole body's facts, before its
+        /// last byte leaves; never for a body decided whole, nor once the venue answered
+        /// first. `early` is the decision in force: its venue (after any failover, never
+        /// -1), overrides, key header and tag. Return it to keep: the last byte goes. A
+        /// refusal (`allow` false, checked as decide()'s) resets a venue holding part of
+        /// the body, short of its Content-Length, and the client gets its status and
+        /// message. Any other allowed decision redoes the request: the venue is reset and
+        /// the whole body goes as a held one under the new venue, model, service_tier,
+        /// credential_header and tag. A change of tag alone is a keep, the tag updated.
+        /// The request was counted at decide(): do not count it again here.
+        virtual Decision confirm(const RequestFacts& whole, const Decision& early) noexcept
+        {
+            (void)whole;
+            return early;
+        }
 
       protected:
         Policy() = default;

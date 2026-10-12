@@ -46,7 +46,8 @@ namespace llmbridge::detail
                                const char* upstream_key);
     void append_usage_headers(std::string& out, const provider::openai::Usage& u);
     /// The builders append to `out`, a connection's stage, whose capacity is kept.
-    void append_error(std::string& out, int code, const char* detail = nullptr);
+    /// `keep`: the connection stays open for the next request, else it closes.
+    void append_error(std::string& out, int code, const char* detail = nullptr, bool keep = false);
 
     /// The 400 for a body whose top-level keys we could read differently from the
     /// provider. A literal: nothing from the body is echoed.

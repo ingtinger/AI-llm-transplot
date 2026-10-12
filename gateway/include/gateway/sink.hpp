@@ -21,6 +21,15 @@ namespace llmbridge
     inline constexpr size_t kSinkCaptureMax = 2;
     inline constexpr size_t kSinkCaptureBytes = 48;
 
+    /// What Policy::confirm() made of a decision taken on the head of a body.
+    enum class ConfirmOutcome : uint8_t
+    {
+        None,    ///< decided on the whole body, or confirm never ran
+        Kept,    ///< the last byte went as decided
+        Redone,  ///< the venue reset, the whole body sent again under a new decision
+        Refused, ///< refused at the last byte, a venue holding part of the body reset
+    };
+
     /// Metadata only, like RequestFacts: no body, no credential, no header beyond
     /// the ones the integrator asked to capture. Timestamps are the gateway's
     /// monotonic stamps and 0 when never stamped,
@@ -122,7 +131,12 @@ namespace llmbridge
         int64_t ts_body_end = 0;  ///< its last byte in from the client; 0 if cut short
         int64_t ts_body_sent = 0; ///< its last byte in the kernel: the venue's wait begins
         int64_t body_work_ns = 0; ///< scanning, copying and sending its parts after t3
+        /// A venue got part of the body before its last byte, a redone attempt's too.
         bool body_streamed = false;
+        /// The policy decided on the head (Policy::decides_on_head), and its confirm.
+        /// With `body_streamed`, a confirm that redid or refused wasted a partial upload.
+        bool decided_on_head = false;
+        ConfirmOutcome confirm_outcome = ConfirmOutcome::None;
     };
 
     /// Called on the loop thread once per completed request, streams included.

@@ -113,14 +113,14 @@ assigns the stamp attributed to it.
 
 | | identifier | storage | stamped when | assigned in (epoll / io_uring) |
 |---|---|---|---|---|
-| **t0** | `ts_req_recvd` | `ReqState` | the client's request is fully framed. Taken just **before** the parse that frames it, on both backends, so the parse is request-path work; a parse that finds the request incomplete discards it, so network wait is never charged. A **streamed** body (§2b) is stamped when its head is framed: the rest of its upload is the client's, and ends at `ts_body_end` | `open_request`, with the clock read before the framing parse (shared) |
+| **t0** | `ts_req_recvd` | `ReqState` | the client's request is fully framed. Taken just **before** the parse that frames it, on both backends, so the parse is request-path work; a parse that finds the request incomplete discards it, so network wait is never charged. A **streamed** body (§2b) is stamped when its head is framed: the rest of its upload is the client's, and ends at `ts_body_end`. A body parked by a policy's head decision, or redone by its confirm, is sent at its last byte and restamped there, as a held body's | `open_request`, with the clock read before the framing parse; `dispatch_whole` (shared) |
 | **t1** | `ts_req_built` | `ReqState` | the upstream request bytes exist: translation, auth mapping and re-serialisation done, nothing sent | `dispatch` (shared) |
 | **t2** | `ts_wire_ready` | `ReqState` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `dispatch`, `tls_feed` (shared), `EpollIo::on_upstream_writable` / `UringIo::on_connect` |
 | **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel: the attempt's first send, the head and the body there at dispatch, all in. Its end is marked in the upstream's wire bytes when it is staged (on TLS, once the Session has encrypted it alone), and the send completion that passes the mark stamps t3: plaintext, TLS-flushed or a partial write's, from `dispatch`, `pump_body` or either loop. A stale retry's fresh connection takes its own; parts staged behind the first send, even while it is backed up, move `ts_body_sent`, never t3 | `note_sent` (shared) |
 | **t4** | `ts_up_recvd` | `ReqState` | the provider's response arrived. **Non-streaming:** the body is framed, stamped at the start of the read that completed it, before the parse, on both backends. **Streaming:** the response *head* is framed, before any data chunk (see §3; this is not the first token) | `on_upstream_bytes` (shared) |
 | **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `on_response` (shared) |
 | **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `finish` (shared) |
-| **body end** | `ts_body_end` | `ReqState` | the client's last body byte is in. A held body's is t0; a streamed body's is the read that completed it (§2b), and 0 when a response came first | `open_request`, `pump_body` (shared) |
+| **body end** | `ts_body_end` | `ReqState` | the client's last body byte is in. A held body's is t0; a streamed body's is the read that completed it (§2b), and 0 when a response came first | `open_request`, `end_upload` (shared) |
 | **body sent** | `ts_body_sent` | `ReqState` | the latest send completion that left nothing staged: a streamed body's last byte in the kernel, where the provider's wait begins. A held body's is t3 | `note_sent` (shared) |
 
 **Two stamps sit outside the scheme, deliberately.** `ts_accepted` is taken when
@@ -271,9 +271,19 @@ before bodies streamed; `--stream-body off`, which holds every body, and
 `--stream-openai-body off`, which holds an OpenAI client's, do the same, as does a body
 held because the worker already streams `--stream-body-max`. A streamed body cut for
 arriving too slowly is a 408 the gateway wrote, with `ts_body_end` 0 (GATEWAY-INTERNALS.md
-12b). In v0.90.0 and v0.91.0 a streamed body's t3 moved with each
-part, so its upload landed in `upwrite-us`, `request-path` and `added-total`,
-overflowing both histograms, while `client_upload_ns` read about 0.
+12b). In v0.90.0 and v0.91.0 a streamed body's t3 moved with each part, so its upload
+landed in `upwrite-us`, `request-path` and `added-total`, overflowing both histograms,
+while `client_upload_ns` read about 0.
+
+A policy that decides on the head (GATEWAY-INTERNALS.md 12c) changes none of this. A body
+it lets stream is timed as above: t0 is the head, its `decide()` runs between t0 and t1,
+so it is ours in `request-path`, and its `confirm()` runs at the last byte, after t3, so
+it is in `body_work_ns`. A body it parks is sent only at its last byte, and is timed as a
+held body: t0 moves to that byte (`ts_body_end` equals t0), its confirm falls between t0
+and t1, and `body_work_ns` is 0. Its decision ran during the upload and is in no interval,
+as the upload is not. A body a confirm redid is timed the same way, as a fresh attempt: t0
+at its last byte and `body_work_ns` 0, so nothing done for the venue it left is counted;
+`body_streamed` stays set to say a venue had part of it.
 
 
 ## 3. Per-request headers (`--timing-headers`)

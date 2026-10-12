@@ -8,6 +8,116 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.95.0]. 2026-10-12
+
+A policy may now decide on the head of a large request body and let it go to the venue as
+it arrives, instead of holding it to its last byte: "decide on the head, confirm before the
+last byte". Opt-in; a policy that does not opt in behaves exactly as before.
+GATEWAY-INTERNALS.md 12c, DESIGN.md "Deciding on the head of a body".
+
+### Added
+
+- **`Policy::decides_on_head()`**, false by default, read once at construction. True, a
+  body that would stream without a policy (16 KiB or more, still arriving at its head, not
+  encoded, `--stream-body on`, and for an OpenAI client `--stream-openai-body on`) is
+  decided on its head, provided one venue in the table byte-forwards the client's dialect
+  and the worker streams fewer than `--stream-body-max` bodies; otherwise it is decided
+  whole, as before.
+  - `decide()` gets `RequestFacts::body_whole` false: `model` is a top-level `model` that
+    has closed in the bytes so far, else empty; `stream` and `include_usage` are false;
+    `prefix_hash` covers the same bytes as a held body's, the gateway waiting for
+    min(body, 4 KiB) of it when the policy wants the hash.
+  - A refusal is answered at once, before the upload ends, and reaches no venue. The rest
+    of the body is read and dropped, and the connection, kept alive, carries the next
+    request.
+  - Allowed with no override and no hold, to a venue that byte-forwards, the body streams
+    there as it arrives. Otherwise (a model or service-tier override, `Decision::hold`, a
+    venue that translates) it is **parked**: kept unsent in the gateway to its last byte,
+    holding no venue connection and no `--stream-body-max` slot, an OpenAI client's JSON
+    still checked as it arrives, under the upload deadline of 0.94.0.
+- **`Policy::confirm(whole, early)`**, called once per request decided on its head, with
+  the whole body's facts, exactly a held body's, before the last byte leaves. The venue
+  never has that byte before the confirm. `early` is the decision in force: its venue
+  (after any failover, never -1), overrides, key header and tag.
+  - Return `early` to keep it: the last byte goes. A change of tag alone is a keep, the
+    tag updated.
+  - Refuse (`allow` false, checked as `decide()`'s): a venue holding part of the body is
+    reset, so it holds one short of its Content-Length and never runs it, and the client
+    gets the policy's status and message.
+  - Any other allowed decision redoes the request: the venue is reset and the whole body
+    sent as a held body under the new venue, model, service tier, key header and tag.
+  - The request was counted at `decide()`; a policy must not count it again here.
+- **`Decision::hold`**: allowed, but nothing goes upstream before the body's last byte.
+  Ignored on a whole body and from `confirm()`.
+- `RequestRecord::decided_on_head` and `RequestRecord::confirm_outcome`
+  (`ConfirmOutcome::None`, `Kept`, `Redone`, `Refused`), at the end of the record. With
+  `body_streamed`, which a redo leaves set, a refusal or a redo of a body a venue held
+  part of is a wasted partial upload: what to measure, per venue, before opting in.
+- `Stats::policy_head_decisions`, `streamed_body_parked` (failover parks too),
+  `streamed_body_redone` (redos of a body a venue held part of) and
+  `streamed_body_confirm_refusals` (also counted in `policy_denied`), at the end of
+  `Stats`. The exit profile and the SIGUSR1 dump print them when there was a head
+  decision.
+
+### Changed
+
+- **A failover of a body decided on its head resends it from the client's buffer.** While
+  it is still arriving, a failover to a venue that takes it as it is streams it there from
+  its first byte; with an override, or to a venue that translates, it parks. Once whole it
+  goes as a held body. A request pipelined behind it keeps its place. The original-bytes
+  copy (`saved`) is no longer taken for a body that stays in the buffer, which also removes
+  an underflow its size arithmetic had on a body not yet whole.
+- **A stale connection's retry of a streamed body carries the key the policy named.** It
+  rebuilt the head with the client's own credential headers, on the assumption that a
+  policy's requests never stream.
+- A policy without the opt-in, and every request with no policy, is unchanged: the same
+  stamps, headers, histogram samples, sink fields and replies. The sink corpus records
+  match 0.94.1's. Instructions per request (callgrind, 3000 requests, one worker) are
+  within 0.7% of 0.94.1's on epoll (17,340 against 17,221) and 0.2% on io_uring (17,306
+  against 17,279); `protocol_micro`'s medians are within 1.6%, its code unchanged; the
+  allocation ceilings are unchanged.
+
+### Tests
+
+- `ProxyHeadDecide.*`, both backends, with a policy that opts in: a body reaching the
+  venue before its last byte, decided once on its head and confirmed once with a held
+  body's model, streaming flags and prefix hash; a policy without the opt-in holding the
+  body and deciding once, whole; a head refusal answered before the upload ends with no
+  venue contacted, the rest drained and the next request on the connection served; the
+  last byte withheld while `confirm()` runs; a confirm refusal resetting the venue short
+  of the body, with the policy's status and message, counted and recorded; a confirm redo
+  sending the whole rewritten body to the second venue, the first reset, the record saying
+  redone; a model override, a hold and a translating venue each parking the body, the
+  confirm running before anything went, the rewrite and the translation correct; a body
+  that names its model last, empty at the decision and present at the confirm; a decision
+  waiting for the 4 KiB the prefix hash covers; a repeated `model` after the decision
+  refused and never forwarded; a failover after a refused connect streaming to the next
+  venue, a failover with an override parking, a parked body outliving the venue idle
+  timeout, and a venue closing after the whole body failing over from the client's buffer
+  with a pipelined request served in step; a stale retry of a streamed body carrying only
+  the named key; past `--stream-body-max` a body decided whole, and a parked body taking
+  no slot; a parked body cut at its deadline, stopped or trickling; a client leaving
+  mid-body resetting the venue; the stamps of a streamed, a parked and a redone body.
+- `ModelOf.EveryPrefixYieldsNothingOrTheWholeBodysModel`: `model_of` on every prefix of a
+  body yields nothing or the whole body's model.
+- Each behaviour fails its test when removed, on both backends, except withholding the last
+  byte, which only epoll can show: io_uring submits the send after the confirm returns
+  either way. The two `body_len - 1` caps, in `pump_body` and `dispatch`, are defence in
+  depth: the read that brings the last byte stages nothing before its confirm.
+
+### Known gaps
+
+- A body whose decision needs it rewritten parks, so it gains nothing from deciding on the
+  head. Two follow-ups would let it stream: splicing a model rewrite (`auto` among them)
+  into the stream for a body that names its model first, and inserting `service_tier` at
+  the start of the stream (redoing the request if the client sent its own), so that mixes
+  of flex and standard tiers can stream.
+- A venue sees part of a prompt the policy may then refuse or move, though never a request
+  it can run (SECURITY.md). A policy that must not answers `hold`.
+- A non-OpenAI client's top-level keys are still not checked for repeats, held or arriving
+  (SECURITY.md).
+
+
 ## [0.94.1]. 2026-10-12
 
 ### Tests

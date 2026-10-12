@@ -26,6 +26,7 @@
 
 #include "core/io.hpp"
 #include "gateway/gateway.hpp"
+#include "gateway/dialect.hpp"
 #include "net/http.hpp"
 #include "net/tls.hpp" // self-guarded by LLMBRIDGE_HAVE_TLS
 #include "provider/translate.hpp"
@@ -84,8 +85,19 @@ namespace llmbridge::detail
         void send_continue(ClientConn* c) noexcept;     // the interim 100, staged like any reply
         void respond(ClientConn* client) noexcept;      // send what is owed; finish if it all went
         // A body forwarded as it arrives (core/body.cpp).
-        [[nodiscard]] bool body_streams(const ClientConn* c, const net::http::Message& m) noexcept;
+        /// May this body be admitted before its last byte, whatever venue serves it?
+        [[nodiscard]] bool body_streamable(const ClientConn* c, const net::http::Message& m) noexcept;
+        /// Does venue `slot` take a `client` body as it is: a byte-forward, no translation?
+        [[nodiscard]] bool venue_streams(Dialect client, int slot) const noexcept;
+        [[nodiscard]] bool any_venue_streams(Dialect client) const noexcept;
+        void start_body(ClientConn* c, bool forward) noexcept; // forward it as it arrives, else park it
         void pump_body(ClientConn* c) noexcept;       // scan, then stage what is safe upstream
+        /// Stage what may go, up to `safe`, and send it; false when the send lost the venue.
+        bool forward_body(ClientConn* c, std::string_view body, size_t safe) noexcept;
+        /// Its last byte is in: the upload's stamps, then the head decision's confirm.
+        /// False when the request went another way: refused, parked or redone.
+        bool end_upload(ClientConn* c, int64_t t) noexcept;
+        void dispatch_whole(ClientConn* c, int64_t t) noexcept; // a parked or redone body, held
         void stop_body(ClientConn* c) noexcept;       // no more of it goes up: its slot is free
         void cut_body(ClientConn* c) noexcept;        // stop it and reset its venue
         void reset_venue(UpstreamConn* u) noexcept;   // never pooled, and its close is a reset
@@ -93,7 +105,7 @@ namespace llmbridge::detail
         void body_timeout(ClientConn* c, uint64_t& counter, const char* why) noexcept;
         /// When a body with `f.body_in` bytes in must have its last; INT64_MAX for never.
         [[nodiscard]] int64_t body_deadline(const ReqState& f) const noexcept;
-        void refuse_body(ClientConn* c) noexcept;     // reset the upstream, answer the 400
+        void refuse_body(ClientConn* c, const char* why) noexcept; // reset the upstream, answer the 400
         void end_body_stream(ClientConn* c, UpstreamConn* u) noexcept; // a response byte arrived
         void drop_discard(ClientConn* c) noexcept;    // bytes of a request that is over
         [[nodiscard]] std::string_view body_so_far(const ClientConn* c) const noexcept;
@@ -103,8 +115,18 @@ namespace llmbridge::detail
         /// Reply `code` and abandon any upstream. `why` is for the log; `detail` is what
         /// a 4xx shows the client, never a policy's reason.
         void error_respond(ClientConn* client, int code, const char* why,
-                           const char* detail = nullptr) noexcept;
-        Decision policy_decision(ClientConn* c, const net::http::Message& m) noexcept;
+                           const char* detail = nullptr, bool keep = false) noexcept;
+        // The policy seam (core/client.cpp).
+        [[nodiscard]] RequestFacts facts_of(const ClientConn* c, bool whole) const noexcept;
+        Decision policy_decision(ClientConn* c, bool whole) noexcept;
+        Decision checked_refusal(const ClientConn* c, Decision d) noexcept; // a status and message we can send
+        bool apply_decision(ClientConn* c, const Decision& d) noexcept; // false: refused, replied
+        /// Where the head of a body still arriving must reach before a policy decides on it.
+        [[nodiscard]] size_t decide_want(const net::http::Message& m) const noexcept;
+        void decide_on_head(ClientConn* c, const net::http::Message& m, const HeadFacts& f,
+                            int64_t t0) noexcept;
+        [[nodiscard]] Decision decision_in_effect(const ClientConn* c) const noexcept;
+        bool confirm_body(ClientConn* c, int64_t t) noexcept; // true: the last byte goes as decided
         /// The bookkeeping half of a close: unpaired, deregistered, doomed. Returns a
         /// client's upstream, which the backend closes too.
         ConnBase* forget(ConnBase& c) noexcept;
@@ -163,6 +185,7 @@ namespace llmbridge::detail
         // The sink (core/sink.cpp) and the sweep (core/sweep.cpp).
         void sink_capture(ClientConn* c) noexcept;
         [[nodiscard]] const char* capture_model(ClientConn* c) noexcept; // why to refuse, or null
+        [[nodiscard]] static uint64_t prefix_hash_of(std::string_view lead) noexcept; // RequestFacts::prefix_hash
         void sink_emit(ClientConn* c, int status, bool streamed) noexcept;
         void sweep_idle() noexcept; // heartbeat, pool reaping and every timeout, one walk
         void sweep_client(ClientConn* c, int64_t now, bool busy) noexcept;
@@ -243,6 +266,7 @@ namespace llmbridge::detail
         uint64_t _body_min_rate = Gateway::kDefaultBodyMinRate;
         Policy* const _policy = nullptr; ///< `const`: swapping it under the loop would race
         bool _wants_prefix_hash = false; ///< Policy::wants_prefix_hash(), read once
+        bool _decides_on_head = false;   ///< Policy::decides_on_head(), read once
         RequestSink* _sink = nullptr;
         std::vector<std::string> _sink_capture_names; ///< lowercased, no colon
         uint8_t _active_backend = 0;                  ///< 1 epoll, 2 io_uring; set by run

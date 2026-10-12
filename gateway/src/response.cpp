@@ -98,14 +98,15 @@ namespace llmbridge::detail
     // `detail` is shown only for a 4xx, the caller's own mistake; a 5xx's reason stays
     // in the log. Every detail is a literal in this tree or a policy message that
     // passed deny_message_ok, so nothing client-supplied is echoed back.
-    void append_error(std::string& out, int code, const char* detail)
+    void append_error(std::string& out, int code, const char* detail, bool keep)
     {
         const ErrorShape s = error_shape(code);
         std::string body;
         provider::openai::write_error(body, (detail && code < 500) ? detail : s.msg, s.type);
         out.reserve(out.size() + body.size() + 128);
         net::http::append_status_line(out, code);
-        out.append("Content-Type: application/json\r\nConnection: close\r\n");
+        out.append(keep ? "Content-Type: application/json\r\nConnection: keep-alive\r\n"
+                        : "Content-Type: application/json\r\nConnection: close\r\n");
         net::http::append_content_length(out, body.size());
         out.append("\r\n");
         out.append(body);

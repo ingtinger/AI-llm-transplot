@@ -31,8 +31,10 @@
 #include <atomic>
 #include <cstdio>
 #include <ctime>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -42,6 +44,7 @@
 #include <vector>
 
 #include "net/http.hpp"
+#include "net/sha256.hpp"
 #include "provider/json.hpp" // reassemble the streamed OpenAI chunks
 
 using llmbridge::Gateway;
@@ -12984,4 +12987,908 @@ TEST_P(ProxyBodyStream, ABodyThatStopsComingIsCutAtItsDeadline)
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyBodyStream,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));
+
+// ── A policy that decides on the head of a body (GATEWAY-INTERNALS.md 12c) ──────
+
+namespace
+{
+    /// What a policy was handed at one call, copied: the views die with it.
+    struct SeenFacts
+    {
+        bool whole = true;
+        std::string model;
+        bool stream = false, include_usage = false;
+        uint64_t hash = 0;
+        size_t body_bytes = 0;
+        int64_t at = 0;          ///< when it was called
+        size_t venue_bytes = 0;  ///< what `probe` read then
+    };
+
+    /// The decision confirm() was handed as the one in force.
+    struct SeenEarly
+    {
+        int upstream_index = -1;
+        std::string model, credential_header;
+        uint64_t tag = 0;
+    };
+
+    /// Opts in to deciding on the head unless `opt_in` is cleared, records every call, and
+    /// answers as the test sets before start(): the i-th decide() gets `heads[i]`, the last
+    /// repeating; confirm() returns `whole` when set, else the decision it was handed.
+    class HeadPolicy final : public llmbridge::Policy
+    {
+      public:
+        bool decides_on_head() const noexcept override { return opt_in; }
+        bool wants_prefix_hash() const noexcept override { return hash; }
+        llmbridge::Decision decide(const llmbridge::RequestFacts& f) noexcept override
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            _decides.push_back(seen(f));
+            decided.fetch_add(1);
+            return heads[std::min(_decides.size(), heads.size()) - 1];
+        }
+        llmbridge::Decision confirm(const llmbridge::RequestFacts& f,
+                                    const llmbridge::Decision& early) noexcept override
+        {
+            {
+                std::lock_guard<std::mutex> lk(_mu);
+                _confirms.push_back(seen(f));
+                _early.push_back({early.upstream_index, std::string(early.model),
+                                  std::string(early.credential_header), early.tag});
+            }
+            in_confirm.store(true);
+            for (int i = 0; gate && !gate->load() && i < 1000; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return whole ? *whole : early;
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts&) noexcept override { return retry; }
+
+        std::vector<SeenFacts> decides() const
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _decides;
+        }
+        std::vector<SeenFacts> confirms() const
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _confirms;
+        }
+        std::vector<SeenEarly> earlies() const
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _early;
+        }
+
+        bool opt_in = true;
+        bool hash = false;
+        std::vector<llmbridge::Decision> heads{llmbridge::Decision{.allow = true}};
+        std::optional<llmbridge::Decision> whole;
+        llmbridge::Retry retry{};
+        const std::atomic<bool>* gate = nullptr; ///< confirm() waits for it, at most 10 s
+        std::function<size_t()> probe;            ///< a venue's bytes, read at each call
+        std::atomic<int> decided{0};
+        std::atomic<bool> in_confirm{false};
+
+      private:
+        SeenFacts seen(const llmbridge::RequestFacts& f) const
+        {
+            return {f.body_whole, std::string(f.model), f.stream, f.include_usage, f.prefix_hash,
+                    f.body_bytes, llmbridge::now_ns(), probe ? probe() : 0};
+        }
+        mutable std::mutex _mu;
+        std::vector<SeenFacts> _decides, _confirms;
+        std::vector<SeenEarly> _early;
+    };
+
+    /// A request in two sends, as openai_halves: `part` opens the body, `rest` ends it.
+    Halves split_request(const std::string& part, const std::string& rest, bool json = true)
+    {
+        return {"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" +
+                    std::string(json ? "Content-Type: application/json\r\n" : "") +
+                    "Content-Length: " + std::to_string(part.size() + rest.size()) + "\r\n\r\n" + part,
+                rest};
+    }
+    std::string model_first(size_t pad = 64 * 1024)
+    {
+        return R"({"model":"gpt-4o","messages":[{"role":"user","content":")" + std::string(pad, 'p') + R"("}])";
+    }
+    std::string whole_body(const Halves& h) { return h.first.substr(h.first.find("\r\n\r\n") + 4) + h.rest; }
+    uint64_t lead_hash(const std::string& body)
+    {
+        using llmbridge::net::Sha256;
+        return Sha256::truncated(Sha256::hash(std::string_view(body).substr(0, llmbridge::kPrefixHashBytes)));
+    }
+    std::string with_model(std::string body, const std::string& model)
+    {
+        const std::string was = R"("model":"gpt-4o")";
+        return body.replace(body.find(was), was.size(), R"("model":")" + model + "\"");
+    }
+} // namespace
+
+class ProxyHeadDecide : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+  protected:
+    void SetUp() override
+    {
+        _backend.set_response(http_ok("{}"));
+        _second.set_response(http_ok(R"({"who":"second"})"));
+    }
+    /// Venue 0 the fixture's backend, or `first_port`; venue 1 `_second`, speaking `second`.
+    void start_with(HeadPolicy& pol, UpstreamDialect second = UpstreamDialect::OpenAI, uint16_t first_port = 0,
+                    int64_t upstream_idle_ns = Gateway::kDefaultUpstreamIdleNs)
+    {
+        _policy = &pol;
+        if (!first_port)
+        {
+            _backend.start();
+            first_port = _backend.port();
+        }
+        _second.start();
+        _upstreams = {{"127.0.0.1", first_port, false, "", UpstreamDialect::OpenAI, ""},
+                      {"127.0.0.1", _second.port(), false, "", second, ""}};
+        start(0, false, UpstreamDialect::OpenAI, GetParam(), upstream_idle_ns);
+    }
+    void TearDown() override
+    {
+        shutdown();
+        _second.stop();
+    }
+    TestBackend _second;
+};
+
+// A policy needs the head and nothing more to route, so a large body no longer waits for
+// its last byte when the policy opts in: decided once on the head, streamed, and confirmed
+// once with the whole body's facts, which are a held body's to the bit.
+TEST_P(ProxyHeadDecide, AHeadDecidedBodyReachesTheVenueBeforeItsLastByte)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.hash = true;
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"stream":true,"stream_options":{"include_usage":true}})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; })) << "held to its last byte";
+    EXPECT_TRUE(pol.confirms().empty());
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string body = whole_body(h);
+    EXPECT_EQ(body_of(_backend.last_request()), body);
+    const auto d = pol.decides();
+    ASSERT_EQ(d.size(), 1u);
+    EXPECT_FALSE(d[0].whole);
+    EXPECT_EQ(d[0].model, "gpt-4o") << "closed in the bytes so far";
+    EXPECT_FALSE(d[0].stream) << "not known before the last byte";
+    EXPECT_FALSE(d[0].include_usage);
+    EXPECT_EQ(d[0].hash, lead_hash(body));
+    EXPECT_EQ(d[0].body_bytes, body.size());
+    const auto w = pol.confirms();
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_TRUE(w[0].whole);
+    EXPECT_EQ(w[0].model, "gpt-4o");
+    EXPECT_TRUE(w[0].stream);
+    EXPECT_TRUE(w[0].include_usage);
+    EXPECT_EQ(w[0].hash, lead_hash(body));
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.policy_head_decisions, 1u);
+    EXPECT_EQ(st.streamed_bodies, 1u);
+    EXPECT_EQ(st.streamed_body_parked, 0u);
+    EXPECT_EQ(st.errors, 0u);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_TRUE(recs[0].r.decided_on_head);
+    EXPECT_EQ(recs[0].r.confirm_outcome, llmbridge::ConfirmOutcome::Kept);
+    EXPECT_TRUE(recs[0].r.body_streamed);
+    EXPECT_EQ(recs[0].model, "gpt-4o");
+}
+
+// Without the opt-in nothing changes: the body is held to its last byte and decided once,
+// whole, with the same facts the head-decided body was confirmed with.
+TEST_P(ProxyHeadDecide, APolicyWithoutTheOptInStillHoldsTheBody)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.hash = true;
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"stream":true,"stream_options":{"include_usage":true}})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(_backend.bytes_seen(), 0u) << "a byte left before the body was complete";
+    EXPECT_EQ(pol.decided.load(), 0);
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string body = whole_body(h);
+    const auto d = pol.decides();
+    ASSERT_EQ(d.size(), 1u);
+    EXPECT_TRUE(d[0].whole);
+    EXPECT_EQ(d[0].model, "gpt-4o");
+    EXPECT_TRUE(d[0].stream);
+    EXPECT_TRUE(d[0].include_usage);
+    EXPECT_EQ(d[0].hash, lead_hash(body));
+    EXPECT_TRUE(pol.confirms().empty());
+    EXPECT_EQ(_gw->stats().policy_head_decisions, 0u);
+    EXPECT_EQ(_gw->stats().streamed_bodies, 0u);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_FALSE(recs[0].r.decided_on_head);
+    EXPECT_EQ(recs[0].r.confirm_outcome, llmbridge::ConfirmOutcome::None);
+    EXPECT_FALSE(recs[0].r.body_streamed);
+}
+
+// A refusal on the head answers while the client is still uploading and contacts no venue.
+// The rest of the body is read and dropped, and the connection serves the next request.
+TEST_P(ProxyHeadDecide, ARefusalOnTheHeadAnswersBeforeTheUploadEnds)
+{
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = false, .deny_status = 429, .reason = "test quota",
+                                     .message = "slow down"},
+                 llmbridge::Decision{.allow = true}};
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 429) << r;
+    EXPECT_EQ(error_body(r).message, "slow down") << r;
+    EXPECT_NE(r.find("\r\nConnection: keep-alive\r\n"), std::string::npos) << r;
+    EXPECT_EQ(_backend.accepted(), 0) << "a refused request reached a venue";
+    ASSERT_TRUE(c.send(h.rest + make_request()));
+    EXPECT_EQ(c.recv_status(), 200) << "the next request on the connection";
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 1);
+    EXPECT_EQ(body_of(_backend.last_request()), "hello");
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.policy_denied, 1u);
+    EXPECT_EQ(st.errors, 1u);
+    EXPECT_EQ(st.requests, 1u);
+    EXPECT_EQ(st.streamed_bodies, 0u);
+    EXPECT_EQ(_second.accepted(), 0);
+}
+
+// Nothing that would let a venue run the request leaves before confirm(): while it runs,
+// the venue holds the body short of one byte, however long the client took to send it.
+TEST_P(ProxyHeadDecide, TheLastByteWaitsForTheConfirm)
+{
+    std::atomic<bool> go{false};
+    HeadPolicy pol;
+    pol.gate = &go;
+    start_with(pol);
+    const std::string req = big_request(64, /*json=*/false); // unscanned: every byte goes
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(req.substr(0, req.size() - 1)));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 64 * 1024; }));
+    ASSERT_TRUE(c.send(req.substr(req.size() - 1)));
+    ASSERT_TRUE(wait_for([&] { return pol.in_confirm.load(); }));
+    // The loop is inside confirm(): what the venue has once its reads settle is all it got.
+    const auto settled = [&] {
+        const size_t was = _backend.bytes_seen();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        return _backend.bytes_seen() == was;
+    };
+    ASSERT_TRUE(wait_for(settled));
+    const size_t held = _backend.bytes_seen();
+    go = true;
+    EXPECT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.last_request().size(), held + 1) << "the last byte went before the confirm";
+    EXPECT_EQ(body_of(_backend.last_request()), body_of(req));
+}
+
+// A confirm that refuses resets the venue, which holds a body short of its length and
+// never runs it; the client gets the policy's status and message.
+TEST_P(ProxyHeadDecide, AConfirmRefusalResetsTheVenue)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.whole = llmbridge::Decision{.allow = false, .deny_status = 402, .reason = "test budget",
+                                    .message = "over budget"};
+    start_with(pol);
+    const Halves h = split_request(model_first(), R"(,"temperature":0.5})", /*json=*/false);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 402) << r;
+    EXPECT_EQ(error_body(r).message, "over budget") << r;
+    EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; })) << "the venue was not reset";
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 0) << "the venue got the whole body";
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u);
+    const size_t got = cut[0].size() - (cut[0].find("\r\n\r\n") + 4);
+    EXPECT_GE(got, h.sent_body()) << "the first part did not stream";
+    EXPECT_LT(got, whole_body(h).size()) << "the venue holds the whole body";
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.streamed_body_confirm_refusals, 1u);
+    EXPECT_EQ(st.policy_denied, 1u);
+    EXPECT_EQ(st.errors, 1u);
+    EXPECT_EQ(_gw->pooled_upstream_count(), 0u);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.status, 402);
+    EXPECT_TRUE(recs[0].r.error_reply);
+    EXPECT_EQ(recs[0].r.confirm_outcome, llmbridge::ConfirmOutcome::Refused);
+    EXPECT_TRUE(recs[0].r.body_streamed) << "a partial upload was wasted";
+}
+
+// A confirm may change its mind: the first venue is reset short of the body, and the whole
+// body goes to the one it names now, under its model.
+TEST_P(ProxyHeadDecide, AConfirmRedoSendsTheWholeBodyToAnotherVenue)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.whole = llmbridge::Decision{.allow = true, .upstream_index = 1, .model = "other-model", .tag = 7};
+    start_with(pol);
+    const Halves h = split_request(model_first(), R"(,"temperature":0.5})", /*json=*/false);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_NE(r.find("second"), std::string::npos) << r;
+    EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; })) << "the first venue was not reset";
+    c.close();
+    shutdown();
+    const std::string want = with_model(whole_body(h), "other-model");
+    const std::string up = _second.last_request();
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_NE(up.find("\r\nContent-Length: " + std::to_string(want.size()) + "\r\n"), std::string::npos);
+    EXPECT_EQ(_backend.requests_seen(), 0);
+    EXPECT_EQ(_backend.incomplete_requests().size(), 1u);
+    const auto e = pol.earlies();
+    ASSERT_EQ(e.size(), 1u);
+    EXPECT_EQ(e[0].upstream_index, 0);
+    EXPECT_EQ(e[0].model, "");
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 1u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.confirm_outcome, llmbridge::ConfirmOutcome::Redone);
+    EXPECT_EQ(recs[0].r.upstream_index, 1);
+    EXPECT_EQ(recs[0].r.tag, 7u);
+    EXPECT_TRUE(recs[0].r.body_streamed) << "a partial upload was wasted";
+}
+
+namespace
+{
+    /// A head decision that parks the body: nothing reaches either venue before its last
+    /// byte, confirm() runs before anything goes, and the venue gets `want`.
+    void expect_parked(TestBackend& venue, HeadPolicy& pol, const Halves& h, uint16_t port)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(port));
+        ASSERT_TRUE(c.send(h.first));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        EXPECT_EQ(venue.bytes_seen(), 0u) << "a byte left before the body was complete";
+        EXPECT_EQ(pol.decided.load(), 1);
+        ASSERT_TRUE(c.send(h.rest));
+        const std::string r = c.recv_response();
+        EXPECT_EQ(Client::status_of(r), 200) << r;
+    }
+} // namespace
+
+// An override needs the whole body rewritten: the body is parked to its last byte, holding
+// no venue, then confirmed and sent once with the new model.
+TEST_P(ProxyHeadDecide, AModelOverrideParksTheBody)
+{
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 0, .model = "other-model"}};
+    pol.probe = [this] { return _backend.bytes_seen(); };
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    expect_parked(_backend, pol, h, _proxy_port);
+    shutdown();
+    EXPECT_EQ(body_of(_backend.last_request()), with_model(whole_body(h), "other-model"));
+    const auto w = pol.confirms();
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_EQ(w[0].venue_bytes, 0u) << "confirm ran after the body went";
+    EXPECT_EQ(pol.earlies()[0].model, "other-model");
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+    EXPECT_EQ(_gw->stats().streamed_bodies, 0u);
+}
+
+TEST_P(ProxyHeadDecide, AHoldParksTheBody)
+{
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .hold = true}};
+    pol.probe = [this] { return _backend.bytes_seen(); };
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    expect_parked(_backend, pol, h, _proxy_port);
+    shutdown();
+    EXPECT_EQ(body_of(_backend.last_request()), whole_body(h));
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_EQ(pol.confirms()[0].venue_bytes, 0u) << "confirm ran after the body went";
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+}
+
+// A venue of another dialect reads the whole body to translate it: parked too.
+TEST_P(ProxyHeadDecide, ATranslatingVenueParksTheBody)
+{
+    _second.set_response(http_ok(anthropic_resp_body("ok")));
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1}};
+    pol.probe = [this] { return _second.bytes_seen(); };
+    start_with(pol, UpstreamDialect::Anthropic);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(_second.bytes_seen(), 0u) << "a byte left before the body was complete";
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_NE(r.find("chat.completion"), std::string::npos) << r;
+    c.close();
+    shutdown();
+    const std::string up = _second.last_request();
+    EXPECT_EQ(up.rfind("POST /v1/messages HTTP/1.1\r\n", 0), 0u) << up.substr(0, 300);
+    EXPECT_NE(up.find(R"("model":"gpt-4o")"), std::string::npos);
+    EXPECT_NE(up.find(std::string(64 * 1024, 'p')), std::string::npos) << "the prompt did not arrive whole";
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_EQ(pol.confirms()[0].venue_bytes, 0u);
+    EXPECT_EQ(_backend.accepted(), 0);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+}
+
+// A body that names its model last has none at the head; confirm() sees it.
+TEST_P(ProxyHeadDecide, AMessagesFirstBodyHasItsModelOnlyAtTheConfirm)
+{
+    HeadPolicy pol;
+    start_with(pol);
+    const Halves h = split_request(R"({"messages":[{"role":"user","content":")" + std::string(64 * 1024, 'p') +
+                                       R"("}])",
+                                   R"(,"model":"gpt-4o"})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    ASSERT_EQ(pol.decides().size(), 1u);
+    EXPECT_EQ(pol.decides()[0].model, "");
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_EQ(pol.confirms()[0].model, "gpt-4o");
+    EXPECT_EQ(body_of(_backend.last_request()), whole_body(h));
+}
+
+// A policy that wants the prefix hash is asked once the bytes it covers are in, and gets
+// the value a held body's would carry.
+TEST_P(ProxyHeadDecide, APrefixHashDecisionWaitsForItsBytes)
+{
+    HeadPolicy pol;
+    pol.hash = true;
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    const size_t head = h.first.find("\r\n\r\n") + 4;
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first.substr(0, head + 1000)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(pol.decided.load(), 0) << "decided before the hashed bytes were in";
+    ASSERT_TRUE(c.send(h.first.substr(head + 1000, 4000)));
+    EXPECT_TRUE(wait_for([&] { return pol.decided.load() == 1; }));
+    ASSERT_TRUE(c.send(h.first.substr(head + 5000) + h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string body = whole_body(h);
+    ASSERT_EQ(pol.decides().size(), 1u);
+    EXPECT_FALSE(pol.decides()[0].whole);
+    EXPECT_EQ(pol.decides()[0].hash, lead_hash(body));
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_EQ(pol.confirms()[0].hash, lead_hash(body));
+}
+
+// The model the policy routed on is the one the venue reads: a repeat after the decision
+// is refused before it leaves, in a part before the last, and confirm() never runs.
+TEST_P(ProxyHeadDecide, ARepeatedModelAfterTheDecisionIsNeverForwarded)
+{
+    HeadPolicy pol;
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"model":"evil","pad":")" + std::string(32 * 1024, 'q') + "\"}");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest.substr(0, h.rest.size() - 2))); // not its last byte
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 400) << r;
+    EXPECT_NE(r.find("repeats a top-level key"), std::string::npos) << r;
+    EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; }));
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 0);
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut[0].find("evil"), std::string::npos) << "the repeat went upstream";
+    EXPECT_TRUE(pol.confirms().empty());
+    EXPECT_EQ(_gw->stats().streamed_body_refusals, 1u);
+}
+
+// A venue that refuses the connection mid-upload: the failover venue takes the body as it
+// is, so it streams there, from the first byte.
+TEST_P(ProxyHeadDecide, AFailoverMidUploadKeepsStreaming)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _second.bytes_seen() > 16 * 1024; })) << "the failover held the body";
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_NE(r.find("second"), std::string::npos) << r;
+    c.close();
+    shutdown();
+    EXPECT_EQ(body_of(_second.last_request()), whole_body(h));
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.upstream_failovers, 1u);
+    EXPECT_EQ(st.streamed_bodies, 1u);
+    EXPECT_EQ(st.streamed_body_parked, 0u);
+    ASSERT_EQ(pol.earlies().size(), 1u);
+    EXPECT_EQ(pol.earlies()[0].upstream_index, 1) << "confirm sees the venue serving now";
+}
+
+// A failover that names a model needs the whole body rewritten: it parks.
+TEST_P(ProxyHeadDecide, AFailoverWithAnOverrideParks)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1, .model = "other-model"};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(_second.bytes_seen(), 0u) << "a byte left before the body was complete";
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    c.close();
+    shutdown();
+    EXPECT_EQ(body_of(_second.last_request()), with_model(whole_body(h), "other-model"));
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+    ASSERT_EQ(pol.earlies().size(), 1u);
+    EXPECT_EQ(pol.earlies()[0].upstream_index, 1);
+    EXPECT_EQ(pol.earlies()[0].model, "other-model");
+}
+
+// Parked by a failover, a body holds no venue, so no venue's idle timeout runs on it: an
+// upload slower than --upstream-timeout is the body deadline's to judge, and is served.
+TEST_P(ProxyHeadDecide, AFailoverParkedBodyOutlivesTheVenueIdleTimeout)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1, .model = "other-model"};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port(), 200'000'000);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    c.close();
+    shutdown();
+    EXPECT_EQ(body_of(_second.last_request()), with_model(whole_body(h), "other-model"));
+    EXPECT_EQ(_second.requests_seen(), 1);
+    EXPECT_EQ(_gw->stats().upstream_timeouts, 0u);
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+}
+
+// The venue read the whole body and closed unanswered: the failover resends it from the
+// client's buffer, and a request pipelined behind it is served next, in step.
+TEST_P(ProxyHeadDecide, AFailoverAfterTheWholeBodyResendsItAndKeepsThePipeline)
+{
+    _backend.set_close_unanswered(true);
+    HeadPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1};
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest + make_request()));
+    const std::string r1 = c.recv_response();
+    const std::string r2 = c.recv_response();
+    EXPECT_EQ(Client::status_of(r1), 200) << r1;
+    EXPECT_EQ(Client::status_of(r2), 200) << r2;
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 2) << "the first venue read both whole";
+    EXPECT_EQ(_second.requests_seen(), 2);
+    const std::string all = _second.all_requests();
+    const std::string body = whole_body(h);
+    EXPECT_NE(all.find(body), std::string::npos) << "the big body was not resent whole";
+    EXPECT_EQ(body_of(_second.last_request()), "hello");
+    EXPECT_EQ(_gw->stats().upstream_failovers, 2u);
+}
+
+// A pooled venue that dropped the connection as the body began: the retry on a fresh
+// connection rebuilds the head with the key the policy named, and only that key.
+TEST_P(ProxyHeadDecide, AStaleRetryOfAStreamedBodySendsOnlyTheNamedKey)
+{
+    _backend.set_drop_first_mid_second(true);
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 0, .credential_header = "x-kottos-key-openai"}};
+    start_with(pol);
+    const std::string hdrs = "Authorization: Bearer sk-CLIENT\r\nX-Kottos-Key-Openai: sk-F1\r\n";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", hdrs)));
+    ASSERT_EQ(c.recv_status(), 200);
+    Halves h = openai_halves(R"(,"temperature":0.5})");
+    h.first.insert(h.first.find("\r\n") + 2, hdrs);
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.accepted() == 2; })) << "no retry on a fresh connection";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_retries, 1u);
+    EXPECT_EQ(_gw->stats().policy_head_decisions, 1u);
+    EXPECT_EQ(body_of(_backend.last_request()), whole_body(h));
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u) << "the head that went ahead of the body";
+    for (const std::string& up : {_backend.all_requests(), cut[0]})
+    {
+        EXPECT_NE(up.find("\r\nAuthorization: Bearer sk-F1\r\n"), std::string::npos) << up.substr(0, 400);
+        EXPECT_EQ(up.find("sk-CLIENT"), std::string::npos) << up.substr(0, 400);
+        EXPECT_EQ(lower_case(up).find("x-kottos-key"), std::string::npos) << up.substr(0, 400);
+    }
+}
+
+// Past --stream-body-max a body is held and decided whole, as before; a parked body holds
+// no venue and so no slot.
+TEST_P(ProxyHeadDecide, PastTheCapTheBodyIsDecidedWhole)
+{
+    _stream_body_max = 1;
+    HeadPolicy pol;
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client a, b;
+    ASSERT_TRUE(a.connect(_proxy_port));
+    ASSERT_TRUE(a.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(b.connect(_proxy_port));
+    ASSERT_TRUE(b.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(pol.decided.load(), 1) << "decided on the head past the cap";
+    ASSERT_TRUE(b.send(h.rest));
+    EXPECT_EQ(b.recv_status(), 200);
+    ASSERT_TRUE(a.send(h.rest));
+    EXPECT_EQ(a.recv_status(), 200);
+    a.close();
+    b.close();
+    shutdown();
+    const auto d = pol.decides();
+    ASSERT_EQ(d.size(), 2u);
+    EXPECT_FALSE(d[0].whole);
+    EXPECT_TRUE(d[1].whole);
+    EXPECT_EQ(_gw->stats().streamed_body_capped, 1u);
+    EXPECT_EQ(_gw->stats().policy_head_decisions, 1u);
+    EXPECT_EQ(pol.confirms().size(), 1u);
+}
+
+TEST_P(ProxyHeadDecide, AParkedBodyTakesNoStreamSlot)
+{
+    _stream_body_max = 1;
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .hold = true}, llmbridge::Decision{.allow = true}};
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client a, b;
+    ASSERT_TRUE(a.connect(_proxy_port));
+    ASSERT_TRUE(a.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return pol.decided.load() == 1; }));
+    ASSERT_TRUE(b.connect(_proxy_port));
+    ASSERT_TRUE(b.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; })) << "the parked body took the slot";
+    ASSERT_TRUE(b.send(h.rest));
+    EXPECT_EQ(b.recv_status(), 200);
+    ASSERT_TRUE(a.send(h.rest));
+    EXPECT_EQ(a.recv_status(), 200);
+    a.close();
+    b.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_capped, 0u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+    EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
+}
+
+// A parked body is held to the upload deadline a streamed one is.
+TEST_P(ProxyHeadDecide, AParkedBodyThatStopsComingIsCutAtItsDeadline)
+{
+    _body_timeout_ns = 300'000'000;
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .hold = true}};
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_EQ(c.recv_status(2000), 408);
+    EXPECT_TRUE(c.wait_closed());
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+    EXPECT_EQ(_backend.accepted(), 0);
+    EXPECT_TRUE(pol.confirms().empty());
+}
+
+TEST_P(ProxyHeadDecide, AParkedBodyThatTricklesIsCutAtItsDeadline)
+{
+    _body_timeout_ns = 400'000'000;
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .hold = true}};
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::string r;
+    for (size_t off = 0; r.empty() && off < h.rest.size(); ++off)
+    {
+        if (!c.send(h.rest.substr(off, 1))) break;
+        r = c.recv_response(50);
+    }
+    if (r.empty()) r = c.recv_response(2000);
+    EXPECT_EQ(Client::status_of(r), 408) << r;
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 1u);
+    EXPECT_EQ(_backend.accepted(), 0);
+}
+
+// A client that leaves mid-upload: the venue holding part of its body is reset.
+TEST_P(ProxyHeadDecide, AClientThatLeavesMidBodyResetsTheVenue)
+{
+    HeadPolicy pol;
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    c.close();
+    EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; })) << "the venue was not reset";
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 0);
+    EXPECT_TRUE(pol.confirms().empty());
+}
+
+// ── Its timing (LATENCY.md 2b) ──────────────────────────────────────────────────
+
+// Streamed on a head decision, a body is timed as any streamed body: the decision is ours,
+// inside t0 to t1, and the confirm is part of the body's work after t3.
+TEST_P(ProxyHeadDecide, AStreamedHeadDecisionIsTimedAsAStreamedBody)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    start_with(pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(send_slowly(c, big_request(32, /*json=*/false), 4));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_TRUE(r.body_streamed);
+    EXPECT_GE(r.ts_body_end - r.ts_req_recvd, kUploadNs * 3 / 4) << "t0 is the head";
+    EXPECT_GE(r.client_upload_ns, kUploadNs * 3 / 4);
+    ASSERT_EQ(pol.decides().size(), 1u);
+    EXPECT_GE(pol.decides()[0].at, r.ts_req_recvd);
+    EXPECT_LE(pol.decides()[0].at, r.ts_req_built) << "the decision is outside t0 to t1";
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_GE(pol.confirms()[0].at, r.ts_body_end);
+    EXPECT_LE(pol.confirms()[0].at, r.ts_body_sent) << "the confirm ran after the last byte went";
+    EXPECT_GT(r.body_work_ns, 0);
+    EXPECT_LT(req_path_of(r), kUploadNs / 10);
+    ASSERT_EQ(_gw->stats().req_path.total(), 1u);
+    EXPECT_EQ(_gw->stats().req_path.max(), static_cast<uint64_t>(req_path_of(r)));
+}
+
+// Parked, a body is timed as a held one: t0 is its last byte, so the upload stays the
+// client's, the confirm is inside t0 to t1 and there is no body work.
+TEST_P(ProxyHeadDecide, AParkedBodyIsTimedAsAHeldBody)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .hold = true}};
+    start_with(pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    SentAt at;
+    ASSERT_TRUE(send_slowly(c, big_request(32, /*json=*/false), 4, &at));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_FALSE(r.body_streamed);
+    EXPECT_TRUE(r.decided_on_head);
+    EXPECT_EQ(r.confirm_outcome, llmbridge::ConfirmOutcome::Kept);
+    EXPECT_EQ(r.ts_body_end, r.ts_req_recvd) << "t0 is the last byte, as a held body's";
+    EXPECT_GE(r.ts_req_recvd, at.last);
+    EXPECT_GE(r.client_upload_ns, kUploadNs * 3 / 4);
+    EXPECT_EQ(r.body_work_ns, 0);
+    EXPECT_LT(req_path_of(r), kUploadNs / 10) << "the upload was counted as ours";
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_GE(pol.confirms()[0].at, r.ts_req_recvd);
+    EXPECT_LE(pol.confirms()[0].at, r.ts_req_built);
+    ASSERT_EQ(_gw->stats().req_path.total(), 1u);
+    EXPECT_EQ(_gw->stats().req_path.max(), static_cast<uint64_t>(req_path_of(r)));
+}
+
+// A redo is a fresh attempt, timed as a held body sent at the last byte: nothing the
+// abandoned one did is in its numbers.
+TEST_P(ProxyHeadDecide, ARedoIsTimedAsAFreshAttempt)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.whole = llmbridge::Decision{.allow = true, .upstream_index = 1};
+    start_with(pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(send_slowly(c, big_request(32, /*json=*/false), 4));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_EQ(r.upstream_index, 1);
+    EXPECT_EQ(r.confirm_outcome, llmbridge::ConfirmOutcome::Redone);
+    EXPECT_EQ(r.ts_body_end, r.ts_req_recvd) << "t0 is the last byte";
+    EXPECT_EQ(r.body_work_ns, 0) << "the abandoned attempt's work";
+    EXPECT_GE(r.client_upload_ns, kUploadNs * 3 / 4);
+    EXPECT_GE(r.ts_req_built, r.ts_req_recvd);
+    EXPECT_GE(r.ts_up_sent, r.ts_req_built);
+    EXPECT_GE(r.ts_up_recvd, r.ts_up_sent);
+    EXPECT_LT(req_path_of(r), kUploadNs / 10);
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_GE(pol.confirms()[0].at, r.ts_req_recvd);
+    EXPECT_LE(pol.confirms()[0].at, r.ts_req_built);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyHeadDecide,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));
