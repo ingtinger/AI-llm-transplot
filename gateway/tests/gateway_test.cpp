@@ -3871,7 +3871,7 @@ TEST_P(ProxyStream, AnUpstreamResetWhilePausedDoesNotSpinTheWorker)
     shutdown();
 }
 
-// ── Backpressure: a slow client must pause upstream reads (epoll) ─────────
+// ── Backpressure: a slow client must pause upstream reads ────────────────
 // Deterministic: a tiny client receive window, a pinned gateway send buffer, a
 // multi-MB stream and a client that stalls before reading force the gateway's
 // writes to block, which must engage the pause path, and every byte must still
@@ -3908,12 +3908,7 @@ TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
     c.close();
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u);
-    // epoll implements backpressure by pausing upstream reads; io_uring instead
-    // bounds the buffer (kStreamBufCap), so only assert the counter on epoll.
-    if (GetParam() == llmbridge::IoBackend::Epoll)
-    {
-            EXPECT_GT(_gw->stats().stream_pauses, 0u) << "slow client should have paused upstream reads";
-    }
+    EXPECT_GT(_gw->stats().stream_pauses, 0u) << "slow client should have paused upstream reads";
 }
 
 // ── The idle deadline measures progress on either leg ──────────────────
@@ -7007,6 +7002,39 @@ TEST_P(ProxyForwardStream, TheProvidersEventsArriveUnaltered)
         << "the forwarded body is not the provider's bytes";
 }
 
+// A stream larger than the 8 MiB cap, to a client that stalls before it reads, is
+// paused rather than buffered: it never reaches the cap, and every byte arrives as the
+// provider sent it. io_uring dropped it at the cap before it could pause.
+TEST_P(ProxyForwardStream, ASlowClientsStreamPastTheCapIsPausedAndArrivesWhole)
+{
+    const std::string text(1000, 'x');
+    std::string events;
+    for (int i = 0; i < 12 * 1024; ++i) // ~12.4 MiB
+        events += "data: {\"choices\":[{\"delta\":{\"content\":\"" + text + "\"}}]}\n\n";
+    events += "data: [DONE]\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(events, 16384));
+    _client_sndbuf = 4096;
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), /*idle=*/0);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port, /*rcvbuf=*/4096));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500)); // the client stalls
+    const std::string raw = c.recv_stream(15000);
+    c.close();
+    shutdown();
+
+    const size_t hdr = raw.find("\r\n\r\n");
+    ASSERT_NE(hdr, std::string::npos);
+    std::string body;
+    ASSERT_TRUE(dechunk(std::string_view(raw).substr(hdr + 4), body)) << raw.size() << " bytes arrived";
+    EXPECT_EQ(body.size(), events.size());
+    EXPECT_TRUE(body == events) << "the stream did not arrive as the provider sent it";
+    EXPECT_GT(_gw->stats().stream_pauses, 0u) << "the stalled client paused nothing";
+    EXPECT_EQ(_gw->stats().errors, 0u) << "the stream was dropped";
+}
+
 TEST_P(ProxyForwardStream, ItStreamsRatherThanBufferingToTheEnd)
 {
     // The regression that started this, tested structurally so no clock decides
@@ -8177,11 +8205,6 @@ TEST_P(ProxyPoolHygiene, AnUpstreamPooledAfterASlowStreamStillAnswers)
         nanosleep(&ts, nullptr);
         (void)a.recv_all(15000);
     }
-    if (GetParam() == llmbridge::IoBackend::Epoll)
-    {
-        ASSERT_GT(_gw->stats().stream_pauses, 0u)
-            << "no pause happened, so this test proves nothing";
-    }
 
     // The same shape of request A sent: this gateway translates, and "hello" is not
     // a chat completion. What is under test is whether an answer arrives at all.
@@ -8194,6 +8217,8 @@ TEST_P(ProxyPoolHygiene, AnUpstreamPooledAfterASlowStreamStillAnswers)
     EXPECT_FALSE(resp.empty()) << "the next client's request was never answered: the "
                                   "upstream went back to the pool with reads disarmed";
     EXPECT_EQ(Client::status_of(resp), 200) << resp.substr(0, 200);
+    // Read once the loop is joined: no pause would mean this test proved nothing.
+    EXPECT_GT(_gw->stats().stream_pauses, 0u) << "no pause happened, so this test proves nothing";
 }
 
 // io_uring pooled an upstream that had already sent EOF after its final chunk
