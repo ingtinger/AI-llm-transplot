@@ -18,7 +18,7 @@
 namespace llmbridge::detail
 {
 
-    Decision Engine::policy_decision(Connection* c, const net::http::Message& m) noexcept
+    Decision Engine::policy_decision(ClientConn* c, const net::http::Message& m) noexcept
     {
         // Head, plus the model and two streaming flags and nothing else from the body.
         // This is the line where "metadata only, no prompt text". All three were read
@@ -55,7 +55,7 @@ namespace llmbridge::detail
         return d;
     }
 
-    void Engine::on_client_bytes(Connection* c) noexcept
+    void Engine::on_client_bytes(ClientConn* c) noexcept
     {
         if (c->req.f.phase == Phase::Idle && !c->rbuf.empty()) try_frame(c);
         if (!c->doomed) gate_client_reads(c);
@@ -64,7 +64,7 @@ namespace llmbridge::detail
     // Reading continues while a request is in flight, so this is the only bound on what
     // a client can pipeline behind it. No legal request is larger, so a pause costs a
     // legitimate client nothing; it resumes once its requests drain the buffer.
-    void Engine::gate_client_reads(Connection* c) noexcept
+    void Engine::gate_client_reads(ClientConn* c) noexcept
     {
         const bool over = c->req.f.phase != Phase::Idle && c->rbuf.size() > kMaxClientBuffered;
         if (over == c->read_paused) return;
@@ -77,14 +77,14 @@ namespace llmbridge::detail
         _ops->set_read(*c, !over);
     }
 
-    void Engine::client_gone(Connection* c) noexcept
+    void Engine::client_gone(ClientConn* c) noexcept
     {
         // Mid-request (a reply or stream still owed included) is an abort; idle is normal.
         if (c->req.f.phase != Phase::Idle) abort_pair(c);
         else _ops->close(*c);
     }
 
-    void Engine::send_continue(Connection* c) noexcept
+    void Engine::send_continue(ClientConn* c) noexcept
     {
         // Phase stays Idle, so the send completing finishes nothing.
         c->out.stage().append(kContinue);
@@ -93,7 +93,7 @@ namespace llmbridge::detail
 
     // t0 is stamped before the parse that frames the request, so the parse counts in the
     // request path; a partial request discards it, so network wait never does.
-    void Engine::try_frame(Connection* c) noexcept
+    void Engine::try_frame(ClientConn* c) noexcept
     {
         // A request whose length is known is not re-parsed per read.
         if (c->client_frame_want && c->rbuf.size() < c->client_frame_want) return;
@@ -157,7 +157,7 @@ namespace llmbridge::detail
         dispatch(c);
     }
 
-    void Engine::dispatch(Connection* c) noexcept
+    void Engine::dispatch(ClientConn* c) noexcept
     {
         // Resolved per attempt: a failover may land on a venue of another dialect. The
         // client dialect is read off the request line, back in rbuf for a failover.
@@ -207,7 +207,7 @@ namespace llmbridge::detail
         }
 
         c->req.f.phase = Phase::Dispatched; // from here until a response byte, failover may redo it
-        Connection* u = acquire_upstream(c->upstream_slot);
+        UpstreamConn* u = acquire_upstream(c->upstream_slot);
         if (!u)
         {
             secure_clear(_rebuild); // a credential must not wait in the scratch
@@ -255,7 +255,7 @@ namespace llmbridge::detail
     }
 
     // The staged reply is on the wire: account for it and take the next request.
-    void Engine::finish(Connection* c) noexcept
+    void Engine::finish(ClientConn* c) noexcept
     {
         // Only a staged reply finishes. A drained interim 100 Continue, or a write event
         // with nothing owed, is no request: counting one wiped the real one's state.
@@ -292,7 +292,7 @@ namespace llmbridge::detail
         on_client_bytes(c); // a pipelined next request is framed from rbuf, with no read
     }
 
-    void Engine::respond(Connection* client) noexcept
+    void Engine::respond(ClientConn* client) noexcept
     {
         switch (_ops->send(*client))
         {
@@ -302,38 +302,45 @@ namespace llmbridge::detail
         }
     }
 
-    Connection* Engine::forget(Connection* c) noexcept
+    ConnBase* Engine::forget(ClientConn* c) noexcept
     {
-        Connection* other = unpair(c); // the other leg never keeps a pointer to a freed one
-        if (c->is_client)
-        {
-            _clients->remove(c);
-            LB_DEBUG("close ", *c, " clients=", _clients->size());
-        }
-        else
-        {
-            _pool->remove(*c);
-            _upconns->remove(c);
-            LB_DEBUG("upstream close ", *c, " pool=", pooled_upstream_count()); // after the erase
-        }
+        UpstreamConn* u = unpair(c); // the other leg never keeps a pointer to a freed one
+        _clients->remove(c);
+        LB_DEBUG("close ", *c, " clients=", _clients->size());
         c->doomed = true;
         _doomed->add(c);
-        return c->is_client ? other : nullptr;
+        return u;
     }
 
-    void Engine::abort_pair(Connection* client) noexcept
+    ConnBase* Engine::forget(UpstreamConn* u) noexcept
+    {
+        unpair(u);
+        _pool->remove(*u);
+        _upconns->remove(u);
+        LB_DEBUG("upstream close ", *u, " pool=", pooled_upstream_count()); // after the erase
+        u->doomed = true;
+        _doomed->add(u);
+        return nullptr;
+    }
+
+    ConnBase* Engine::forget(ConnBase& c) noexcept
+    {
+        return visit(c, [this](auto& k) { return forget(&k); });
+    }
+
+    void Engine::abort_pair(ClientConn* client) noexcept
     {
         if (!client) return;
         _ops->close(*client); // and its upstream
         ++_stats.errors;
     }
 
-    void Engine::fail_request(Connection* client, int code, const char* why) noexcept
+    void Engine::fail_request(ClientConn* client, int code, const char* why) noexcept
     {
         if (!upstream_failed(client, code, why)) error_respond(client, code, why);
     }
 
-    void Engine::error_respond(Connection* client, int code, const char* why,
+    void Engine::error_respond(ClientConn* client, int code, const char* why,
                                 const char* detail) noexcept
     {
         if (!client || client->doomed) return;
@@ -350,7 +357,7 @@ namespace llmbridge::detail
             return;
         }
         // We're replying to the client ourselves, so drop any in-flight upstream.
-        if (Connection* u = unpair(client)) _ops->close(*u);
+        if (UpstreamConn* u = unpair(client)) _ops->close(*u);
         append_error(client->out.stage(), code, detail);
         client->req.f.phase = Phase::Replying;
         client->close_after_resp = true; // closes once the reply flushes

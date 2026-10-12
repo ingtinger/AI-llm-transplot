@@ -31,7 +31,8 @@ gateway/    the event-loop proxy that ties net + provider together
   ├─ resolve.cpp        next address after a failed connect, re-resolution thread
   ├─ core/              the one request lifecycle, by concern: client, upstream,
   │                     stream, transport (TLS), sink, sweep, pool; io.hpp is IoOps,
-  │                     conn.hpp Connection, req.hpp a request, limits.hpp constants
+  │                     conn.hpp the two connection kinds, req.hpp a request,
+  │                     limits.hpp constants
   ├─ io/                the backends: EpollIo and UringIo, each its loop and syscalls
   └─ request, response, scan, stream   the helpers, by concern (src/ only)
 app/        the CLI daemon (llmbridge --listen ... --upstream ... --upstream-dialect ...)
@@ -143,7 +144,7 @@ upstream model latencies measured in hundreds of milliseconds.
 
 ### io_uring lifetime handling
 
-The sharp edge of io_uring is object lifetime: a `Connection` can have kernel ops in
+The sharp edge of io_uring is object lifetime: a connection can have kernel ops in
 flight after you'd like to free it. The backend tracks an in-flight op count per
 connection and defers the free until the count reaches zero (a "doomed" list),
 handles multishot CQEs that carry `F_MORE` alongside a terminal result, and re-arms
@@ -181,7 +182,7 @@ sides are symmetric small state machines.
   math over the caller's buffer.
 - **Allocation-light, not allocation-free.** Be precise: the JSON DOM allocates its
   node vectors, each request builds its translated output in a growable `std::string`,
-  and the proxy allocates one `Connection` per accepted socket. These are small, warm,
+  and the proxy allocates one `ClientConn` per accepted socket. These are small, warm,
   per-request allocations (bounded, no bursts) but they are allocations. They are
   not small once a request is: an agent context of 10 MB written into a fresh string
   faulted in 2.6 ms of pages per request on the live tape, which is why the upstream

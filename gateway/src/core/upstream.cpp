@@ -28,7 +28,7 @@ namespace llmbridge::detail
     // What the provider said about its own limits, kept from the response head.
     // Shared by both backends and by the streaming and non-streaming paths, so the
     // four cannot disagree about what a refusal meant.
-    void Engine::note_quota(Connection* client, const net::http::ResponseHead& h) noexcept
+    void Engine::note_quota(ClientConn* client, const net::http::ResponseHead& h) noexcept
     {
         client->req.f.quota_exhausted = static_cast<uint8_t>(h.quota_exhausted);
         client->req.f.retry_after_s = h.retry_after_s;
@@ -36,7 +36,7 @@ namespace llmbridge::detail
 
     // Bedrock is first: a Claude-via-Bedrock response carries x-amzn and
     // Anthropic's own id together, and the AWS one is what CloudTrail indexes.
-    void Engine::note_venue_req_id(Connection* client, std::string_view head) noexcept
+    void Engine::note_venue_req_id(ClientConn* client, std::string_view head) noexcept
     {
         client->req.f.venue_req_id.set({});
         static constexpr std::string_view kNames[] = {"x-amzn-requestid", "request-id",
@@ -50,7 +50,7 @@ namespace llmbridge::detail
         }
     }
 
-    void Engine::note_upstream_rtt(Connection* client, const Connection* u) noexcept
+    void Engine::note_upstream_rtt(ClientConn* client, const UpstreamConn* u) noexcept
     {
         // At the head, when the venue has acknowledged the whole request, and on the
         // socket under TLS. One getsockopt, after t4 is stamped so it is not inside it.
@@ -59,7 +59,7 @@ namespace llmbridge::detail
         client->req.f.upstream_min_rtt_us = rtt.min_us;
     }
 
-    void Engine::note_upstream_error(Connection* client, const net::http::ResponseHead& h,
+    void Engine::note_upstream_error(ClientConn* client, const net::http::ResponseHead& h,
                                       std::string_view body) noexcept
     {
         client->req.f.upstream_error.set({});
@@ -68,7 +68,7 @@ namespace llmbridge::detail
         client->req.f.upstream_error.set(scan_error_type(body));
     }
 
-    bool Engine::pool_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept
+    bool Engine::pool_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept
     {
         using R = UpstreamPool::Refusal;
         switch (_pool->release(*u, keep_alive, body_ended, upstream_request_sent(u), now_ns()))
@@ -90,28 +90,27 @@ namespace llmbridge::detail
         }
     }
 
-    Connection* Engine::new_upstream(int slot) noexcept
+    UpstreamConn* Engine::new_upstream(int slot) noexcept
     {
         // The venue's address now, never a cached one: the ip may have rotated. One
         // that does not parse fails the acquire, on both backends.
         const Upstream& up = _upstreams[static_cast<size_t>(slot)];
         sockaddr_in addr{};
         if (!net::resolve_ipv4(up.ip.c_str(), up.port, addr)) return nullptr;
-        Connection* u = new Connection();
-        u->is_client = false;
-        u->upstream_slot = slot;   // the pool, the venue and the TLS name all index this
-        u->ts_accepted = now_ns(); // the connect deadline counts from here
+        auto* u = new UpstreamConn();
+        u->venue = slot;
+        u->ts_opened = now_ns();
         u->up_addr = addr;
         u->rbuf.reserve(kInitialBuf);
         return u;
     }
 
-    Connection* Engine::acquire_upstream(int slot) noexcept
+    UpstreamConn* Engine::acquire_upstream(int slot) noexcept
     {
         // Only this venue's pool: a connection to one provider cannot serve a request
         // bound for another, and handing one over would send the request, and its
         // credential, to the wrong company.
-        if (Connection* u = _pool->acquire(slot))
+        if (UpstreamConn* u = _pool->acquire(slot))
         {
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
             u->ts_pool_taken = now_ns();
@@ -119,7 +118,7 @@ namespace llmbridge::detail
             ++_stats.upstream_reused;
             return u;
         }
-        Connection* u = new_upstream(slot);
+        UpstreamConn* u = new_upstream(slot);
         if (!u) return nullptr;
         adopt_warm(u);
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -142,17 +141,17 @@ namespace llmbridge::detail
         return u;
     }
 
-    bool Engine::retry_upstream(Connection* u) noexcept
+    bool Engine::retry_upstream(UpstreamConn* u) noexcept
     {
         // A pooled reuse, not yet retried, that failed before any response byte: the
         // provider almost certainly dropped it idle without running the request.
         if (!u->from_pool || u->retried) return false;
         if (now_ns() - u->ts_pool_taken > kStaleRetryWindowNs) return false; // may have run
-        Connection* client = u->peer;
+        ClientConn* client = u->client;
         if (!client || !client->req.can_redispatch()) return false; // a response byte arrived
         // The same venue: a retry that lands elsewhere is a silent reroute, and the
         // request was translated for this dialect and carries its credential.
-        Connection* uf = new_upstream(u->upstream_slot);
+        UpstreamConn* uf = new_upstream(u->venue);
         if (!uf) return false;
         uf->retried = true; // this request's one allowed retry is now spent
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -181,7 +180,7 @@ namespace llmbridge::detail
         return true;
     }
 
-    void Engine::release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept
+    void Engine::release_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept
     {
         if (!pool_upstream(u, keep_alive, body_ended))
         {
@@ -194,23 +193,23 @@ namespace llmbridge::detail
     }
 
     // One decision and one log text per cause, on both backends.
-    void Engine::upstream_lost(Connection* u, UpFail f) noexcept
+    void Engine::upstream_lost(UpstreamConn* u, UpFail f) noexcept
     {
         static constexpr const char* kWhy[] = {"upstream EOF", "upstream TLS failed", "upstream write failed"};
         static constexpr const char* kExhausted[] = {"upstream EOF, retry exhausted",
                                                      "upstream TLS failed, retry exhausted",
                                                      "upstream write failed, retry exhausted"};
         const auto i = static_cast<size_t>(f);
-        Connection* client = u->peer;
+        ClientConn* client = u->client;
         if (!client) return _ops->close(*u); // an idle pooled connection the venue dropped
         if (retry_upstream(u)) return;
         if (!upstream_failed(client, 502, kWhy[i])) error_respond(client, 502, kExhausted[i]);
     }
 
-    void Engine::on_upstream_eof(Connection* u, bool tls_failed) noexcept
+    void Engine::on_upstream_eof(UpstreamConn* u, bool tls_failed) noexcept
     {
         u->peer_eof = true; // never pooled now, whatever finishes the exchange
-        Connection* client = u->peer;
+        ClientConn* client = u->client;
         if (client && client->req.f.streaming)
         {
             // Only a real EOF may end a close-delimited stream: a corrupt one that ends
@@ -223,9 +222,9 @@ namespace llmbridge::detail
 
     // New bytes in `u->rbuf`. The head is parsed once, by the framer; its Body kind
     // frames the rest, streamed or whole.
-    void Engine::on_upstream_bytes(Connection* u) noexcept
+    void Engine::on_upstream_bytes(UpstreamConn* u) noexcept
     {
-        Connection* client = u->peer;
+        ClientConn* client = u->client;
         // Stray bytes on an idle pooled upstream are the tail of an exchange that is
         // over; kept, they would be the next client's response.
         if (!client) return _ops->close(*u);
@@ -264,10 +263,10 @@ namespace llmbridge::detail
         on_response(u, h, r.body, r.total_len);
     }
 
-    void Engine::on_response(Connection* u, const net::http::ResponseHead& h,
+    void Engine::on_response(UpstreamConn* u, const net::http::ResponseHead& h,
                               std::string_view body, size_t total_len) noexcept
     {
-        Connection* client = u->peer;
+        ClientConn* client = u->client;
         // Pooled only if it stays open: the response says keep-alive and, for a
         // byte-forward that relayed the client's Connection header, the client did too.
         const bool keep_alive = h.keep_alive && (client->req.f.translate_body || client->msg.keep_alive);
@@ -321,14 +320,14 @@ namespace llmbridge::detail
         respond(client);
     }
 
-    bool Engine::upstream_failed(Connection* client, int status, const char* why) noexcept
+    bool Engine::upstream_failed(ClientConn* client, int status, const char* why) noexcept
     {
         const Retry r = failover_target(client, status, why);
         if (!r.retry) return false;
 
         LB_WARN(ReqId{client->req.f.req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),
                 " failed (", why, "); retrying on ", static_cast<int64_t>(r.upstream_index));
-        if (Connection* u = unpair(client)) _ops->close(*u);
+        if (UpstreamConn* u = unpair(client)) _ops->close(*u);
         ++client->req.f.failover_attempts;
         client->upstream_slot = r.upstream_index;
         // The original request back at the front of rbuf. The forward rebuilds it for the
@@ -340,7 +339,7 @@ namespace llmbridge::detail
         return true;
     }
 
-    Retry Engine::failover_target(Connection* client, int status, const char* why) noexcept
+    Retry Engine::failover_target(ClientConn* client, int status, const char* why) noexcept
     {
         // Every precondition here is about safety, not policy. Re-sending a request the
         // client has already begun receiving would duplicate output; re-sending one we

@@ -21,7 +21,7 @@ namespace llmbridge::detail
 
     // Token counts cannot be read from a compressed stream. request_without drops
     // Accept-Encoding, so the provider compressed unasked; say so.
-    void Engine::stream_warn_if_encoded(const Connection* client,
+    void Engine::stream_warn_if_encoded(const ClientConn* client,
                                          const net::http::ResponseHead& h) noexcept
     {
         if (!h.encoded) return;
@@ -33,7 +33,7 @@ namespace llmbridge::detail
     // request-path and the handshake do not care what shape the response takes, so a
     // stream records them like any other request. resp_path and added-total it cannot
     // have: both end at the instant a response was built. See LATENCY.md section 4.
-    void Engine::stream_record_latency(const Connection* client) noexcept
+    void Engine::stream_record_latency(const ClientConn* client) noexcept
     {
         if (now_ns() - _t_start < _warmup_ns) return;
         // t4 stands in for the absent t5; only the request-side fields are read.
@@ -51,9 +51,9 @@ namespace llmbridge::detail
 
     // The upstream answered text/event-stream: stage the client's SSE head, then
     // translate or forward the body as it arrives.
-    void Engine::begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept
+    void Engine::begin_stream(UpstreamConn* u, const net::http::ResponseHead& h) noexcept
     {
-        Connection* client = u->peer;
+        ClientConn* client = u->client;
         client->req.f.streaming = true;
         client->req.f.stream_body = h.body; // it alone says where the body ends
         client->req.f.stream_left = h.content_length;
@@ -89,9 +89,9 @@ namespace llmbridge::detail
     }
 
     // New body bytes in `u->rbuf`: translate or forward them into the client's buffer.
-    void Engine::stream_pump(Connection* u) noexcept
+    void Engine::stream_pump(UpstreamConn* u) noexcept
     {
-        Connection* client = u->peer;
+        ClientConn* client = u->client;
         if (!client) return _ops->close(*u);
         const StreamStep st = stream_step(client, u->rbuf, client->out.stage(), /*at_eof=*/false);
         // Truncate honestly: flush what was translated, with no fabricated [DONE].
@@ -110,14 +110,14 @@ namespace llmbridge::detail
     // Write what the stream owes the client. Behind a slow client a backend that can
     // pauses the upstream's reads (GATEWAY-INTERNALS.md 6c); a stream that ended and
     // drained finalizes.
-    void Engine::stream_flush(Connection* client) noexcept
+    void Engine::stream_flush(ClientConn* client) noexcept
     {
         const uint64_t sent = client->sent_bytes;
         const Sent s = _ops->send(*client);
         // A client draining a paused stream is progress, though the upstream is silent.
         if (client->sent_bytes != sent) client->req.f.ts_progress = now_ns();
         if (s == Sent::Failed) return abort_pair(client);
-        Connection* u = client->peer;
+        UpstreamConn* u = client->up;
         const bool pausable = _stream_backpressure && u && !u->doomed;
         if (s == Sent::Queued)
         {
@@ -141,9 +141,9 @@ namespace llmbridge::detail
 
     // The upstream closed: translate what remains, emit the terminal [DONE] if the
     // framing allows, and flush toward the finalize.
-    void Engine::stream_on_upstream_eof(Connection* u) noexcept
+    void Engine::stream_on_upstream_eof(UpstreamConn* u) noexcept
     {
-        Connection* client = u->peer;
+        ClientConn* client = u->client;
         if (!client)
         {
             _ops->close(*u);
@@ -157,11 +157,11 @@ namespace llmbridge::detail
         stream_flush(client);
     }
 
-    void Engine::finalize_stream(Connection* client) noexcept
+    void Engine::finalize_stream(ClientConn* client) noexcept
     {
         // Reuse is the whole point: a streaming request otherwise costs a fresh
         // upstream connect, the dominant term in time-to-first-token.
-        if (Connection* u = unpair(client))
+        if (UpstreamConn* u = unpair(client))
             release_upstream(u, stream_keeps_upstream(client), stream_body_ended(client));
         // The stream's outcome, size and tokens. `close_after_resp` here means
         // truncated: no [DONE], which the client cannot tell from a clean finish.
@@ -191,7 +191,7 @@ namespace llmbridge::detail
         on_client_bytes(client); // a pipelined next request may already be in rbuf
     }
 
-    void Engine::stream_truncate(Connection* client) noexcept
+    void Engine::stream_truncate(ClientConn* client) noexcept
     {
         // One call for the three mutations and the log line: GATEWAY-INTERNALS.md 6b.
         // CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTheClient guards

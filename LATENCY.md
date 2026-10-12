@@ -101,7 +101,7 @@ for the one header that has to correlate with the outside world.
 ### The stamps in code
 
 The `ts_*` identifiers are the stable names; t0–t6 is shorthand used in comments
-and in this document. Every stamp is a `Connection` member except the last two,
+and in this document. Every stamp is a `ReqState` member except the last two,
 which are locals; nothing outlives the request that needs them.
 
 Stamps are named by the **function** that assigns them. Most are taken in shared
@@ -115,7 +115,7 @@ assigns the stamp attributed to it.
 | **t0** | `ts_req_recvd` | `ReqState` | the client's request is fully framed. Taken just **before** the parse that frames it, on both backends, so the parse is request-path work; a parse that finds the request incomplete discards it, so network wait is never charged | `try_frame` (shared) |
 | **t1** | `ts_req_built` | `ReqState` | the upstream request bytes exist: translation, auth mapping and re-serialisation done, nothing sent | `dispatch` (shared) |
 | **t2** | `ts_wire_ready` | `ReqState` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `dispatch`, `tls_feed` (shared), `EpollIo::on_upstream_writable` / `UringIo::on_connect` |
-| **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel. Several sites (plaintext, TLS-flushed, partial-write completion) all meaning "fully sent" | `dispatch` (shared), `EpollIo::on_upstream_writable`, `EpollIo::tls_drain_read` / `UringIo::on_send` |
+| **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel. Several sites (plaintext, TLS-flushed, partial-write completion) all meaning "fully sent" | `dispatch` (shared), `EpollIo::on_upstream_writable`, `EpollIo::tls_drain_read` / `UringIo::drained` |
 | **t4** | `ts_up_recvd` | `ReqState` | the provider's response arrived. **Non-streaming:** the body is framed, stamped at the start of the read that completed it, before the parse, on both backends. **Streaming:** the response *head* is framed, before any data chunk (see §3; this is not the first token) | `on_upstream_bytes` (shared) |
 | **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `on_response` (shared) |
 | **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `finish` (shared) |
@@ -123,7 +123,7 @@ assigns the stamp attributed to it.
 **Two stamps sit outside the scheme, deliberately.** `ts_accepted` is taken when
 the client connection is accepted, which is before t0 and on a different clock
 of relevance: t0–t6 describe one request, and `ts_accepted` belongs to the
-Connection that carries it. It feeds two things and neither is a request
+`ClientConn` that carries it. It feeds two things and neither is a request
 interval: the client setup deadline in `sweep_idle`, and the `accept(TLS)`
 histogram (§4), stamped where the inbound handshake completes in `tls_feed`. Do
 not add it to the table above; a per-connection stamp in a per-request scheme is

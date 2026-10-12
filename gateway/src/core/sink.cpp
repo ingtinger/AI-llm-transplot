@@ -50,7 +50,7 @@ namespace llmbridge::detail
         }
     }
 
-    void Engine::sink_capture(Connection* c) noexcept
+    void Engine::sink_capture(ClientConn* c) noexcept
     {
         // The request buffer is reused long before completion, so the sink's header
         // values are copied now, bounded, and the wall clock (the cross-process
@@ -67,7 +67,7 @@ namespace llmbridge::detail
     // a policy installed. A stock build parses nothing here, as before.
     // Split out of sink_capture because a policy needs it too and needs it before the
     // decision, while sink_capture's other work is only ever read at the end.
-    const char* Engine::capture_model(Connection* c) noexcept
+    const char* Engine::capture_model(ClientConn* c) noexcept
     {
         const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
         // One walk of the top level for everything a policy or the sink reads: a key
@@ -97,7 +97,7 @@ namespace llmbridge::detail
         return nullptr;
     }
 
-    void Engine::sink_emit(Connection* c, int status, bool streamed) noexcept
+    void Engine::sink_emit(ClientConn* c, int status, bool streamed) noexcept
     {
         RequestRecord r;
         r.seq = c->req.f.req_seq;

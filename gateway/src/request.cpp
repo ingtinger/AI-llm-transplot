@@ -429,7 +429,7 @@ namespace llmbridge::detail
         return f;
     }
 
-    TranslationPlan resolve_dialect(const Connection* c, const Upstream& venue) noexcept
+    TranslationPlan resolve_dialect(const ClientConn* c, const Upstream& venue) noexcept
     {
         const std::string_view head(c->rbuf.data(), c->msg.header_len);
         const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);

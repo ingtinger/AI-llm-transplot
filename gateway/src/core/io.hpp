@@ -13,7 +13,9 @@
 
 namespace llmbridge
 {
-    struct Connection;
+    struct ConnBase;
+    struct ClientConn;
+    struct UpstreamConn;
 }
 
 namespace llmbridge::detail
@@ -38,12 +40,12 @@ namespace llmbridge::detail
     class IoOps
     {
       public:
-        virtual Sent send(Connection& c) noexcept = 0;
+        virtual Sent send(ConnBase& c) noexcept = 0;
         /// Open a fresh upstream's socket and start connecting; false: nothing is open.
-        virtual bool connect(Connection& u) noexcept = 0;
-        virtual void set_read(Connection& c, bool on) noexcept = 0;
+        virtual bool connect(UpstreamConn& u) noexcept = 0;
+        virtual void set_read(ConnBase& c, bool on) noexcept = 0;
         /// `c`, and a client's upstream with it; freed once no event can reach it.
-        virtual void close(Connection& c) noexcept = 0;
+        virtual void close(ConnBase& c) noexcept = 0;
 
       protected:
         ~IoOps() = default;

@@ -60,7 +60,7 @@ namespace llmbridge::detail
 
     /// The venue was sent HEAD, so its response has no body. Only a byte-forward keeps
     /// the client's method; a translated request is always a POST.
-    [[nodiscard]] inline bool sent_head(const Connection& c) noexcept
+    [[nodiscard]] inline bool sent_head(const ClientConn& c) noexcept
     {
         return c.msg.head && !c.req.f.translate_body;
     }
@@ -76,7 +76,7 @@ namespace llmbridge::detail
     /// once per request.
     [[nodiscard]] provider::TopLevelFacts body_facts(std::string_view head,
                                                      std::string_view body) noexcept;
-    TranslationPlan resolve_dialect(const Connection* c, const Upstream& venue) noexcept;
+    TranslationPlan resolve_dialect(const ClientConn* c, const Upstream& venue) noexcept;
     const char* translate_failure(std::string_view body) noexcept;
     const char* dialect_name(UpstreamDialect m) noexcept;
     void append_http(std::string& out, std::string_view start_line, std::string_view body,

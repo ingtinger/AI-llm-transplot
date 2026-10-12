@@ -39,34 +39,34 @@ namespace llmbridge
         {
             e.attach(&io, IoCaps{.stream_backpressure = backpressure});
         }
-        Connection* client()
+        ClientConn* client()
         {
-            auto* c = new Connection();
+            auto* c = new ClientConn();
             c->fd = ::eventfd(0, EFD_CLOEXEC);
             c->id = 1;
             e._clients->add(c);
             return c;
         }
         /// Connected and registered, as a pooled or freshly connected one would be.
-        Connection* upstream(int slot = 0)
+        UpstreamConn* upstream(int slot = 0)
         {
-            Connection* u = e.new_upstream(slot);
+            UpstreamConn* u = e.new_upstream(slot);
             u->fd = ::eventfd(0, EFD_CLOEXEC);
             u->connected = u->wire_ready = true;
             e._upconns->add(u);
             return u;
         }
         /// A backend's close, less the fd, which closes at teardown.
-        void forget(Connection& c)
+        void forget(ConnBase& c)
         {
             if (c.doomed) return;
-            if (Connection* other = e.forget(&c)) forget(*other);
+            if (ConnBase* other = e.forget(c)) forget(*other);
         }
         /// A request framed on `c` and dispatched on `u`, its bytes on `u`'s wire.
-        void dispatch(Connection* c, Connection* u)
+        void dispatch(ClientConn* c, UpstreamConn* u)
         {
             c->req.begin(7);
-            c->upstream_slot = u->upstream_slot;
+            c->upstream_slot = u->venue;
             c->msg.keep_alive = c->msg.http_1_1 = true;
             c->req.f.phase = Phase::Dispatched;
             u->out.stage() = "POST / HTTP/1.1\r\n\r\n";
@@ -74,20 +74,20 @@ namespace llmbridge
             pair(c, u);
         }
 
-        void error_respond(Connection* c, int code) { e.error_respond(c, code, "test"); }
-        Connection* acquire(int slot) { return e.acquire_upstream(slot); }
-        bool retry(Connection* u) { return e.retry_upstream(u); }
-        void release(Connection* u, bool keep_alive) { e.release_upstream(u, keep_alive, true); }
-        bool failover(Connection* c) { return e.upstream_failed(c, 502, "test"); }
-        void begin_stream(Connection* u, const net::http::ResponseHead& h) { e.begin_stream(u, h); }
-        void upstream_eof(Connection* u) { e.stream_on_upstream_eof(u); }
-        void finalize(Connection* c) { e.finalize_stream(c); }
-        void abort_pair(Connection* c) { e.abort_pair(c); }
-        void bytes(Connection* c) { e.on_client_bytes(c); }
-        void upstream_bytes(Connection* u) { e.on_upstream_bytes(u); }
-        void flush(Connection* c) { e.stream_flush(c); }
-        void pump(Connection* u) { e.stream_pump(u); }
-        void gone(Connection* c) { e.client_gone(c); }
+        void error_respond(ClientConn* c, int code) { e.error_respond(c, code, "test"); }
+        UpstreamConn* acquire(int slot) { return e.acquire_upstream(slot); }
+        bool retry(UpstreamConn* u) { return e.retry_upstream(u); }
+        void release(UpstreamConn* u, bool keep_alive) { e.release_upstream(u, keep_alive, true); }
+        bool failover(ClientConn* c) { return e.upstream_failed(c, 502, "test"); }
+        void begin_stream(UpstreamConn* u, const net::http::ResponseHead& h) { e.begin_stream(u, h); }
+        void upstream_eof(UpstreamConn* u) { e.stream_on_upstream_eof(u); }
+        void finalize(ClientConn* c) { e.finalize_stream(c); }
+        void abort_pair(ClientConn* c) { e.abort_pair(c); }
+        void bytes(ClientConn* c) { e.on_client_bytes(c); }
+        void upstream_bytes(UpstreamConn* u) { e.on_upstream_bytes(u); }
+        void flush(ClientConn* c) { e.stream_flush(c); }
+        void pump(UpstreamConn* u) { e.stream_pump(u); }
+        void gone(ClientConn* c) { e.client_gone(c); }
         const Stats& stats() const { return g.stats(); }
         size_t pooled() const { return g.pooled_upstream_count(); }
     };
@@ -95,7 +95,10 @@ namespace llmbridge
 
 namespace
 {
-    using llmbridge::Connection;
+    using llmbridge::ClientConn;
+    using llmbridge::ConnBase;
+    using llmbridge::ConnKind;
+    using llmbridge::UpstreamConn;
     using llmbridge::Gateway;
     using llmbridge::GatewayCoreTest;
     using llmbridge::Phase;
@@ -110,29 +113,30 @@ namespace
         Sent next_send = Sent::Done;
         bool connect_ok = true;
 
-        Sent send(Connection& c) noexcept override
+        Sent send(ConnBase& c) noexcept override
         {
-            calls.push_back(c.is_client ? "send client" : "send upstream");
+            calls.push_back(c.kind == ConnKind::Client ? "send client" : "send upstream");
             if (next_send != Sent::Done) return next_send;
             const size_t n = c.out.wire().size();
             c.out.sent(n);
             c.sent_bytes += n;
             return Sent::Done;
         }
-        bool connect(Connection& u) noexcept override
+        bool connect(UpstreamConn& u) noexcept override
         {
             calls.push_back("connect");
             if (!connect_ok) return false;
             u.fd = ::eventfd(0, EFD_CLOEXEC);
             return true;
         }
-        void set_read(Connection& c, bool on) noexcept override
+        void set_read(ConnBase& c, bool on) noexcept override
         {
-            calls.push_back(std::string(on ? "resume " : "pause ") + (c.is_client ? "client" : "upstream"));
+            calls.push_back(std::string(on ? "resume " : "pause ") +
+                            (c.kind == ConnKind::Client ? "client" : "upstream"));
         }
-        void close(Connection& c) noexcept override
+        void close(ConnBase& c) noexcept override
         {
-            calls.push_back(c.is_client ? "close client" : "close upstream");
+            calls.push_back(c.kind == ConnKind::Client ? "close client" : "close upstream");
             _t.forget(c);
         }
 
@@ -166,10 +170,27 @@ namespace
         void SetUp() override { t.attach(io, /*backpressure=*/true); }
     };
 
+    // Either side of an unpair leaves both links clear: a link is never one-sided.
+    TEST_F(Core, PairAndUnpairWriteBothDirections)
+    {
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
+        llmbridge::pair(c, u);
+        EXPECT_EQ(c->up, u);
+        EXPECT_EQ(u->client, c);
+        EXPECT_EQ(llmbridge::unpair(c), u);
+        EXPECT_EQ(c->up, nullptr);
+        EXPECT_EQ(u->client, nullptr);
+        llmbridge::pair(c, u);
+        EXPECT_EQ(llmbridge::unpair(u), c);
+        EXPECT_EQ(c->up, nullptr);
+        EXPECT_EQ(u->client, nullptr);
+    }
+
     TEST_F(Core, AnErrorReplyIsStagedOnceAndFinishesWhenItIsOnTheWire)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         t.error_respond(c, 502);
         EXPECT_TRUE(u->doomed) << "an abandoned upstream is closed, never pooled";
@@ -184,7 +205,7 @@ namespace
     // failure must not stage a second reply behind the first, and nothing finishes.
     TEST_F(Core, ASlowClientsQueuedReplyIsNeverFollowedByASecondOne)
     {
-        Connection* c = t.client();
+        ClientConn* c = t.client();
         io.next_send = Sent::Queued;
         t.error_respond(c, 400);
         EXPECT_EQ(io.calls, (std::vector<std::string>{"send client"}));
@@ -199,7 +220,7 @@ namespace
 
     TEST_F(Core, ASendThatFailsAbortsThePair)
     {
-        Connection* c = t.client();
+        ClientConn* c = t.client();
         io.next_send = Sent::Failed;
         t.error_respond(c, 400);
         EXPECT_TRUE(c->doomed);
@@ -208,8 +229,8 @@ namespace
 
     TEST_F(Core, ARequestStillQueuedForTheUpstreamKeepsItOutOfThePool)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         u->out.stage() += "more request bytes";
         unpair(c);
@@ -221,7 +242,7 @@ namespace
 
     TEST_F(Core, APooledUpstreamIsReadableWhereABackendPausesStreams)
     {
-        Connection* u = t.upstream();
+        UpstreamConn* u = t.upstream();
         t.release(u, /*keep_alive=*/true);
         EXPECT_EQ(t.pooled(), 1u);
         EXPECT_EQ(io.calls, (std::vector<std::string>{"resume upstream"}));
@@ -235,14 +256,14 @@ namespace
 
     TEST_F(Core, AcquireTakesThePooledConnectionBeforeOpeningOne)
     {
-        Connection* u = t.upstream();
+        UpstreamConn* u = t.upstream();
         t.release(u, true);
         io.calls.clear();
         EXPECT_EQ(t.acquire(0), u);
         EXPECT_TRUE(u->from_pool);
         EXPECT_TRUE(io.calls.empty());
 
-        Connection* fresh = t.acquire(0);
+        UpstreamConn* fresh = t.acquire(0);
         ASSERT_NE(fresh, nullptr);
         EXPECT_FALSE(fresh->from_pool);
         EXPECT_GE(fresh->fd, 0);
@@ -252,24 +273,24 @@ namespace
 
     TEST_F(Core, AConnectThatFailsAtOnceLeavesNothingBehind)
     {
-        const long live = Connection::s_live.load();
+        const long live = ConnBase::s_live.load();
         io.connect_ok = false;
         EXPECT_EQ(t.acquire(0), nullptr);
-        EXPECT_EQ(Connection::s_live.load(), live);
+        EXPECT_EQ(ConnBase::s_live.load(), live);
         EXPECT_EQ(t.stats().upstream_conns_opened, 0u);
     }
 
     TEST_F(Core, AStalePooledUpstreamIsRetriedOnceOnAFreshConnection)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.release(u, true);
         ASSERT_EQ(t.acquire(0), u);
         t.dispatch(c, u);
         const std::string request = u->out.bytes();
 
         ASSERT_TRUE(t.retry(u));
-        Connection* fresh = c->peer;
+        UpstreamConn* fresh = c->up;
         ASSERT_NE(fresh, nullptr);
         EXPECT_NE(fresh, u);
         EXPECT_TRUE(u->doomed);
@@ -281,14 +302,14 @@ namespace
 
     TEST_F(Core, NoRetryOnceAResponseByteArrived)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.release(u, true);
         ASSERT_EQ(t.acquire(0), u);
         t.dispatch(c, u);
         c->req.f.phase = Phase::Responding;
         EXPECT_FALSE(t.retry(u));
-        EXPECT_EQ(c->peer, u);
+        EXPECT_EQ(c->up, u);
     }
 
     TEST(CoreFailover, ARequestThatFailedBeforeAnyResponseIsForwardedToTheNextVenue)
@@ -300,17 +321,17 @@ namespace
         GatewayCoreTest t{gw};
         FakeIo io{t};
         t.attach(io, true);
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         c->req.saved = "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
         ASSERT_EQ(llmbridge::net::http::parse_request(c->req.saved, c->msg),
                   llmbridge::net::http::FrameStatus::Complete);
         ASSERT_TRUE(t.failover(c));
         EXPECT_TRUE(u->doomed);
-        ASSERT_NE(c->peer, nullptr);
-        EXPECT_EQ(c->peer->upstream_slot, 1) << "the request is dispatched again, to venue 1";
-        EXPECT_EQ(c->peer->out.bytes().rfind("POST /v1/chat/completions", 0), 0u);
+        ASSERT_NE(c->up, nullptr);
+        EXPECT_EQ(c->up->venue, 1) << "the request is dispatched again, to venue 1";
+        EXPECT_EQ(c->up->out.bytes().rfind("POST /v1/chat/completions", 0), 0u);
         EXPECT_EQ(io.calls, (std::vector<std::string>{"close upstream", "connect"}));
         EXPECT_EQ(t.stats().upstream_failovers, 1u);
 
@@ -320,8 +341,8 @@ namespace
 
     TEST_F(Core, AStreamStagesItsHeadAndPumps)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         u->rbuf = "HTTP/1.1 200 OK\r\n\r\ndata: x\n\n";
         llmbridge::net::http::ResponseHead h;
@@ -340,8 +361,8 @@ namespace
 
     TEST_F(Core, AnUpstreamEofEndsACloseDelimitedStreamAndClosesTheUpstream)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         c->req.f.streaming = true;
         c->req.f.phase = Phase::Streaming;
@@ -357,8 +378,8 @@ namespace
 
     TEST_F(Core, AChunkedStreamCutByEofIsTruncated)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         c->req.f.streaming = true;
         c->req.f.stream_body = llmbridge::net::http::Body::Chunked;
@@ -371,8 +392,8 @@ namespace
 
     TEST_F(Core, AFinishedStreamPoolsItsUpstreamAndReframes)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         c->req.f.streaming = c->req.f.stream_chunked_out = true;
         c->req.f.stream_body = llmbridge::net::http::Body::Chunked;
@@ -380,7 +401,7 @@ namespace
         std::string sse;
         ASSERT_TRUE(c->req.chunkdec.feed(std::string("0\r\n\r\n"), sse));
         t.finalize(c);
-        EXPECT_EQ(c->peer, nullptr);
+        EXPECT_EQ(c->up, nullptr);
         EXPECT_EQ(t.pooled(), 1u);
         EXPECT_EQ(c->req.f.phase, Phase::Idle);
         EXPECT_EQ(t.stats().requests, 1u);
@@ -389,8 +410,8 @@ namespace
 
     TEST_F(Core, ATruncatedStreamClosesTheClient)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         c->req.f.streaming = c->req.f.stream_chunked_out = c->req.f.stream_ended = true;
         c->close_after_resp = true;
@@ -402,8 +423,8 @@ namespace
 
     TEST_F(Core, AbortClosesBothLegsAndCountsOneError)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         t.abort_pair(c);
         EXPECT_TRUE(c->doomed);
@@ -416,8 +437,8 @@ namespace
     // closed, and resumes once its request finishes and the buffer drains.
     TEST_F(Core, PipeliningPastTheCapPausesReadsInsteadOfClosing)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         c->rbuf.assign(llmbridge::detail::kMaxClientBuffered + 1, 'x');
         t.bytes(c);
@@ -438,7 +459,7 @@ namespace
 
     TEST_F(Core, AnIdleClientIsNeverPausedWhateverItBuffered)
     {
-        Connection* c = t.client();
+        ClientConn* c = t.client();
         c->rbuf = "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n";
         t.bytes(c);
         EXPECT_FALSE(io.called("pause client"));
@@ -448,7 +469,7 @@ namespace
     // finishes nothing, because the request is not framed yet.
     TEST_F(Core, AnInterimContinueIsStagedAndSentAndFinishesNothing)
     {
-        Connection* c = t.client();
+        ClientConn* c = t.client();
         io.next_send = Sent::Queued;
         c->rbuf = "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n";
         t.bytes(c);
@@ -463,12 +484,12 @@ namespace
     // its request stood; one that leaves between requests is not.
     TEST_F(Core, AClientGoneMidReplyIsAnErrorAndAnIdleOneIsNot)
     {
-        Connection* idle = t.client();
+        ClientConn* idle = t.client();
         t.gone(idle);
         EXPECT_TRUE(idle->doomed);
         EXPECT_EQ(t.stats().errors, 0u);
 
-        Connection* c = t.client();
+        ClientConn* c = t.client();
         c->req.f.phase = Phase::Replying; // reply staged, upstream already released
         t.gone(c);
         EXPECT_TRUE(c->doomed);
@@ -477,10 +498,10 @@ namespace
 
     TEST_F(Core, AFramedRequestIsDispatchedWithT0StampedBeforeTheParse)
     {
-        Connection* c = t.client();
+        ClientConn* c = t.client();
         c->rbuf = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
         t.bytes(c);
-        ASSERT_NE(c->peer, nullptr);
+        ASSERT_NE(c->up, nullptr);
         EXPECT_EQ(c->req.f.phase, Phase::Dispatched);
         EXPECT_GT(c->req.f.ts_req_recvd, 0);
         EXPECT_LE(c->req.f.ts_req_recvd, c->req.f.ts_req_built);
@@ -488,7 +509,7 @@ namespace
         EXPECT_EQ(io.calls, (std::vector<std::string>{"connect"})) << "a cold upstream sends on connect";
     }
     /// A streaming request in flight on `c` and `u`, the SSE head already sent.
-    void streaming(Connection* c, Connection* u, llmbridge::net::http::Body body, uint64_t len = 0)
+    void streaming(ClientConn* c, UpstreamConn* u, llmbridge::net::http::Body body, uint64_t len = 0)
     {
         c->req.f.streaming = true;
         c->req.f.phase = Phase::Streaming;
@@ -502,8 +523,8 @@ namespace
     // once per episode, and resumes when the client drains. T1 without a kernel.
     TEST_F(Core, ASlowClientPausesItsStreamsUpstreamAndADrainResumesIt)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         streaming(c, u, llmbridge::net::http::Body::UntilClose);
         io.next_send = Sent::Queued;
@@ -528,8 +549,8 @@ namespace
         FakeIo capped{t};
         t.attach(capped, /*backpressure=*/false);
         capped.next_send = Sent::Queued;
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         streaming(c, u, llmbridge::net::http::Body::UntilClose);
         u->rbuf.assign(1 << 20, 'x');
@@ -549,8 +570,8 @@ namespace
     // open, and the upstream is pooled: nothing waits for an EOF that never comes.
     TEST_F(Core, AContentLengthStreamEndsAtItsLastByteWithoutEof)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         const std::string body = "data: x\n\ndata: [DONE]\n\n";
         streaming(c, u, llmbridge::net::http::Body::Length, body.size());
@@ -569,8 +590,8 @@ namespace
 
     TEST_F(Core, BytesPastAContentLengthStreamKeepTheUpstreamOutOfThePool)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         streaming(c, u, llmbridge::net::http::Body::Length, 9);
         c->req.f.stream_chunked_out = true;
@@ -584,8 +605,8 @@ namespace
     // A response arriving over many reads has its head parsed once.
     TEST_F(Core, AResponseHeadIsParsedOnceHoweverManyReadsTheBodyTakes)
     {
-        Connection* c = t.client();
-        Connection* u = t.upstream();
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
         t.dispatch(c, u);
         const std::string body(1000, 'a');
         u->rbuf = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n";

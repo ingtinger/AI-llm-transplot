@@ -18,7 +18,7 @@ namespace llmbridge::detail
 {
 
     // Plaintext not yet on the wire or ciphertext not yet written, sends in flight included.
-    static bool owes_client(const Connection* c) noexcept
+    static bool owes_client(const ClientConn* c) noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         if (!c->tls_out.idle()) return true;
@@ -53,7 +53,7 @@ namespace llmbridge::detail
         // Providers close idle keep-alives on their own schedule, and finding a corpse
         // costs a request its retry, so expired ones go first. Only those are visited.
         if (_pool_idle_ns > 0)
-            _pool->reap(now - _pool_idle_ns, [this](Connection* u) { _ops->close(*u); });
+            _pool->reap(now - _pool_idle_ns, [this](UpstreamConn* u) { _ops->close(*u); });
 
         apply_reresolved();
 
@@ -62,8 +62,8 @@ namespace llmbridge::detail
         for (size_t i = _clients->size(); i-- > 0;)
         {
             if (i >= _clients->size()) continue;
-            Connection* c = (*_clients)[i];
-            const bool busy = c->peer != nullptr || c->req.f.streaming;
+            ClientConn* c = (*_clients)[i];
+            const bool busy = c->up != nullptr || c->req.f.streaming;
             in_flight += busy;
             sweep_client(c, now, busy);
         }
@@ -78,7 +78,7 @@ namespace llmbridge::detail
 
     // Each deadline is independent of the others: the setup deadline holds even with
     // the upstream timeout off, so a peer cannot hold a connection by sending nothing.
-    void Engine::sweep_client(Connection* c, int64_t now, bool busy) noexcept
+    void Engine::sweep_client(ClientConn* c, int64_t now, bool busy) noexcept
     {
         // Never framed a request. Measured before this existed: 50 half-open
         // connections, each holding a slot with a partial request, and none closed.
@@ -106,14 +106,14 @@ namespace llmbridge::detail
         }
         // A fresh connect that never became wire-ready. Separate from the idle timeout,
         // which starts at the request write, never on a socket still retrying SYNs.
-        if (Connection* u = c->peer;
-            _connect_ns > 0 && u && !u->wire_ready && u->ts_accepted != 0 &&
-            now - u->ts_accepted > _connect_ns)
+        if (UpstreamConn* u = c->up;
+            _connect_ns > 0 && u && !u->wire_ready && u->ts_opened != 0 &&
+            now - u->ts_opened > _connect_ns)
         {
             ++_stats.connect_timeouts;
             LB_WARN(ReqId{c->req.f.req_seq}, " TIMEOUT upstream connect ", *u,
-                    " after_ns=", now - u->ts_accepted, " limit_ns=", _connect_ns);
-            note_connect_failure(u->upstream_slot, "timed out");
+                    " after_ns=", now - u->ts_opened, " limit_ns=", _connect_ns);
+            note_connect_failure(u->venue, "timed out");
             unpair(u);
             _ops->close(*u);
             fail_request(c, 502, "upstream connect timeout");

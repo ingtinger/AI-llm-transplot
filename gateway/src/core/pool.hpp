@@ -43,15 +43,15 @@ namespace llmbridge
         [[nodiscard]] size_t size() const noexcept { return _count; } // connections, not venues
 
         /// The newest connection to `venue`, unlinked, or null.
-        Connection* acquire(int venue) noexcept;
+        UpstreamConn* acquire(int venue) noexcept;
 
         /// The one reusability check. On None the connection is scrubbed (its request
         /// carried a credential), stamped and pooled, and `u` has no peer.
-        Refusal release(Connection& u, bool keep_alive, bool body_ended, bool request_sent,
+        Refusal release(UpstreamConn& u, bool keep_alive, bool body_ended, bool request_sent,
                         int64_t now) noexcept;
 
         /// O(1); a no-op for a connection not in the pool.
-        void remove(Connection& u) noexcept;
+        void remove(UpstreamConn& u) noexcept;
 
         /// Unlink and hand `close` every connection pooled before `cutoff`, oldest
         /// first; touches only those and one live one per venue.
@@ -60,7 +60,7 @@ namespace llmbridge
             for (List& l : _lists)
                 while (l.oldest && l.oldest->ts_pooled < cutoff)
                 {
-                    Connection* u = l.oldest;
+                    UpstreamConn* u = l.oldest;
                     remove(*u);
                     close(u);
                 }
@@ -69,14 +69,14 @@ namespace llmbridge
         template <class F> void for_each(F&& f) const
         {
             for (const List& l : _lists)
-                for (Connection* u = l.newest; u; u = u->pool_older) f(u);
+                for (UpstreamConn* u = l.newest; u; u = u->pool_older) f(u);
         }
 
       private:
         struct List
         {
-            Connection* newest = nullptr;
-            Connection* oldest = nullptr;
+            UpstreamConn* newest = nullptr;
+            UpstreamConn* oldest = nullptr;
         };
         std::vector<List> _lists;
         size_t _cap = 0;

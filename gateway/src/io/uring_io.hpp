@@ -31,33 +31,44 @@ namespace llmbridge::detail
         [[nodiscard]] bool ready() const noexcept { return _ready; }
         int run(); // until Engine::_stop, then drains every operation in flight
 
-        Sent send(Connection& c) noexcept override;
-        bool connect(Connection& u) noexcept override;
+        Sent send(ConnBase& c) noexcept override;
+        bool connect(UpstreamConn& u) noexcept override;
         /// Cancels and re-arms the multishot recv. Streams do not use it: kStreamBufCap
         /// bounds them (IoCaps).
-        void set_read(Connection& c, bool on) noexcept override;
-        void close(Connection& c) noexcept override;
+        void set_read(ConnBase& c, bool on) noexcept override;
+        void close(ConnBase& c) noexcept override;
 
       private:
         bool next_sqe(struct io_uring_sqe** out) noexcept; // flushes once when the SQ is full
         [[nodiscard]] bool submit_accept() noexcept;
         void pause_accept(const char* why) noexcept;
         [[nodiscard]] bool submit_timer() noexcept;
-        void drop_sq_full(Connection* c) noexcept;
-        bool arm_recv(Connection* c) noexcept;
-        [[nodiscard]] bool cancel_recv(Connection* c) noexcept;
-        bool submit_send(Connection* c) noexcept;
-        void client_send(Connection* c) noexcept; // a TLS conn goes through its Session first
-        void submit_cancel(int fd) noexcept;      // every op on the fd
+        void drop_sq_full(ConnBase* c) noexcept;
+        bool arm_recv(ConnBase* c) noexcept;
+        [[nodiscard]] bool cancel_recv(ConnBase* c) noexcept;
+        bool submit_send(ConnBase* c) noexcept;
+        void client_send(ConnBase* c) noexcept; // a TLS conn goes through its Session first
+        void submit_cancel(int fd) noexcept;    // every op on the fd
 #ifdef LLMBRIDGE_HAVE_TLS
-        void tls_flush(Connection* u) noexcept; // one send in flight, so flights never interleave
+        void tls_flush(ConnBase* u) noexcept; // one send in flight, so flights never interleave
 #endif
-        void maybe_free(Connection* c) noexcept; // once no completion can reach it
+        void maybe_free(ConnBase* c) noexcept; // once no completion can reach it
         void on_cqe(uint64_t user_data, int res, uint32_t flags) noexcept;
         void on_accept(int res, uint32_t flags) noexcept;
-        void on_recv(Connection* c, int res, uint32_t flags) noexcept;
-        void on_send(Connection* c, int res) noexcept;
-        void on_connect(Connection* u, int res) noexcept;
+        template <class C> void on_recv(C* c, int res, uint32_t flags) noexcept;
+        template <class C> void on_send(C* c, int res) noexcept;
+        void on_connect(UpstreamConn* u, int res) noexcept;
+        // What each kind does once on_recv and on_send have handled the transport.
+        void lost(ClientConn* c, bool tls_failed) noexcept;
+        void lost(UpstreamConn* u, bool tls_failed) noexcept;
+        void arrived(ClientConn* c) noexcept;
+        void arrived(UpstreamConn* u) noexcept;
+        void send_failed(ClientConn* c) noexcept;
+        void send_failed(UpstreamConn* u) noexcept;
+        void progressed(ClientConn* c) noexcept;
+        void progressed(UpstreamConn* u) noexcept;
+        void drained(ClientConn* c) noexcept;
+        void drained(UpstreamConn* u) noexcept;
 
         Engine& _e;
         net::uring::Ring _ring;

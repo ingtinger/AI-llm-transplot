@@ -29,12 +29,22 @@
 
 namespace llmbridge::detail
 {
+    namespace
+    {
+        // An event's data is the connection, its kind in the low bit (ConnBase is aligned).
+        constexpr uint64_t kUpstreamBit = 1;
+        inline uint64_t tag(const ConnBase* c) noexcept
+        {
+            return reinterpret_cast<uintptr_t>(c) | (c->kind == ConnKind::Upstream ? kUpstreamBit : 0);
+        }
+    } // namespace
+
     EpollIo::EpollIo(Engine& e) noexcept : _e(e)
     {
         _epfd = ::epoll_create1(EPOLL_CLOEXEC);
         epoll_event ev{};
         ev.events = EPOLLIN;
-        ev.data.ptr = this; // the listener's identity in an event
+        ev.data.u64 = reinterpret_cast<uintptr_t>(this); // the listener's identity in an event
         if (_epfd >= 0) ::epoll_ctl(_epfd, EPOLL_CTL_ADD, _e._listen_fd, &ev);
     }
 
@@ -46,7 +56,7 @@ namespace llmbridge::detail
     void EpollIo::pause_accept() noexcept
     {
         epoll_event ev{};
-        ev.data.ptr = this;
+        ev.data.u64 = reinterpret_cast<uintptr_t>(this);
         ::epoll_ctl(_epfd, EPOLL_CTL_MOD, _e._listen_fd, &ev);
         _e._accept_resume_ns = now_ns() + kAcceptBackoffNs;
         ++_e._stats.accept_backoffs;
@@ -58,29 +68,29 @@ namespace llmbridge::detail
     {
         epoll_event ev{};
         ev.events = EPOLLIN;
-        ev.data.ptr = this;
+        ev.data.u64 = reinterpret_cast<uintptr_t>(this);
         ::epoll_ctl(_epfd, EPOLL_CTL_MOD, _e._listen_fd, &ev);
         _e._accept_resume_ns = 0;
     }
 
     // From both flags: arming a write used to set EPOLLIN too, silently undoing a pause.
-    void EpollIo::sync_interest(Connection* c) noexcept
+    void EpollIo::sync_interest(ConnBase* c) noexcept
     {
         epoll_event ev{};
         ev.events = (c->read_paused ? 0u : static_cast<uint32_t>(EPOLLIN)) |
                     (c->write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u);
-        ev.data.ptr = c;
+        ev.data.u64 = tag(c);
         ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
     }
 
-    void EpollIo::arm_write(Connection* c) noexcept
+    void EpollIo::arm_write(ConnBase* c) noexcept
     {
         if (c->write_armed) return;
         c->write_armed = true;
         sync_interest(c);
     }
 
-    void EpollIo::disarm_write(Connection* c) noexcept
+    void EpollIo::disarm_write(ConnBase* c) noexcept
     {
         if (!c->write_armed) return;
         c->write_armed = false;
@@ -88,14 +98,14 @@ namespace llmbridge::detail
     }
 
     // EPOLLHUP and EPOLLERR still fire with EPOLLIN off, so a close is never missed.
-    void EpollIo::set_read(Connection& c, bool on) noexcept
+    void EpollIo::set_read(ConnBase& c, bool on) noexcept
     {
         if (c.read_paused == !on) return;
         c.read_paused = !on;
         sync_interest(&c);
     }
 
-    bool EpollIo::drain_read(Connection* c) noexcept
+    template <class C> bool EpollIo::drain_read(C* c) noexcept
     {
         char tmp[16384];
         size_t pulled = 0;
@@ -104,7 +114,7 @@ namespace llmbridge::detail
             const ssize_t n = ::read(c->fd, tmp, sizeof(tmp));
             if (n > 0)
             {
-                if (c->ts_first_byte == 0) c->ts_first_byte = now_ns();
+                stamp_first_byte(*c);
                 c->rbuf.append(tmp, static_cast<size_t>(n));
                 pulled += static_cast<size_t>(n);
                 // What is left re-notifies; stopping lets back-pressure engage between events.
@@ -119,7 +129,7 @@ namespace llmbridge::detail
         }
     }
 
-    bool EpollIo::pump_write(Connection* c, bool* done) noexcept
+    bool EpollIo::pump_write(ConnBase* c, bool* done) noexcept
     {
         *done = false;
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -159,7 +169,7 @@ namespace llmbridge::detail
 
 #ifdef LLMBRIDGE_HAVE_TLS
 
-    bool EpollIo::tls_flush(Connection* u, bool* done) noexcept
+    bool EpollIo::tls_flush(ConnBase* u, bool* done) noexcept
     {
         *done = false;
         _e.tls_pump_out(u);
@@ -188,33 +198,44 @@ namespace llmbridge::detail
         return true;
     }
 
-    bool EpollIo::tls_drain_read(Connection* u) noexcept
+    template <class C> bool EpollIo::tls_read(C* c) noexcept
     {
         char tmp[16384];
         size_t pulled = 0;
         for (;;)
         {
-            const ssize_t n = ::read(u->fd, tmp, sizeof tmp);
+            const ssize_t n = ::read(c->fd, tmp, sizeof tmp);
             if (n > 0)
             {
-                if (!_e.tls_feed(u, tmp, static_cast<size_t>(n))) return false;
+                if (!_e.tls_feed(c, tmp, static_cast<size_t>(n))) return false;
                 pulled += static_cast<size_t>(n);
-                if (pulled >= kMaxReadPerEvent) break; // see drain_read
-                if (static_cast<size_t>(n) < sizeof tmp) break;
+                if (pulled >= kMaxReadPerEvent) return true; // see drain_read
+                if (static_cast<size_t>(n) < sizeof tmp) return true;
                 continue;
             }
             if (n == 0) return false; // EOF
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
             if (errno == EINTR) continue;
             return false;
         }
-        // Feeding may have produced output (handshake flights, or the request once the
-        // handshake completed): put it on the wire, and stamp t3 on the transition.
-        const bool was_flushed = u->peer && _e.tls_out_flushed(u);
+    }
+
+    // Feeding may have produced output, handshake flights: put it on the wire.
+    bool EpollIo::tls_drain_read(ClientConn* c) noexcept
+    {
+        bool done = false;
+        return tls_read(c) && tls_flush(c, &done);
+    }
+
+    // The request too, once the handshake completed: stamp t3 on the transition.
+    bool EpollIo::tls_drain_read(UpstreamConn* u) noexcept
+    {
+        if (!tls_read(u)) return false;
+        const bool was_flushed = u->client && _e.tls_out_flushed(u);
         bool done = false;
         if (!tls_flush(u, &done)) return false;
-        if (u->peer && !was_flushed && _e.tls_out_flushed(u))
-            u->peer->req.f.ts_up_sent = now_ns();
+        if (u->client && !was_flushed && _e.tls_out_flushed(u))
+            u->client->req.f.ts_up_sent = now_ns();
         return true;
     }
 
@@ -222,10 +243,10 @@ namespace llmbridge::detail
 
     // The fd closes now; the memory at the end of the batch, because a later event in
     // the same batch may still carry this connection in data.ptr (skipped as doomed).
-    void EpollIo::close(Connection& c) noexcept
+    void EpollIo::close(ConnBase& c) noexcept
     {
         if (c.doomed) return;
-        Connection* u = _e.forget(&c);
+        ConnBase* u = _e.forget(c);
         if (c.fd >= 0)
         {
             ::close(c.fd);
@@ -236,7 +257,7 @@ namespace llmbridge::detail
 
     // One EPOLL_CTL_ADD, read and write interest together: the connect's completion is
     // the first writable event.
-    bool EpollIo::connect(Connection& u) noexcept
+    bool EpollIo::connect(UpstreamConn& u) noexcept
     {
         const int fd = net::make_client_socket();
         if (fd < 0) return false;
@@ -250,12 +271,12 @@ namespace llmbridge::detail
         u.write_armed = true;
         epoll_event ev{};
         ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.ptr = &u;
+        ev.data.u64 = tag(&u);
         ::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev);
         return true;
     }
 
-    Sent EpollIo::send(Connection& c) noexcept
+    Sent EpollIo::send(ConnBase& c) noexcept
     {
         bool done = false;
         if (!pump_write(&c, &done)) return Sent::Failed;
@@ -286,9 +307,8 @@ namespace llmbridge::detail
             net::set_nosigpipe(fd);
             if (_e._client_sndbuf > 0)
                 ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_e._client_sndbuf, sizeof(_e._client_sndbuf));
-            Connection* c = new Connection();
+            auto* c = new ClientConn();
             c->fd = fd;
-            c->is_client = true;
             c->id = _e._next_client_id++;
             c->ts_accepted = now_ns();
             c->ts_client_activity = c->ts_accepted;
@@ -307,12 +327,12 @@ namespace llmbridge::detail
             LB_DEBUG("accept ", *c, " clients=", _e._clients->size());
             epoll_event ev{};
             ev.events = EPOLLIN;
-            ev.data.ptr = c;
+            ev.data.u64 = tag(c);
             ::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev);
         }
     }
 
-    void EpollIo::on_client_readable(Connection* c) noexcept
+    void EpollIo::on_client_readable(ClientConn* c) noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         const bool ok = c->tls ? tls_drain_read(c) : drain_read(c);
@@ -323,13 +343,13 @@ namespace llmbridge::detail
         _e.on_client_bytes(c);
     }
 
-    void EpollIo::on_client_writable(Connection* c) noexcept
+    void EpollIo::on_client_writable(ClientConn* c) noexcept
     {
         if (c->req.f.streaming) return _e.stream_flush(c);
         _e.respond(c);
     }
 
-    void EpollIo::on_upstream_writable(Connection* u) noexcept
+    void EpollIo::on_upstream_writable(UpstreamConn* u) noexcept
     {
         const uint64_t sent = u->sent_bytes;
         if (!u->connected)
@@ -337,8 +357,8 @@ namespace llmbridge::detail
             const int err = net::connect_result(u->fd);
             if (err != 0)
             {
-                _e.note_connect_failure(u->upstream_slot, std::strerror(err));
-                Connection* client = unpair(u);
+                _e.note_connect_failure(u->venue, std::strerror(err));
+                ClientConn* client = unpair(u);
                 close(*u);
                 if (client) _e.fail_request(client, 502, "upstream connect refused");
                 else ++_e._stats.errors;
@@ -349,7 +369,7 @@ namespace llmbridge::detail
             if (!_e.upstream_is_tls(u))
             {
                 u->wire_ready = true;
-                if (u->peer) u->peer->req.f.ts_wire_ready = now_ns();
+                if (u->client) u->client->req.f.ts_wire_ready = now_ns();
             }
 #ifdef LLMBRIDGE_HAVE_TLS
             if (u->tls && !u->tls->handshake_done())
@@ -359,30 +379,30 @@ namespace llmbridge::detail
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->tls)
         {
-            const bool was_flushed = u->peer && _e.tls_out_flushed(u);
+            const bool was_flushed = u->client && _e.tls_out_flushed(u);
             bool tdone = false;
             if (!tls_flush(u, &tdone)) return _e.upstream_lost(u, Engine::UpFail::Write);
-            if (u->peer && u->sent_bytes != sent) u->peer->req.f.ts_progress = now_ns();
+            if (u->client && u->sent_bytes != sent) u->client->req.f.ts_progress = now_ns();
             if (!tdone) return; // EPOLLOUT re-armed by tls_flush
             disarm_write(u);    // handshake replies arrive via read
-            if (u->peer && !was_flushed && _e.tls_out_flushed(u))
-                u->peer->req.f.ts_up_sent = now_ns();
+            if (u->client && !was_flushed && _e.tls_out_flushed(u))
+                u->client->req.f.ts_up_sent = now_ns();
             return;
         }
 #endif
         bool done = false;
         if (!pump_write(u, &done)) return _e.upstream_lost(u, Engine::UpFail::Write);
-        if (u->peer && u->sent_bytes != sent) u->peer->req.f.ts_progress = now_ns();
+        if (u->client && u->sent_bytes != sent) u->client->req.f.ts_progress = now_ns();
         if (!done)
         {
             arm_write(u);
             return;
         }
         disarm_write(u);
-        if (u->peer) u->peer->req.f.ts_up_sent = now_ns(); // end of request-path work
+        if (u->client) u->client->req.f.ts_up_sent = now_ns(); // end of request-path work
     }
 
-    void EpollIo::on_upstream_readable(Connection* u) noexcept
+    void EpollIo::on_upstream_readable(UpstreamConn* u) noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         const bool read_ok = u->tls ? tls_drain_read(u) : drain_read(u);
@@ -420,35 +440,35 @@ namespace llmbridge::detail
             }
             for (int i = 0; i < n; ++i)
             {
-                if (events[i].data.ptr == this)
+                const uint64_t d = events[i].data.u64;
+                if (d == reinterpret_cast<uintptr_t>(this))
                 {
                     on_accept();
                     continue;
                 }
-                Connection* c = static_cast<Connection*>(events[i].data.ptr);
+                auto* c = reinterpret_cast<ConnBase*>(d & ~kUpstreamBit);
                 if (c->doomed) continue; // closed earlier this batch
                 // One entry can carry both directions. Errors and hangups read as
                 // readable, and drain_read reports them; doomed is re-checked between.
                 const uint32_t e = events[i].events;
                 const bool readable = e & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP);
                 const bool writable = e & EPOLLOUT;
-                if (c->is_client)
+                if (d & kUpstreamBit)
                 {
-                    if (readable) on_client_readable(c);
-                    if (writable && !c->doomed) on_client_writable(c);
+                    auto* u = static_cast<UpstreamConn*>(c);
+                    if (writable) on_upstream_writable(u);
+                    if (readable && !u->doomed) on_upstream_readable(u);
                 }
                 else
                 {
-                    if (writable) on_upstream_writable(c);
-                    if (readable && !c->doomed) on_upstream_readable(c);
+                    auto* cl = static_cast<ClientConn*>(c);
+                    if (readable) on_client_readable(cl);
+                    if (writable && !cl->doomed) on_client_writable(cl);
                 }
             }
             _e.sweep_idle();
             if (_e._accept_resume_ns && now_ns() >= _e._accept_resume_ns) resume_accept();
-            _e._doomed->clear([this](Connection* d) {
-                _e.retire_wbuf(d);
-                delete d;
-            });
+            _e._doomed->clear([this](ConnBase* d) { _e.free_conn(d); });
         }
         _e.attach(nullptr, IoCaps{});
         return 0;

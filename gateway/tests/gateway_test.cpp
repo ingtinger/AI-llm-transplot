@@ -11,7 +11,7 @@
 // keep-alive, multi-client + upstream-pool reuse, warm-up gating,
 // upstream-refused error, and clean shutdown.
 
-#include "core/conn.hpp" // Connection::s_live
+#include "core/conn.hpp" // ConnBase::s_live
 #include "gateway/gateway.hpp"
 
 #include <gtest/gtest.h>
@@ -287,8 +287,10 @@ namespace
         // body length is unknown when headers are sent. `n` = chunks to split into.
         void set_chunked_response(int n) { _chunked_chunks = n; }
         // Stall modes for timeout tests: 1 = read the request then never reply;
-        // 2 = send half the response, then hold the connection open forever.
+        // 2 = send half the response, then hold the connection open forever;
+        // 3 = read the request, never reply, and count the gateway's close of it.
         void set_stall(int mode) { _stall = mode; }
+        int closed_by_gateway() const { return _closed_by_gateway.load(); }
         // Answer with a complete keep-alive response the instant the connection is
         // accepted, without reading the request, and never read afterwards. Combined
         // with set_small_rcvbuf() this pins the gateway's request send half-written
@@ -444,6 +446,13 @@ namespace
                     ::close(c);
                     return;
                 }
+                if (_stall == 3) // never answer; notice when the gateway lets go
+                {
+                    while (!_stop && ::read(c, tmp, sizeof(tmp)) > 0) {}
+                    if (!_stop) ++_closed_by_gateway;
+                    ::close(c);
+                    return;
+                }
                 if (_stall == 2) // partial answer, then hang (stalled mid-stream)
                 {
                     (void)!::write(c, resp.data(), resp.size() / 2);
@@ -520,6 +529,7 @@ namespace
         int _close_first_n = 0;
         std::atomic<int> _accepted{0};
         int _stall = 0;
+        std::atomic<int> _closed_by_gateway{0};
         int _close_after_reply_ms = 0;
         const std::atomic<bool>* _first_go = nullptr;
         bool _reply_before_read = false;
@@ -3054,6 +3064,45 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnection)
     // request was served. The pipelined variant below forces the retry path itself.
 }
 
+// A client that vanishes mid-request takes its upstream with it: the venue sees the
+// close, and no orphaned socket waits for a response nobody will read.
+TEST_P(ProxyBackend, AClientThatVanishesMidRequestClosesItsUpstream)
+{
+    _backend.set_stall(3); // read the request, never reply, report the close
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    for (int i = 0; i < 200 && _backend.requests_seen() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_EQ(_backend.requests_seen(), 1);
+    c.close();
+    for (int i = 0; i < 200 && _backend.closed_by_gateway() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(_backend.closed_by_gateway(), 1) << "the upstream outlived its client";
+    shutdown();
+}
+
+// A closed upstream hands its request buffer to the next one it opens, so a large
+// request does not pay for fresh pages on every new connection.
+TEST_P(ProxyBackend, AClosedUpstreamsBufferIsReusedByTheNextConnection)
+{
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                          "Connection: close\r\nContent-Length: 2\r\n\r\n{}");
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const std::string body(128u << 10, 'x'); // past Gateway::kWarmMin
+    for (int i = 0; i < 2; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(make_request(body)));
+        ASSERT_EQ(Client::status_of(c.recv_response()), 200) << i;
+        c.close();
+    }
+    shutdown();
+    EXPECT_GE(_gw->stats().warm_reuses, 1u) << "the first upstream's buffer was not kept";
+}
+
 // Pipelined variant: two requests on one keep-alive connection. The 2nd is
 // forwarded by reusing the pooled (already-dropped) upstream inline, before the
 // event loop can evict it, so both backends are forced through the retry path.
@@ -3085,15 +3134,15 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyBackend,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
 
-// ── Bug-2 regression (deterministic, no sanitizer needed): every Connection the
+// ── Bug-2 regression (deterministic, no sanitizer needed): every connection the
 // gateway allocates must be freed. Tear down with 50 requests in flight (acquired
-// upstreams reachable only via peer, exactly what leaked) and assert the live
-// Connection count returns to baseline after ~Gateway.
+// upstreams reachable only via their client, exactly what leaked) and assert the live
+// connection count returns to baseline after ~Gateway.
 TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
 {
     for (const llmbridge::IoBackend backend : {llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring})
     {
-        const long base = llmbridge::Connection::s_live.load();
+        const long base = llmbridge::ConnBase::s_live.load();
         {
             TestBackend be;
             be.set_trickle(4); // slow replies so requests are still in flight at teardown
@@ -3114,7 +3163,7 @@ TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
             t.join();
             be.stop();
         } // ~Gateway runs here
-        EXPECT_EQ(llmbridge::Connection::s_live.load(), base) << be_name(backend);
+        EXPECT_EQ(llmbridge::ConnBase::s_live.load(), base) << be_name(backend);
     }
 }
 
@@ -3126,7 +3175,7 @@ TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
 // it also checks both workers together serve every request and free every conn.
 TEST(GatewayMultiWorker, ShardedConcurrentClientsNoRaceNoLeak)
 {
-    const long base = llmbridge::Connection::s_live.load();
+    const long base = llmbridge::ConnBase::s_live.load();
     {
         TestBackend be;
         be.start();
@@ -3159,7 +3208,7 @@ TEST(GatewayMultiWorker, ShardedConcurrentClientsNoRaceNoLeak)
         for (auto& g : gws) total += g->stats().requests; // safe: read after join
         EXPECT_EQ(total, static_cast<uint64_t>(M)); // the two workers together served all
     }
-    EXPECT_EQ(llmbridge::Connection::s_live.load(), base); // no leak across workers
+    EXPECT_EQ(llmbridge::ConnBase::s_live.load(), base); // no leak across workers
 }
 
 // Translation parity across both backends and all three dialects (2 x 3 = 6).
