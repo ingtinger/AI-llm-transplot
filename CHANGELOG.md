@@ -8,6 +8,102 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.93.0]. 2026-10-12
+
+A request may carry one provider key per `x-kottos-key-<domain>` header, and the policy
+names which one goes to the venue it picked. Mechanism only: which header serves which
+venue is the policy's decision. DESIGN.md "Naming the key for a venue".
+
+### Added
+
+- **`Decision::credential_header` and `Retry::credential_header`**: the client header
+  holding the key for the venue that decision or retry picked. Empty keeps today's
+  behaviour, the key from `Authorization`, `x-api-key`, `x-goog-api-key` or `api-key`.
+  Set, its value goes out as the venue's own key header and is the only credential the
+  venue receives: `x-api-key` for Anthropic (with the client's `anthropic-version`, or
+  2023-06-01), `Authorization: Bearer` for OpenAI-compatible venues and Cohere,
+  `x-goog-api-key` for Gemini, `api-key` for Azure. Translated and byte-forwarded,
+  streamed or not. Both fields come last in their structs, so existing initializers keep
+  compiling, and both are copied, so they need only outlive the call.
+- `kKeyHeaderPrefix` (`x-kottos-key-`), `kMaxKeyHeaderName` (64) and `key_header_ok` in
+  `gateway/policy.hpp`, public so a policy can `static_assert` its own names;
+  `refuse::kKeyHeaderMissing`, `kKeyHeaderRepeated`, `kKeyHeaderUnusable` and
+  `kKeyHeaderTooMany`.
+
+### Security
+
+- **No `x-kottos-key-*` header reaches any upstream**, with or without a policy. Every
+  header whose name starts with the prefix, in any case, is dropped from a byte-forwarded
+  request: at dispatch, in the head of a body sent as it arrives, and in a stale
+  connection's retry. The strip list matches exact names, so a client's
+  `x-kottos-key-anything` reached the provider. A translated request never carried one.
+- **A named key never falls back.** Refused with a 400 before any upstream is contacted,
+  with fixed text and none of the client's bytes: the named header absent or empty,
+  repeated in any case, whichever copy comes first, or holding a control or 8-bit byte or
+  more than 8 KiB; a name outside the family; more than eight family headers a policy
+  could name, since a repeat could hide past what the gateway reads; a Bedrock venue,
+  which signs with a key pair and has no header for a bearer key. `Authorization` never
+  stands in, because it may hold another provider's key.
+- **A failover carries the next venue's key, never the first one's.** The retry's header
+  is adopted before the rebuild. A retry that names none after a decision that named one
+  gives up, and the client sees the failure; one that names a header the client never
+  sent gets the 400, and the next venue is not contacted.
+- **A sink cannot capture a family header**, as it cannot capture `Authorization`.
+- The key is read in the framing walk, which records each family line a policy could
+  name, at most eight, as offsets into the head: no second walk and no allocation,
+  named or not. A strip-list entry for the named header does not hide it from that read.
+  Instructions per request (callgrind) are within 0.3% of 0.91.0 on both backends,
+  byte-forwarded and as a translated stream.
+
+### Changed
+
+- **Behaviour change: a gateway no longer forwards `x-kottos-key-*` headers**, with no
+  policy installed too. A deployment that relied on a provider seeing one loses it.
+- **Behaviour change: with a key named, a byte-forwarded request no longer carries the
+  client's `Authorization`, `x-api-key`, `x-goog-api-key` or `api-key`**; the named key
+  replaces them.
+
+### Tests
+
+- `gateway_request_test`: `KeyHeader` and `KeySwap`. Each venue's own header, the
+  client's `anthropic-version`, absent, empty, repeated and unsafe values, a bare CR
+  refused by the framing walk, a signed venue at both the resolution and the signing,
+  the family never read when nothing is named, an exact name match, a stripped key
+  header still read, the table's bound with lines that cannot be named left out, the
+  byte-forward swap, every refusal leaving the buffer empty, the family and lines no
+  policy could name stripped when nothing is named, and a golden rebuild without the
+  family. `TheNamedKeyIsReadFromTheFramingWalkAlone` poisons every head byte outside
+  the recorded spans and still resolves the key; `ANamedKeyStaysWithinTheSameBound`
+  holds the named path to the one-walk timing bound.
+- Both backends, `ProxyKeyHeader`: translated requests to Anthropic, Gemini, Cohere and
+  Azure, OpenAI and Anthropic client byte-forwards, streams, every malformed header
+  refused with nothing sent, the table's bound, a SigV4 venue, names outside the
+  family, the family with no policy installed, failover across dialects, a failover
+  naming no usable key, a failover to a key the client never sent, an unnamed decision
+  failing over to a named key, three clients on one pooled connection, the sink, and
+  the log. `ProxyBodyStream.TheKeyFamilyNeverLeavesWithAStreamedBody`: the streamed head
+  and a stale connection's rebuild.
+- `AllocCeiling.NamedKeyPassthrough` and `NamedKeyTranslated`: no allocation on either
+  backend, as with the same policy naming none.
+- `fuzz_body_stream` asserts no family header leaves in the held or the streamed head.
+- Mutation-checked in a scratch copy, each mutation failing at least one test: falling
+  back to `Authorization` when the named header is absent, skipping the family strip on
+  a byte-forward, on a streamed head, or when the walk recorded no nameable line,
+  keeping the first venue's header on a retry, keeping the client's own credential
+  headers beside the named key, letting a repeated header win first, recording only
+  the first copy, dropping the charset check, dropping the table's bound, retrying
+  unnamed after a named decision, accepting any name, letting the sink capture a family
+  header, signing a Bedrock request despite a named key, a strip-list entry hiding the
+  named header, reading the key with a second walk, the wrong header for a venue,
+  dropping `anthropic-version`, and not adopting the decision's header at all.
+
+### Known gaps
+
+- A Gemini client byte-forwarding to a Gemini venue can carry its own key in the query
+  (`?key=`); a named key header is added beside it, not instead. No venue in use takes
+  that form.
+
+
 ## [0.92.0]. 2026-10-12
 
 ### Fixed
