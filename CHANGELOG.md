@@ -28,6 +28,11 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   first byte instead of the last, either would hold the whole upload. For the held body
   both are the mock venue reading a MiB at its own pace, which a loaded machine
   stretched past 75 ms and once past the upload; its last byte is t3, as checked.
+- `GatewayTls.PartsStagedDuringTheHandshakeDoNotMoveT3` raced a fixed 150 ms venue
+  handshake hold against a 50 ms client sleep, so a late wake-up sent the rest of the
+  body after the handshake. The venue now holds its handshake until the test releases
+  it, after the head was dispatched and the rest sent, and the hold is checked against
+  the release time instead of a fixed 100 ms.
 
 
 ## [0.94.0]. 2026-10-12

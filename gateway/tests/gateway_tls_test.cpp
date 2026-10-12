@@ -188,6 +188,10 @@ namespace
         uint16_t port() const { return _port; }
         int handshakes() const { return _handshakes.load(); }
         int requests() const { return _requests.load(); }
+        int accepted() const { return _accepted.load(); }
+        /// Before start(): every handshake waits for `go` as well, however long the
+        /// test takes, where a fixed delay would race a client that was late.
+        void hold_handshake(const std::atomic<bool>* go) { _hs_go = go; }
 
       private:
         void accept_loop()
@@ -196,6 +200,7 @@ namespace
             {
                 const int fd = ::accept(_lfd, nullptr, nullptr);
                 if (fd < 0) return; // listener closed
+                ++_accepted;
                 {
                     std::lock_guard<std::mutex> g(_fds_mtx);
                     _fds.push_back(fd);
@@ -214,6 +219,8 @@ namespace
             }
             if (_hs_delay_ms > 0)
                 std::this_thread::sleep_for(std::chrono::milliseconds(_hs_delay_ms));
+            while (_hs_go && !_hs_go->load() && !_stopping)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             SSL* ssl = SSL_new(_ctx);
             SSL_set_fd(ssl, fd);
             if (SSL_accept(ssl) == 1)
@@ -416,6 +423,8 @@ namespace
         std::string _mode{"json"};
         std::atomic<bool> _stopping{false};
         int _hs_delay_ms = 0;
+        const std::atomic<bool>* _hs_go = nullptr;
+        std::atomic<int> _accepted{0};
         std::atomic<int> _handshakes{0};
         std::atomic<int> _requests{0};
         std::thread _acc;
@@ -1065,19 +1074,28 @@ TEST_P(GatewayTls, AStreamedBodysLaterPartsDoNotMoveT3)
 // Parts that come while a cold venue's handshake runs wait in `out` behind the first
 // send, and went out with it in one push: t3 waited for them, so upwrite held that much
 // of the upload. The first send is encrypted alone and measured, and t3 is its own bytes
-// in the kernel. The small send buffer makes the rest take many writes.
+// in the kernel. The small send buffer makes the rest take many writes. The venue holds
+// its handshake until the rest is in: a fixed hold raced a client whose sleep woke late.
 TEST_P(GatewayTls, PartsStagedDuringTheHandshakeDoNotMoveT3)
 {
     _sink = &_last;
     _up_sndbuf = 4096;
-    start(UpstreamDialect::OpenAI, "json", kHost, /*handshake_delay_ms=*/150);
+    static std::atomic<bool> go; // the venue reads it before its handshake, until it stops
+    go = false;
+    _backend.hold_handshake(&go);
+    start();
     const std::string req = make_request(R"({"model":"gpt","messages":[{"role":"user","content":")" +
                                          std::string(512 * 1024, 'p') + R"("}]})");
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(req.substr(0, 20000))); // the head and a part: it streams, the connect starts
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    for (int i = 0; i < 600 && _backend.accepted() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(_backend.accepted(), 1) << "the head was not dispatched";
     ASSERT_TRUE(c.send(req.substr(20000))); // while the venue holds its handshake
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the loop reads it in
+    const int64_t go_ns = llmbridge::now_ns();
+    go = true;
     ASSERT_EQ(Client::status_of(c.recv_response(5000)), 200);
     _gw->request_stop();
     _gt.join();
@@ -1085,7 +1103,7 @@ TEST_P(GatewayTls, PartsStagedDuringTheHandshakeDoNotMoveT3)
     ASSERT_EQ(_last.n(), 1);
     const llmbridge::RequestRecord r = _last.last();
     EXPECT_TRUE(r.body_streamed);
-    EXPECT_GT(r.ts_wire_ready - r.ts_req_built, 100'000'000) << "the handshake was not held";
+    EXPECT_GT(r.ts_wire_ready, go_ns) << "the handshake was not held";
     EXPECT_LT(r.ts_body_end, r.ts_wire_ready) << "a part came after the handshake";
     EXPECT_GT(r.ts_up_sent, r.ts_wire_ready);
     EXPECT_LT(r.ts_up_sent, r.ts_body_sent) << "t3 waited for the parts staged behind the first send";
