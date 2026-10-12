@@ -189,6 +189,7 @@ namespace llmbridge::detail
         LB_WARN("upstream stale, resending on a fresh connection ", *u);
         _ops->close(*u); // discard the dead connection; unpairs it
         pair(client, uf);
+        mark_first_send(uf); // the resend so far is this attempt's first send
         return true;
     }
 

@@ -286,14 +286,10 @@ namespace llmbridge::detail
         c->req.f.ts_up_sent = c->req.f.ts_body_sent = 0;
         c->req.f.upstream_pooled = u->connected;
         c->req.f.upstream_ip = u->up_addr.sin_addr.s_addr;
+        mark_first_send(u);
 
         if (!u->connected) return; // the connect's completion sends it
-        switch (_ops->send(*u))
-        {
-            case Sent::Done: return note_sent(c, now_ns());
-            case Sent::Queued: return;
-            case Sent::Failed: return upstream_lost(u, UpFail::Write);
-        }
+        send_upstream(u);
     }
 
     // The staged reply is on the wire: account for it and take the next request.

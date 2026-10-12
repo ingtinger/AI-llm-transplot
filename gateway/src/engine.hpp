@@ -135,8 +135,11 @@ namespace llmbridge::detail
         /// Has the request left the machine on every transport it uses? Pooling one
         /// that has not truncates the next client's request (ProxyEarlyResponse).
         [[nodiscard]] bool upstream_request_sent(const UpstreamConn* u) const noexcept;
-        /// Everything staged for `c`'s venue is in the kernel: t3, then ts_body_sent.
-        static void note_sent(ClientConn* c, int64_t now) noexcept;
+        /// What `u->out` holds now is the attempt's first send, which t3 waits for.
+        void mark_first_send(UpstreamConn* u) noexcept;
+        /// `u` took bytes: t3 once the first send is in, ts_body_sent whenever all is.
+        void note_sent(UpstreamConn* u, int64_t now) noexcept;
+        bool send_upstream(UpstreamConn* u) noexcept; // false: the write failed, `u` is lost
 
         // Streams (core/stream.cpp).
         void begin_stream(UpstreamConn* u, const net::http::ResponseHead& h) noexcept;
@@ -172,7 +175,8 @@ namespace llmbridge::detail
             Handshook, ///< the handshake completed on this feed
         };
         template <class C> TlsIn tls_ingest(C* c, const char* p, size_t n, bool quiet_handshake) noexcept;
-        void tls_push_out(ConnBase* c) noexcept;        // unfed plaintext into the Session
+        void tls_push_out(ConnBase* c, size_t limit = SIZE_MAX) noexcept; // unfed plaintext into the Session
+        void tls_measure_first_send(UpstreamConn* u) noexcept;
         [[nodiscard]] bool tls_out_flushed(const ConnBase* c) const noexcept;
 #endif
 
@@ -236,6 +240,7 @@ namespace llmbridge::detail
 #endif
         unsigned _uring_buf_count = 0; // test seams: 0 is the default
         int _client_sndbuf = 0;
+        int _upstream_sndbuf = 0;
         size_t _ep_write_cap = 0;
         int64_t _last_sweep_ns = 0;
         int64_t _last_heartbeat_ns = 0; ///< 0 until the first sweep, which beats at once

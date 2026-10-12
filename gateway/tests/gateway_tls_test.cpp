@@ -808,6 +808,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
         // Before the loop thread exists, like setup_ns in start_inbound.
         if (connect_ns > 0) _gw->set_connect_ns(connect_ns);
         if (_write_cap > 0) _gw->set_epoll_write_cap_for_test(_write_cap);
+        if (_up_sndbuf > 0) _gw->set_upstream_sndbuf_for_test(_up_sndbuf);
         if (_sink) _gw->set_request_sink(_sink, {});
         _port = _gw->bound_port();
         _gt = std::thread([this] { _gw->run(); });
@@ -875,6 +876,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     uint16_t _port{0};
     std::string _ca_path;
     size_t _write_cap = 0; // set before start_inbound(); epoll only
+    int _up_sndbuf = 0;    // set before start(); SO_SNDBUF on upstream connections
     llmbridge::RequestSink* _sink = nullptr; // set before start(); read after the join
     LastRecord _last;                        // a sink for _sink, alive until the join
 };
@@ -1031,6 +1033,35 @@ TEST_P(GatewayTls, AStreamedBodysLaterPartsDoNotMoveT3)
     EXPECT_GE(r.ts_body_sent, r.ts_body_end);
     EXPECT_LE(r.ts_body_sent, r.ts_up_recvd);
     EXPECT_GE(r.ts_body_end - r.ts_up_sent, upload / 2);
+}
+
+// Parts that come while a cold venue's handshake runs wait in `out` behind the first
+// send, and went out with it in one push: t3 waited for them, so upwrite held that much
+// of the upload. The first send is encrypted alone and measured, and t3 is its own bytes
+// in the kernel. The small send buffer makes the rest take many writes.
+TEST_P(GatewayTls, PartsStagedDuringTheHandshakeDoNotMoveT3)
+{
+    _sink = &_last;
+    _up_sndbuf = 4096;
+    start(UpstreamDialect::OpenAI, "json", kHost, /*handshake_delay_ms=*/150);
+    const std::string req = make_request(R"({"model":"gpt","messages":[{"role":"user","content":")" +
+                                         std::string(512 * 1024, 'p') + R"("}]})");
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(req.substr(0, 20000))); // the head and a part: it streams, the connect starts
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(c.send(req.substr(20000))); // while the venue holds its handshake
+    ASSERT_EQ(Client::status_of(c.recv_response(5000)), 200);
+    _gw->request_stop();
+    _gt.join();
+
+    ASSERT_EQ(_last.n(), 1);
+    const llmbridge::RequestRecord r = _last.last();
+    EXPECT_TRUE(r.body_streamed);
+    EXPECT_GT(r.ts_wire_ready - r.ts_req_built, 100'000'000) << "the handshake was not held";
+    EXPECT_LT(r.ts_body_end, r.ts_wire_ready) << "a part came after the handshake";
+    EXPECT_GT(r.ts_up_sent, r.ts_wire_ready);
+    EXPECT_LT(r.ts_up_sent, r.ts_body_sent) << "t3 waited for the parts staged behind the first send";
 }
 
 TEST_P(GatewayTls, PooledConnectionSkipsSecondHandshake)

@@ -269,6 +269,8 @@ namespace llmbridge::detail
     {
         const int fd = net::make_client_socket();
         if (fd < 0) return false;
+        if (_e._upstream_sndbuf > 0)
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_e._upstream_sndbuf, sizeof(_e._upstream_sndbuf));
         u.fd = fd;
         io_uring_sqe* s = nullptr;
         if (!next_sqe(&s))
@@ -517,9 +519,13 @@ namespace llmbridge::detail
         if (c->req.f.streaming) c->req.f.ts_progress = now_ns();
     }
 
+    // Before the rest is resubmitted, so `out` says whether everything staged is in.
     void UringIo::progressed(UpstreamConn* u) noexcept
     {
-        if (u->client) u->client->req.f.ts_progress = now_ns();
+        if (!u->client) return;
+        const int64_t now = now_ns();
+        u->client->req.f.ts_progress = now;
+        _e.note_sent(u, now); // t3, or a body's last byte
     }
 
     void UringIo::drained(ClientConn* c) noexcept
@@ -528,11 +534,9 @@ namespace llmbridge::detail
         else _e.finish(c);
     }
 
-    // An upstream's request stays in `out` for a resend; its response comes by recv.
-    void UringIo::drained(UpstreamConn* u) noexcept
-    {
-        if (u->client) _e.note_sent(u->client, now_ns());
-    }
+    // An upstream's request stays in `out` for a resend; its response comes by recv, and
+    // progressed() took its stamps.
+    void UringIo::drained(UpstreamConn*) noexcept {}
 
     int UringIo::run()
     {

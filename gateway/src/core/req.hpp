@@ -102,6 +102,10 @@ namespace llmbridge
         int64_t ts_body_end = 0;
         int64_t ts_body_sent = 0;
         int64_t body_work_ns = 0;
+        /// The attempt's first send, the head and the body there at dispatch: its
+        /// plaintext length, and the upstream's sent_bytes once it is in, which t3 waits for.
+        uint64_t first_send_len = 0;
+        uint64_t first_send_end = 0;
         /// Streaming, outside t0-t6: first content token, first thinking delta, the
         /// latest chunk and the longest gap between chunks once tokens started.
         int64_t ts_first_token = 0;

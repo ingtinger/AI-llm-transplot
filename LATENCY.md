@@ -116,12 +116,12 @@ assigns the stamp attributed to it.
 | **t0** | `ts_req_recvd` | `ReqState` | the client's request is fully framed. Taken just **before** the parse that frames it, on both backends, so the parse is request-path work; a parse that finds the request incomplete discards it, so network wait is never charged. A **streamed** body (§2b) is stamped when its head is framed: the rest of its upload is the client's, and ends at `ts_body_end` | `open_request`, with the clock read before the framing parse (shared) |
 | **t1** | `ts_req_built` | `ReqState` | the upstream request bytes exist: translation, auth mapping and re-serialisation done, nothing sent | `dispatch` (shared) |
 | **t2** | `ts_wire_ready` | `ReqState` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `dispatch`, `tls_feed` (shared), `EpollIo::on_upstream_writable` / `UringIo::on_connect` |
-| **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel: the first send completion of an attempt, plaintext, TLS-flushed or a partial write's, from `dispatch`, `pump_body` or either loop. A stale retry's fresh connection takes its own; a streamed body's later parts move `ts_body_sent`, never t3 | `note_sent` (shared) |
+| **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel: the attempt's first send, the head and the body there at dispatch, all in. Its end is marked in the upstream's wire bytes when it is staged (on TLS, once the Session has encrypted it alone), and the send completion that passes the mark stamps t3: plaintext, TLS-flushed or a partial write's, from `dispatch`, `pump_body` or either loop. A stale retry's fresh connection takes its own; parts staged behind the first send, even while it is backed up, move `ts_body_sent`, never t3 | `note_sent` (shared) |
 | **t4** | `ts_up_recvd` | `ReqState` | the provider's response arrived. **Non-streaming:** the body is framed, stamped at the start of the read that completed it, before the parse, on both backends. **Streaming:** the response *head* is framed, before any data chunk (see §3; this is not the first token) | `on_upstream_bytes` (shared) |
 | **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `on_response` (shared) |
 | **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `finish` (shared) |
 | **body end** | `ts_body_end` | `ReqState` | the client's last body byte is in. A held body's is t0; a streamed body's is the read that completed it (§2b), and 0 when a response came first | `open_request`, `pump_body` (shared) |
-| **body sent** | `ts_body_sent` | `ReqState` | the latest send completion: a streamed body's last byte in the kernel, where the provider's wait begins. A held body's is t3 | `note_sent` (shared) |
+| **body sent** | `ts_body_sent` | `ReqState` | the latest send completion that left nothing staged: a streamed body's last byte in the kernel, where the provider's wait begins. A held body's is t3 | `note_sent` (shared) |
 
 **Two stamps sit outside the scheme, deliberately.** `ts_accepted` is taken when
 the client connection is accepted, which is before t0 and on a different clock
@@ -176,10 +176,11 @@ Two consequences of that table worth reading off it:
   histogram both read exactly 0 on a warm connection. A single site could not
   express "no handshake occurred" without inventing a duration.
 - **t3 has one writer and many callers.** Plaintext, TLS-flushed, and the
-  write-completion paths of both loops all mean the same thing, everything staged is
-  in the kernel, and all call `note_sent`, which keeps the first of an attempt as t3
-  and moves `ts_body_sent` every time. A new send path must call it too, or the
-  request silently reports a zero upstream write.
+  write-completion paths of both loops call `note_sent` whenever a send moved bytes.
+  It stamps t3 once the upstream's `sent_bytes` passes the first send's end, which
+  `mark_first_send` recorded, and moves `ts_body_sent` each time everything staged is
+  in. A new send path must call it too, or the request silently reports a zero
+  upstream write.
 
 The gateway sources use this same t0–t6 labelling in their comments, and this
 document is the only table of it, so `connect-us` reads one way whichever file you trust.
@@ -225,9 +226,13 @@ our work and the venue's wait where a held body puts them:
    │                           │ t4  provider's response received     │
 ```
 
-- **t3 stays ours**: the first send, of the head and whatever body came with it.
-  Later parts move `ts_body_sent`, never t3, so `upwrite-us` is a write and not an
-  upload.
+- **t3 stays ours**: the first send, the head and the body there at dispatch, in the
+  kernel. It is counted in wire bytes, so a part staged while that send is still
+  backed up waits behind it in the socket's queue and does not move t3, and on a cold
+  connection the parts that came during the connect or the TLS handshake go after it,
+  the Session encrypting the first send alone. Later parts move `ts_body_sent`, never
+  t3, so `upwrite-us` is a write and not an upload; like a held body's, it holds the
+  kernel's backpressure on that first send.
 - **`ts_body_end`** is the read that brought the body's last byte, and
   `client_upload_ns` runs from the request's first byte to it: a 10 MB body at
   100 Mbit/s reads about 840 ms there, as it would held. On a connection's first
@@ -235,14 +240,19 @@ our work and the venue's wait where a held body puts them:
   body's does and subtracting one from the other still leaves the wait before the
   first byte. `ts_body_end` is 0 when the venue answered before the body ended; the
   rest is then read and dropped, and both stop at t0.
-- **`ts_body_sent`** is the last send completion, the body's last byte handed to the
-  kernel. The provider's wait is t4 − `ts_body_sent` (`upstream-us`,
-  `upstream-ttfb-us`): a venue cannot answer a request it has not all got.
-- **`body_work_ns`** sums each later part's scan, copy and send call. It is ours, so
-  `request-path` and `added-total` include it, and `x-llmbridge-body-work-us`
-  reports it. It is not small: a 10 MB transcript at 100 Mbit/s took 25 to 27 ms on
-  epoll, where each part's send is a `write()`, and 15 ms on io_uring, where it is a
-  queued submission. Held, the same body's `request-path` read 15 to 27 ms.
+- **`ts_body_sent`** is the last send completion that left nothing staged, the
+  body's last byte handed to the kernel. The provider's wait is t4 − `ts_body_sent`
+  (`upstream-us`, `upstream-ttfb-us`): a venue cannot answer a request it has not all
+  got.
+- **`body_work_ns`** sums the scan, copy and send call of each part pumped after t3.
+  It is ours, so `request-path` and `added-total` include it, and
+  `x-llmbridge-body-work-us` reports it; a part pumped before t3 is inside
+  `connect-us` or `upwrite-us` already, and is not counted twice. It is not small: a
+  10 MB transcript at 100 Mbit/s took 25 to 27 ms on epoll, where each part's send is
+  a `write()`, and 15 ms on io_uring, where it is a queued submission. Held, the same
+  body's `request-path` read 15 to 27 ms. Both are well past the 2.62 ms range of
+  `request-path` and `added-total`, so a multi-MB body's sample, held or streamed,
+  still prints `[overflow!]` (§4): that is our real work on it, not the upload.
 
 What is left between t3 and `ts_body_sent`, less `body_work_ns`, is the client's
 upload overlapping the venue's read of it: in no reported interval, because it is
@@ -303,10 +313,10 @@ so they emit `x-llmbridge-upstream-ttfb-us` instead, and token counts travel
 in the stream's final usage chunk (`stream_options.include_usage`), never
 invented by the gateway.
 
-**`upstream-ttfb-us` is not time-to-first-token.** It spans t3 → the moment
-the provider's response *head* is fully framed. The stamp lands before any
-data chunk is pumped, on both backends, verified in the source at both stamp
-sites.
+**`upstream-ttfb-us` is not time-to-first-token.** It spans `ts_body_sent` (t3
+for a held body) → the moment the provider's response *head* is fully framed. The
+stamp lands before any data chunk is pumped, on both backends, verified in the source
+at both stamp sites.
 
 **The gateway does stamp a real first-token, for the sink not the headers.**
 `ts_first_token` (the `RequestRecord` field of the same name) is taken in

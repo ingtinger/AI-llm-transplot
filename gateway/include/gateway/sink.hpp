@@ -46,7 +46,7 @@ namespace llmbridge
         int64_t ts_req_recvd = 0;  ///< t0
         int64_t ts_req_built = 0;  ///< t1
         int64_t ts_wire_ready = 0; ///< t2; == t1 when the connection was pooled
-        int64_t ts_up_sent = 0;    ///< t3: the head, and the body so far, in the kernel
+        int64_t ts_up_sent = 0;    ///< t3: the head, and the body there at dispatch, in the kernel
         int64_t ts_up_recvd = 0;   ///< t4: ttfb
         int64_t ts_first_token = 0; ///< streaming only: the first token shown; ttft from ts_body_end
         /// Streaming only, and 0 unless the model emitted reasoning. The first thinking delta.

@@ -78,6 +78,7 @@ namespace llmbridge
     }
     void Gateway::set_uring_buf_count_for_test(unsigned n) noexcept { _e->_uring_buf_count = n; }
     void Gateway::set_client_sndbuf_for_test(int bytes) noexcept { _e->_client_sndbuf = bytes; }
+    void Gateway::set_upstream_sndbuf_for_test(int bytes) noexcept { _e->_upstream_sndbuf = bytes; }
     void Gateway::set_epoll_write_cap_for_test(size_t bytes) noexcept { _e->_ep_write_cap = bytes; }
     size_t Gateway::prefault_resident_bytes_for_test() { return _e->prefault_resident_bytes_for_test(); }
     void Gateway::retire_wbuf(UpstreamConn* u) noexcept { _e->retire_wbuf(u); }

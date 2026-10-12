@@ -42,6 +42,7 @@ namespace llmbridge::detail
         void on_client_readable(ClientConn* c) noexcept;
         void on_client_writable(ClientConn* c) noexcept;
         void on_upstream_writable(UpstreamConn* u) noexcept;
+        void progressed(UpstreamConn* u, uint64_t sent_before) noexcept;
         void on_upstream_readable(UpstreamConn* u) noexcept;
         template <class C> bool drain_read(C* c) noexcept;
         bool pump_write(ConnBase* c, bool* done) noexcept;

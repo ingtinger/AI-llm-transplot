@@ -307,6 +307,14 @@ namespace
         // After each complete reply, wait `ms`, then close: the end of a close-delimited
         // body arrives as its own event, after the body has gone on.
         void set_close_after_reply_ms(int ms) { _close_after_reply_ms = ms; }
+        // Read nothing until `*go` (at most 10 s), then `bytes` a read every `ms`: a venue
+        // slower than its client. With set_small_rcvbuf() the gateway's writes back up.
+        void hold_reads(const std::atomic<bool>* go, size_t bytes, int ms)
+        {
+            _read_go = go;
+            _pace_bytes = bytes;
+            _pace_ms = ms;
+        }
         // Hold the first reply until `*go` (at most 10 s), so a client can pipeline behind it.
         void hold_first_reply(const std::atomic<bool>* go) { _first_go = go; }
         int requests_seen() const { return _requests_seen.load(); }
@@ -430,7 +438,10 @@ namespace
                 llmbridge::net::http::Message m;
                 while (llmbridge::net::http::parse_request(buf, m) != llmbridge::net::http::FrameStatus::Complete)
                 {
-                    ssize_t n = ::read(c, tmp, sizeof(tmp));
+                    for (int i = 0; _read_go && !_read_go->load() && !_stop && i < 1000; ++i)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    if (_pace_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(_pace_ms));
+                    ssize_t n = ::read(c, tmp, _pace_bytes ? std::min(_pace_bytes, sizeof(tmp)) : sizeof(tmp));
                     if (n <= 0)
                     {
                         if (!buf.empty())
@@ -562,6 +573,9 @@ namespace
         std::atomic<int> _closed_by_gateway{0};
         int _close_after_reply_ms = 0;
         const std::atomic<bool>* _first_go = nullptr;
+        const std::atomic<bool>* _read_go = nullptr;
+        size_t _pace_bytes = 0;
+        int _pace_ms = 0;
         bool _reply_before_read = false;
         int _reset_after_reply_ms = 0;
         int _rcvbuf = 0;
@@ -842,6 +856,7 @@ namespace
             if (_client_sndbuf >= 0) _gw->set_client_sndbuf_for_test(_client_sndbuf);
             if (!_stream_openai_body) _gw->set_stream_openai_body(false);
             if (_epoll_write_cap) _gw->set_epoll_write_cap_for_test(_epoll_write_cap);
+            if (_upstream_sndbuf) _gw->set_upstream_sndbuf_for_test(_upstream_sndbuf);
             _proxy_port = _gw->bound_port();
             // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
@@ -879,6 +894,7 @@ namespace
         int _client_sndbuf = -1;  // set before start(); pins SO_SNDBUF on accepted clients
         bool _stream_openai_body = true; // set before start()
         size_t _epoll_write_cap = 0;     // set before start(); 0 writes all it can
+        int _upstream_sndbuf = 0;        // set before start(); pins SO_SNDBUF upstream
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
@@ -11452,6 +11468,50 @@ TEST_P(ProxyBodyStream, APartialWriteOfTheLastPartEndsTheBodyNotT3)
     EXPECT_LE(r.ts_body_sent, r.ts_up_recvd);
     EXPECT_LT(r.ts_up_sent - wire_of(r), 50'000'000);
     EXPECT_GE(r.client_upload_ns, 100'000'000);
+}
+
+// The first send, the head and the body there at dispatch, was still backed up when the
+// next parts came, and they joined its backlog: t3 waited for all of them, so upwrite
+// held the upload again. t3 is the first send's own bytes in the kernel, and the work on
+// parts pumped before it is inside upwrite already. A 20 KiB head keeps io_uring's first
+// send, framed from 4 KiB reads, larger than the socket buffers the venue holds full.
+TEST_P(ProxyBodyStream, PartsQueuedBehindTheFirstSendDoNotMoveT3)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    static std::atomic<bool> go; // the venue reads it before every read, until it stops
+    go = false;
+    _backend.set_response(http_ok("{}"));
+    _backend.set_small_rcvbuf(4096);
+    _backend.hold_reads(&go, 4096, 4); // then about 1 MB/s
+    _upstream_sndbuf = 4096;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const std::string body = R"({"model":"gpt-4o","messages":[{"role":"user","content":")" +
+                             std::string(320 << 10, 'p') + R"("}]})";
+    const std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nX-Pad: " + std::string(20 << 10, 'h') +
+                            "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    const size_t first = req.size() - body.size() + 8192;
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(req.substr(0, first)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(c.send(req.substr(first))); // staged behind the first send, which cannot drain
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const int64_t go_ns = llmbridge::now_ns();
+    go = true;
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_TRUE(r.body_streamed);
+    ASSERT_GT(r.ts_up_sent, go_ns) << "the first send went before the venue read: this proves nothing";
+    EXPECT_LT(r.ts_body_end, go_ns) << "a part came after the venue began to read";
+    EXPECT_LT(r.ts_up_sent - go_ns, 100'000'000) << "t3 waited for the parts behind the first send";
+    EXPECT_GE(r.ts_body_sent - r.ts_up_sent, 100'000'000);
+    EXPECT_EQ(r.body_work_ns, 0) << "every part came before t3, inside upwrite";
 }
 
 // The retry on a fresh connection is a new attempt: its connect is t2, its first send
