@@ -60,6 +60,8 @@ namespace llmbridge::detail
             c->req.f.body_streaming = false;
             c->req.f.ts_body_end = t;
             c->req.f.client_upload_ns = span_since(c->ts_first_byte, t);
+            // Setup holds the upload, as a held body's does, so subtracting it still works.
+            if (!c->req.f.client_conn_reused) c->req.f.client_conn_setup_ns = span_since(c->ts_accepted, t);
             c->ts_first_byte = c->rbuf.size() > c->msg.total_len ? t : 0; // as open_request
             if (_sink) (void)capture_model(c); // the facts only: every byte already passed
         }

@@ -37,7 +37,8 @@ namespace llmbridge
         /// separates a full pipe from a congestion window still opening.
         uint64_t request_bytes = 0;
         bool client_conn_reused = false;
-        /// Inbound leg, first request on the connection only, else 0: accept to t0.
+        /// Inbound leg, first request on the connection only, else 0: accept to its last
+        /// byte, t0 or a streamed body's `ts_body_end`.
         /// Contains the TLS handshake, the client's idle time, and the request upload
         /// (`client_upload_ns`, subtract it). Excludes the TCP handshake because it
         /// completes before `accept()`. For handshake alone prefer the `accept(TLS)`.

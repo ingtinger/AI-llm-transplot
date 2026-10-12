@@ -230,8 +230,11 @@ our work and the venue's wait where a held body puts them:
   upload.
 - **`ts_body_end`** is the read that brought the body's last byte, and
   `client_upload_ns` runs from the request's first byte to it: a 10 MB body at
-  100 Mbit/s reads about 840 ms there, as it would held. It is 0 when the venue
-  answered before the body ended; the rest is then read and dropped.
+  100 Mbit/s reads about 840 ms there, as it would held. On a connection's first
+  request `client_conn_setup_ns` runs to it too, so it holds the upload as a held
+  body's does and subtracting one from the other still leaves the wait before the
+  first byte. `ts_body_end` is 0 when the venue answered before the body ended; the
+  rest is then read and dropped, and both stop at t0.
 - **`ts_body_sent`** is the last send completion, the body's last byte handed to the
   kernel. The provider's wait is t4 − `ts_body_sent` (`upstream-us`,
   `upstream-ttfb-us`): a venue cannot answer a request it has not all got.

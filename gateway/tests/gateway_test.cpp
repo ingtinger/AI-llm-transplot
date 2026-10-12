@@ -11337,6 +11337,8 @@ TEST_P(ProxyBodyStream, AStreamedUploadIsTheClientsTimeNotOurs)
     EXPECT_TRUE(r.body_streamed);
     EXPECT_GE(r.client_upload_ns, kUploadNs * 3 / 4) << "the upload is the client's";
     EXPECT_GE(r.ts_body_end - r.ts_req_recvd, kUploadNs * 3 / 4);
+    ASSERT_FALSE(r.client_conn_reused);
+    EXPECT_GE(r.client_conn_setup_ns, r.client_upload_ns) << "setup holds the upload, as a held body's";
     EXPECT_LT(r.ts_up_sent - wire_of(r), kUploadNs / 10) << "upwrite carried the upload";
     EXPECT_GE(r.ts_body_sent, r.ts_body_end);
     EXPECT_LE(r.ts_body_sent, r.ts_up_recvd);
@@ -11583,6 +11585,9 @@ TEST_P(ProxyBodyStream, OnAndOffReadTheSameUpload)
     for (const llmbridge::RequestRecord& r : rec)
     {
         EXPECT_GE(r.client_upload_ns, kUploadNs * 3 / 4) << "on=" << r.body_streamed;
+        // Setup less the upload is the connection's wait before its first byte.
+        EXPECT_GE(r.client_conn_setup_ns - r.client_upload_ns, 0) << "on=" << r.body_streamed;
+        EXPECT_LT(r.client_conn_setup_ns - r.client_upload_ns, kUploadNs / 4) << "on=" << r.body_streamed;
         EXPECT_LT(req_path_of(r) - r.body_work_ns, kUploadNs / 4) << "on=" << r.body_streamed;
         EXPECT_LT(r.ts_up_recvd - r.ts_body_sent, kUploadNs / 4) << "on=" << r.body_streamed;
     }
