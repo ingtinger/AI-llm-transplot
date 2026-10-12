@@ -1190,6 +1190,37 @@ TEST(ModelOf, RefusesWhatItCannotCompare)
         << "a truncated body must not yield a model";
 }
 
+// A gateway deciding on the head of a body still arriving reads model_of on the bytes so
+// far: every prefix yields nothing or the whole body's own model, never a cut name, a
+// nested decoy, a name in a prompt or a later repeat.
+TEST(ModelOf, EveryPrefixYieldsNothingOrTheWholeBodysModel)
+{
+    const std::string bodies[] = {
+        R"({"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]})",
+        R"({"messages":[{"role":"user","content":"use {\"model\":\"evil\"} here"}],"model":"gpt-4o"})",
+        R"({"metadata":{"model":"decoy"},"stream":true,"model":"m-1","model":"m-2"})",
+        R"({"a":{"b":[1,2,{"c":"}"}]},"b":[[]],"c":null,"d":true,"e":-1.5e3,"f":"a\"b","model":"m"})",
+        R"( { "max_tokens" : 12 , "model" : "spaced" } )",
+        R"({"x":"\\","model":"after-a-backslash"})",
+        R"({"x":"\\\"","model":"after-an-escaped-quote"})",
+        R"({"model":"a\\b","n":1})",
+        R"({"n":123,"model":7})",
+        R"({"messages":[]})",
+    };
+    for (const std::string& body : bodies)
+    {
+        const std::string_view whole = llmbridge::provider::model_of(body);
+        for (size_t n = 0; n <= body.size(); ++n)
+        {
+            const std::string prefix = body.substr(0, n); // its own buffer, so a read past it is caught
+            const std::string_view got = llmbridge::provider::model_of(prefix);
+            EXPECT_TRUE(got.empty() || got == whole) << body << " cut at " << n << " read " << got;
+        }
+    }
+    EXPECT_EQ(llmbridge::provider::model_of(R"({"model":"gpt-4o")"), "gpt-4o") << "closed is enough";
+    EXPECT_TRUE(llmbridge::provider::model_of(R"({"model":"gpt-4)").empty());
+}
+
 TEST(ModelOf, SkipsEveryValueShape)
 {
     EXPECT_EQ(llmbridge::provider::model_of(
