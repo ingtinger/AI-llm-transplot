@@ -15,6 +15,7 @@
 #include <deque>
 #include <string>
 
+#include "provider/dialect.hpp"
 #include "provider/json.hpp"
 #include "provider/openai.hpp"
 
@@ -2018,4 +2019,105 @@ TEST(ToolReq, ArgumentsDecodeInPlaceWithEveryEscape)
     const Value* in = v.find("messages")->arr[0].find("content")->arr[0].find("input");
     ASSERT_NE(in, nullptr);
     EXPECT_EQ(in->sv, R"({"q":"\u00e9 \\ \/ \n","r":"plain run"})");
+}
+
+// ── The venue table ───────────────────────────────────────────────────────────
+
+// Every finish reason each provider documents, and what it reads as. A value missing
+// here fell through to "stop": an Anthropic refusal or a Gemini SPII block looked like
+// a finished answer, and a Cohere ERROR or a Gemini MALFORMED_FUNCTION_CALL like a
+// success. A failure (null here) is no completion at all: the gateway answers 502.
+TEST(FinishTables, EveryDocumentedValue)
+{
+    struct Case { const char* reason; const char* finish; };
+    const Case anthropic[] = {{"end_turn", "stop"}, {"stop_sequence", "stop"}, {"pause_turn", "stop"},
+                              {"max_tokens", "length"}, {"model_context_window_exceeded", "length"},
+                              {"tool_use", "tool_calls"}, {"refusal", "content_filter"}};
+    for (const Case& c : anthropic)
+    {
+        const std::string in = std::string(R"({"content":[{"type":"text","text":"x"}],"stop_reason":")") +
+                               c.reason + "\"}";
+        Value out = P(anthropic_to_openai_response(in));
+        EXPECT_EQ(out.find("choices")->arr[0].str_or("finish_reason"), c.finish) << c.reason;
+    }
+    const Case gemini[] = {{"STOP", "stop"}, {"FINISH_REASON_UNSPECIFIED", "stop"}, {"OTHER", "stop"},
+                           {"MAX_TOKENS", "length"}, {"SAFETY", "content_filter"},
+                           {"RECITATION", "content_filter"}, {"LANGUAGE", "content_filter"},
+                           {"BLOCKLIST", "content_filter"}, {"PROHIBITED_CONTENT", "content_filter"},
+                           {"SPII", "content_filter"}, {"IMAGE_SAFETY", "content_filter"},
+                           {"MALFORMED_FUNCTION_CALL", nullptr}, {"UNEXPECTED_TOOL_CALL", nullptr},
+                           {"TOO_MANY_TOOL_CALLS", nullptr}};
+    for (const Case& c : gemini)
+    {
+        const std::string in = std::string(R"({"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":")") +
+                               c.reason + "\"}]}";
+        if (!c.finish) { EXPECT_TRUE(gemini_to_openai_response(in).empty()) << c.reason; continue; }
+        Value out = P(gemini_to_openai_response(in));
+        EXPECT_EQ(out.find("choices")->arr[0].str_or("finish_reason"), c.finish) << c.reason;
+    }
+    const Case cohere[] = {{"COMPLETE", "stop"}, {"STOP_SEQUENCE", "stop"}, {"MAX_TOKENS", "length"},
+                           {"TOOL_CALL", "tool_calls"}, {"ERROR", nullptr}, {"TIMEOUT", nullptr}};
+    for (const Case& c : cohere)
+    {
+        const std::string in = std::string(R"({"message":{"content":[{"type":"text","text":"x"}]},"finish_reason":")") +
+                               c.reason + "\"}";
+        if (!c.finish) { EXPECT_TRUE(cohere_to_openai_response(in).empty()) << c.reason; continue; }
+        Value out = P(cohere_to_openai_response(in));
+        EXPECT_EQ(out.find("choices")->arr[0].str_or("finish_reason"), c.finish) << c.reason;
+    }
+}
+
+// A prompt Gemini blocks has no candidate, only promptFeedback.blockReason: it read as a
+// successful empty answer.
+TEST(FinishTables, ABlockedGeminiPromptIsAContentFilter)
+{
+    Value out = P(gemini_to_openai_response(R"({"promptFeedback":{"blockReason":"SAFETY"}})"));
+    EXPECT_EQ(out.find("choices")->arr[0].str_or("finish_reason"), "content_filter");
+}
+
+// Gemini names the model in the path. It was always `models/gemini`, which names no model.
+TEST(VenueTargets, GeminiAndBedrockPutTheModelInThePath)
+{
+    using llmbridge::provider::spec;
+    using llmbridge::provider::Venue;
+    std::string path;
+    ASSERT_TRUE(spec(Venue::Gemini).target("gemini-2.5-flash", path));
+    EXPECT_EQ(path, "/v1beta/models/gemini-2.5-flash:generateContent");
+    path.clear();
+    ASSERT_TRUE(spec(Venue::Gemini).target("models/gemini-2.5-pro", path));
+    EXPECT_EQ(path, "/v1beta/models/gemini-2.5-pro:generateContent") << "the API's own prefix is not doubled";
+    path.clear();
+    EXPECT_FALSE(spec(Venue::Gemini).target("", path)) << "no model names no path";
+    path.clear();
+    ASSERT_TRUE(spec(Venue::Bedrock).target(R"(arn:aws:bedrock:us-east-1::inference-profile\/us.x)", path));
+    EXPECT_EQ(path, "/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A%3Ainference-profile%2Fus.x/invoke")
+        << "decoded from its JSON form, then one segment";
+    path.clear();
+    ASSERT_TRUE(spec(Venue::Anthropic).target("anything", path));
+    EXPECT_EQ(path, "/v1/messages");
+}
+
+// The request translators read a body parsed once; the override reaches them through
+// RequestOut, and the result is what a splice and a second parse produced.
+TEST(VenueTargets, AnOverrideThroughRequestOutMatchesTheSplice)
+{
+    using llmbridge::provider::RequestOut;
+    using llmbridge::provider::spec;
+    using llmbridge::provider::Venue;
+    const std::string body = R"({"model":"gpt-4o","max_tokens":9,"messages":[{"role":"user","content":"hi"}]})";
+    for (const Venue v : {Venue::Anthropic, Venue::Gemini, Venue::Cohere, Venue::Bedrock, Venue::Azure})
+    {
+        bool ok = false;
+        const Value in = parse(body, ok);
+        ASSERT_TRUE(ok);
+        std::string out;
+        RequestOut o{out, body, "claude-x"};
+        ASSERT_TRUE(spec(v).request(in, o)) << spec(v).name;
+        const std::string spliced = llmbridge::provider::rewrite_model(body, "claude-x");
+        Value sp = P(spliced);
+        std::string expect;
+        RequestOut e{expect, spliced};
+        ASSERT_TRUE(spec(v).request(sp, e));
+        EXPECT_EQ(out, expect) << spec(v).name;
+    }
 }

@@ -237,10 +237,9 @@ namespace llmbridge::detail
         if (hs == net::http::FrameStatus::Error) return error_respond(client, 502, "upstream response head framing");
         const net::http::ResponseHead& h = u->framer.h();
         // Only a 200 is a real stream; a provider error is relayed with its own status.
-        // Gemini and Cohere do not stream here: their translators do not exist.
-        const UpstreamDialect d = client->req.f.effective_dialect;
+        // A translated one needs a venue that streams (a stream:true elsewhere is refused).
         if (h.event_stream && h.status == 200 && h.body != net::http::Body::None &&
-            (!client->req.f.translate_body || d == UpstreamDialect::Anthropic || d == UpstreamDialect::Azure))
+            (!client->req.f.translate_body || provider::spec(client->req.f.effective_dialect).streams))
         {
             // t4 for a stream is the head, not the first token: LATENCY.md 3.
             client->req.f.ts_up_recvd = now_ns();

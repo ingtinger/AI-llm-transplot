@@ -19,7 +19,8 @@
 
 #include "net/http_write.hpp"
 #include "net/sigv4.hpp"
-#include "provider/json.hpp" // translate_failure re-parses a refused body
+#include "provider/dialect.hpp"
+#include "provider/json.hpp"
 
 namespace llmbridge::detail
 {
@@ -124,19 +125,20 @@ namespace llmbridge::detail
                 if (v.empty()) return;
                 out.append(name).append(": ").append(v).append("\r\n");
             };
-            switch (mode)
+            using provider::Auth;
+            switch (provider::spec(mode).auth)
             {
-                case UpstreamDialect::Anthropic:
+                case Auth::XApiKey:
                     line("x-api-key", x_api_key.empty() ? bearer_token(auth) : x_api_key);
                     line("anthropic-version", version.empty() ? kAnthropicVersionDefault : version);
                     return nullptr;
-                case UpstreamDialect::Gemini:
+                case Auth::GoogApiKey:
                     line("x-goog-api-key", goog.empty() ? bearer_token(auth) : goog);
                     return nullptr;
-                case UpstreamDialect::Cohere:
+                case Auth::Bearer:
                     line("Authorization", auth); // Cohere speaks Bearer natively
                     return nullptr;
-                case UpstreamDialect::Azure:
+                case Auth::ApiKey:
                 {
                     // Azure's own `api-key` first; the OpenAI SDK against an Azure
                     // endpoint sends Authorization, the normal case.
@@ -146,52 +148,11 @@ namespace llmbridge::detail
                     line("api-key", key);
                     return nullptr;
                 }
-                case UpstreamDialect::Bedrock: // signed instead: sign_bedrock
-                case UpstreamDialect::OpenAI:  // byte-forwarded, never rebuilt here
+                case Auth::SigV4:   // signed instead: sign_bedrock
+                case Auth::Forward: // byte-forwarded, never rebuilt here
                     break;
             }
             return "credential";
-        }
-
-        /// An OpenAI body in the venue's dialect, into `out`, and the venue's path for it,
-        /// into `target`. False refuses the request.
-        bool xlate_req(UpstreamDialect mode, std::string_view body, bool* wants_stream_usage,
-                       std::string& out, std::string& target)
-        {
-            out.clear();
-            switch (mode)
-            {
-                case UpstreamDialect::Anthropic:
-                    target = "/v1/messages";
-                    return provider::openai_to_anthropic_request(body, out, wants_stream_usage);
-                case UpstreamDialect::Gemini:
-                    target = "/v1beta/models/gemini:generateContent";
-                    out = provider::openai_to_gemini_request(body);
-                    return !out.empty(); // Gemini and Cohere refuse by returning nothing
-                case UpstreamDialect::Cohere:
-                    target = "/v2/chat";
-                    out = provider::openai_to_cohere_request(body);
-                    return !out.empty();
-                case UpstreamDialect::Bedrock:
-                {
-                    // The model moves from the body into the path, encoded as one
-                    // segment, slashes included: an inference-profile id may hold them.
-                    std::string model;
-                    if (!provider::openai_to_bedrock_request(body, model, out) || model.empty())
-                    { out.clear(); return false; }
-                    target.assign("/model/").append(net::sigv4::uri_encode(model, true)).append("/invoke");
-                    return true;
-                }
-                case UpstreamDialect::Azure:
-                    // Azure serves the OpenAI dialect: the body goes as the client wrote it,
-                    // so an option we do not model is not dropped on the way through.
-                    out.assign(body);
-                    target = "/chat/completions";
-                    return !out.empty();
-                case UpstreamDialect::OpenAI:
-                    break;
-            }
-            return false;
         }
 
         /// Sign a rebuilt Bedrock request into `out`, or refuse it. Here and not at the
@@ -319,12 +280,11 @@ namespace llmbridge::detail
     {
         const std::string_view head(c->rbuf.data(), c->msg.header_len);
         const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
-        // Whether the client asked to stream is consulted for one venue only,
-        // because Bedrock cannot stream from this endpoint, and answering it means walking
-        // the body to its top-level `stream` key.
-        const bool stream_matters = venue.dialect == UpstreamDialect::Bedrock;
-        return resolve_translation(client_dialect_of(head), venue.dialect,
-                                   stream_matters && provider::wants_stream(body));
+        // Whether the client asked to stream matters only to an OpenAI client of a venue
+        // that cannot stream, and answering it walks the body to its top-level `stream`.
+        const Dialect client = client_dialect_of(head);
+        const bool stream_matters = client == Dialect::OpenAI && !provider::spec(venue.dialect).streams;
+        return resolve_translation(client, venue.dialect, stream_matters && provider::wants_stream(body));
     }
 
     /// Why a request translation failed, for the log only. The translator returns
@@ -397,16 +357,7 @@ namespace llmbridge::detail
 
     const char* dialect_name(UpstreamDialect m) noexcept
     {
-        switch (m)
-        {
-            case UpstreamDialect::OpenAI: return "openai";
-            case UpstreamDialect::Anthropic: return "anthropic";
-            case UpstreamDialect::Gemini: return "gemini";
-            case UpstreamDialect::Cohere: return "cohere";
-            case UpstreamDialect::Bedrock: return "bedrock";
-            case UpstreamDialect::Azure: return "azure";
-        }
-        return "?";
+        return provider::spec(m).name.data(); // a literal, so terminated
     }
 
     // A minimal HTTP/1.1 message: start line, JSON type, keep-alive, length, `extra`
@@ -510,42 +461,44 @@ namespace llmbridge::detail
     }
 
     /// Everything between a client request and the bytes for a translated venue, written
-    /// straight into `out`. The body and target come first, because a Bedrock signature
-    /// covers both; the credential is the client's, from the framing walk, in the
-    /// venue's terms.
+    /// straight into `out`. The body is parsed once, here; a model override reaches the
+    /// venue's translator and its path through RequestOut, never a splice and a reparse.
+    /// The body and target come before the credential, because a Bedrock signature
+    /// covers both.
     bool build_translated_request(const Upstream& up, UpstreamDialect mode,
                                   std::string_view body, std::string_view head,
                                   const HeadFacts& f, std::string& out,
                                   std::string& body_scratch, const char*& why,
                                   std::string_view model_override, bool* wants_stream_usage)
     {
-        // One rewrite before translating serves every dialect: the translators read the
-        // model out of the body, and Bedrock then puts it in the path.
-        std::string rewritten;
-        if (!model_override.empty())
-        {
-            rewritten = provider::rewrite_model(body, model_override);
-            if (rewritten.empty()) { why = "translate"; return false; }
-            body = rewritten;
-        }
-        std::string target;
-        if (!xlate_req(mode, body, wants_stream_usage, body_scratch, target))
-        { why = "translate"; return false; }
+        why = "translate";
+        out.clear();
+        const provider::VenueSpec& s = provider::spec(mode);
+        bool ok = false;
+        const provider::json::Value v = provider::json::parse(body, ok);
+        if (!ok || !v.is_object() || !s.request) return false;
+        // An override replaces a model the client named, never a missing one.
+        const provider::json::Value* m = v.find("model");
+        if (!model_override.empty() && (!m || !m->is_string() || !provider::plain_json_text(model_override)))
+            return false;
+        provider::RequestOut o{body_scratch, body, model_override};
+        if (!s.request(v, o)) return false;
+        if (wants_stream_usage) *wants_stream_usage = o.include_usage;
         const std::string_view tbody = body_scratch;
 
-        out.clear();
-        const size_t need = tbody.size() + up.base_path.size() + target.size() + up.query.size() +
-                            up.host_hdr.size() + 512;
+        const size_t need = tbody.size() + up.base_path.size() + up.query.size() + up.host_hdr.size() + 640;
         if (out.capacity() < need) out.reserve(need + need / 8);
-        // The venue's query, not the client's: Azure's api-version rides here.
-        out.append("POST ").append(up.base_path).append(target);
+        // The venue's path from the model it is asked for; its query, not the client's:
+        // Azure's api-version rides there.
+        out.append("POST ").append(up.base_path);
+        if (!s.target(model_override.empty() ? v.str_or("model") : model_override, out))
+        { out.clear(); return false; }
         if (!up.query.empty()) out.append("?").append(up.query);
         out.append(" HTTP/1.1\r\nHost: ").append(up.host_hdr).append("\r\n");
-        if (mode == UpstreamDialect::Bedrock)
+        if (s.auth == provider::Auth::SigV4)
         {
             // Signed over exactly the target written above, between "POST " and " HTTP/1.1".
-            const std::string_view signed_target(out.data() + 5, out.find(" HTTP/1.1") - 5);
-            const std::string path(signed_target);
+            const std::string path(out.data() + 5, out.find(" HTTP/1.1") - 5);
             if (!sign_bedrock(up, f.authorization.in(head), path, tbody, out, why))
             { out.clear(); return false; }
         }
@@ -562,22 +515,7 @@ namespace llmbridge::detail
     bool xlate_resp(UpstreamDialect mode, std::string_view body, std::string& out,
                     provider::openai::Usage& u)
     {
-        switch (mode)
-        {
-            // Bedrock answers with Anthropic's Messages envelope, so the response
-            // leg is the same translator; only the request leg differs.
-            case UpstreamDialect::Bedrock:
-            case UpstreamDialect::Anthropic:
-                return provider::anthropic_to_openai_response(body, out, u);
-            // Azure answers in the OpenAI shape it was asked in.
-            case UpstreamDialect::Azure:
-                out.assign(body);
-                u = provider::openai::scan_usage(body);
-                return !out.empty();
-            case UpstreamDialect::Gemini: return provider::gemini_to_openai_response(body, out, u);
-            case UpstreamDialect::Cohere: return provider::cohere_to_openai_response(body, out, u);
-            case UpstreamDialect::OpenAI: break;
-        }
+        if (const auto response = provider::spec(mode).response) return response(body, out, u);
         out.clear();
         u = {};
         return false;

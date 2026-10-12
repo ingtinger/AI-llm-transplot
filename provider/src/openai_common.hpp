@@ -8,10 +8,8 @@
 #pragma once
 
 // Internal helpers shared by the two translators when producing OpenAI-shaped
-// output: the whole-body path (translate_*.cpp) and the streaming path (sse.cpp).
-// Not public API: it lives in src/, not include/. Kept in one place so the two
-// paths can't drift: a new Anthropic stop_reason (or a change to how `created`
-// is stamped) must land identically for streaming and non-streaming.
+// output: the whole-body path (translate_*.cpp) and the streaming path (sse.cpp),
+// kept in one place so the two cannot drift. Finish reasons are the venue table's.
 
 #include <ctime>
 #include <string>
@@ -93,14 +91,4 @@ namespace llmbridge::provider::detail
         if (u.cached <= 0) u.cached = -1;
     }
 
-    // Anthropic Messages stop_reason -> OpenAI finish_reason. Returns a static
-    // literal. Shared by translate_anthropic.cpp (non-streaming message_delta) and sse.cpp
-    // (streaming message_delta), which must agree.
-    inline const char* anthropic_finish_reason(std::string_view stop_reason)
-    {
-        if (stop_reason == "max_tokens") return "length";
-        if (stop_reason == "tool_use") return "tool_calls";
-        // end_turn, stop_sequence, and anything else -> "stop"
-        return "stop";
-    }
 } // namespace llmbridge::provider::detail

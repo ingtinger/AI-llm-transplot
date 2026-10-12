@@ -29,6 +29,17 @@ namespace llmbridge::provider::openai
 
     enum class Shape : uint8_t { Completion, Chunk };
 
+    /// How a choice ended, in OpenAI's terms. Error is a venue's own failure: never
+    /// written, the gateway answers 502 instead.
+    enum class Finish : uint8_t { Stop, Length, ToolCalls, ContentFilter, Error };
+
+    /// The `finish_reason` text for `f`; null for Error.
+    constexpr const char* finish_name(Finish f) noexcept
+    {
+        constexpr const char* kNames[] = {"stop", "length", "tool_calls", "content_filter", nullptr};
+        return kNames[static_cast<uint8_t>(f)];
+    }
+
     /// The one writer of an OpenAI response object, appending to `out`. `id` and `model`
     /// are JSON string contents, already escaped; `created` is decimal text.
     class Envelope

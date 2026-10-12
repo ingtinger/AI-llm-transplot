@@ -14,23 +14,15 @@
 #include <string>
 #include <vector>
 
+#include "provider/dialect.hpp"
+
 namespace llmbridge
 {
-    /// What a venue speaks. OpenAI byte-forwards; the rest translate on the way out
-    /// and back. Bedrock and Azure carry transport quirks over a body dialect:
-    /// DESIGN.md "Dialect resolution".
-    enum class UpstreamDialect
-    {
-        OpenAI,
-        Anthropic,
-        Gemini,
-        Cohere,
-        Bedrock,
-        Azure,
-    };
+    /// What a venue speaks: provider::Venue, whose table (provider/dialect.hpp) says
+    /// how each one is reached. OpenAI byte-forwards; the rest translate.
+    using UpstreamDialect = provider::Venue;
 
-    /// TLS on either leg, declared without ifdefs. `rbuf` and `wbuf` always hold plaintext;
-    /// ciphertext lives in `tls_out` and the Session.
+    /// TLS on either leg, declared without ifdefs.
     struct TlsConfig
     {
         /// Outbound, gateway to provider: we are the TLS client and verify them.

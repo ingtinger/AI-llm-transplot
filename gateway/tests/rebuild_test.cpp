@@ -12,6 +12,9 @@
 
 #include "request.hpp"
 
+#include "net/http.hpp"
+#include "provider/json.hpp"
+
 #include "gateway/gateway.hpp"
 
 #include <gtest/gtest.h>
@@ -152,6 +155,35 @@ TEST(Rebuild, MoreConnectionLinesThanTheWalkHoldsAreRefused)
     EXPECT_TRUE(into.empty());
 }
 
+// A translated request with a model override was spliced (one parse) and then
+// translated (a second parse). The body is parsed once now, and the override reaches
+// the translator through RequestOut; the bytes are the same.
+TEST(ParseOnce, AnOverriddenTranslatedRequestParsesTheBodyOnce)
+{
+    llmbridge::Upstream up{.ip = "127.0.0.1", .port = 1, .dialect = llmbridge::UpstreamDialect::Anthropic};
+    up.host_hdr = "venue";
+    std::string body = R"({"model":"gpt-4o","max_tokens":64,"messages":[)";
+    for (int i = 0; i < 66; ++i)
+        body += std::string(i ? "," : "") + R"({"role":"user","content":")" + std::string(2000, 'w') + "\"}";
+    body += "]}";
+    ASSERT_GT(body.size(), 128u * 1024);
+    const std::string head = "POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer k\r\n\r\n";
+    llmbridge::HeadFacts f;
+    const std::vector<std::string> strip;
+    ASSERT_TRUE(llmbridge::net::http::walk_headers(std::string_view(head).substr(0, head.size() - 4),
+                                                   llmbridge::detail::HeadReader{head, strip, f}));
+    std::string out, scratch;
+    const char* why = "";
+    const uint64_t before = llmbridge::provider::json::detail::parse_count();
+    ASSERT_TRUE(llmbridge::detail::build_translated_request(up, up.dialect, body, head, f, out, scratch,
+                                                            why, "claude-haiku-4-5"));
+    EXPECT_EQ(llmbridge::provider::json::detail::parse_count() - before, 1u);
+    const std::string expect = llmbridge::provider::openai_to_anthropic_request(
+        llmbridge::provider::rewrite_model(body, "claude-haiku-4-5"));
+    EXPECT_EQ(out.substr(out.size() - expect.size()), expect);
+    EXPECT_NE(out.find("\r\nx-api-key: k\r\n"), std::string::npos);
+}
+
 static std::string big_openai(size_t turns)
 {
     std::string b = R"({"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,)"
@@ -230,8 +262,9 @@ TEST(Rebuild, PrefaultMapsTheScratchPages)
 {
     const size_t want = 4u << 20;
     llmbridge::Gateway off(0, "127.0.0.1", 1);
-    // An empty string points into its own object, so one resident page is the floor.
-    EXPECT_LE(off.prefault_resident_bytes_for_test(), 4096u);
+    // An empty string points into its own object, whose inline buffer may straddle a
+    // page boundary wherever the allocator placed it: two pages, never the 4 MiB.
+    EXPECT_LE(off.prefault_resident_bytes_for_test(), 2 * 4096u);
     llmbridge::Gateway on(0, "127.0.0.1", 1);
     on.set_prefault_bytes(want);
     EXPECT_GE(on.prefault_resident_bytes_for_test(), want);

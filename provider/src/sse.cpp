@@ -11,7 +11,8 @@
 #include <cstring>
 
 #include "json_scan.hpp"
-#include "openai_common.hpp" // detail::now_secs / anthropic_finish_reason
+#include "openai_common.hpp" // detail::now_secs
+#include "provider/dialect.hpp"
 #include "provider/json.hpp"
 
 namespace llmbridge::provider
@@ -358,7 +359,9 @@ namespace llmbridge::provider
             if (const json::Value* d = v.find("delta"))
                 if (const std::string_view sr = d->str_or("stop_reason"); !sr.empty())
                 {
-                    _finish = detail::anthropic_finish_reason(sr);
+                    const openai::Finish f = finish_of(spec(Venue::Anthropic), sr);
+                    if (f == openai::Finish::Error) { _failed = true; return; }
+                    _finish = openai::finish_name(f);
                     _tool_open = false; // the message completed; arguments are whole
                 }
             // Anthropic reports output_tokens cumulatively on message_delta.

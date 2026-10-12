@@ -17,6 +17,7 @@
 #include "messages.hpp"
 #include "openai_common.hpp" // detail::now_secs / gemini_usage
 #include "provider/json.hpp"
+#include "venues.hpp"
 
 namespace llmbridge::provider
 {
@@ -61,20 +62,21 @@ namespace llmbridge::provider
         };
     } // namespace
 
-    std::string openai_to_gemini_request(std::string_view openai_body)
+    // The model is not in the body: Gemini names it in the path (VenueSpec::target).
+    bool detail::gemini_request(const json::Value& v, RequestOut& o)
     {
-        bool ok = false;
-        const json::Value v = json::parse(openai_body, ok);
-        if (!ok || !v.is_object()) return {};
+        std::string& out = o.body;
+        out.clear();
+        if (!v.is_object()) return false;
         // A body carrying no `messages` array is not a chat request. Refuse instead of guessing.
         const json::Value* msgs = v.find("messages");
-        if (!msgs || !msgs->is_array() || detail::declares_tools(v)) return {};
+        if (!msgs || !msgs->is_array() || declares_tools(v)) return false;
 
-        std::string out, system;
-        out.reserve(openai_body.size() + 256);
+        std::string system;
+        if (out.capacity() < v.sv.size() + 256) out.reserve(v.sv.size() + 256);
         out = "{\"contents\":[";
         GeminiTurns turns{out, system};
-        if (!detail::walk_messages(*msgs, turns)) return {};
+        if (!walk_messages(*msgs, turns)) { out.clear(); return false; }
         out += ']';
         if (!system.empty())
         {
@@ -92,12 +94,22 @@ namespace llmbridge::provider
             out += key;
             out += value;
         };
-        put("\"maxOutputTokens\":", detail::max_tokens_of(v));
+        put("\"maxOutputTokens\":", max_tokens_of(v));
         put("\"temperature\":", v.num_or("temperature"));
         put("\"topP\":", v.num_or("top_p"));
         if (out.size() == first) out.resize(at);
         else out += '}';
         out += '}';
+        return true;
+    }
+
+    std::string openai_to_gemini_request(std::string_view openai_body)
+    {
+        bool ok = false;
+        const json::Value v = json::parse(openai_body, ok);
+        std::string out;
+        RequestOut o{out};
+        if (!ok || !detail::gemini_request(v, o)) return {};
         return out;
     }
 
@@ -111,19 +123,18 @@ namespace llmbridge::provider
         if (!ok || !v.is_object()) return false;
 
         const json::Value* parts = nullptr; // candidates[0].content.parts
-        const char* finish = "stop";
+        openai::Finish finish = openai::Finish::Stop;
         if (const json::Value* cands = v.find("candidates"); cands && cands->is_array() && !cands->arr.empty())
         {
             const json::Value& c0 = cands->arr.front();
             if (const json::Value* cont = c0.find("content"))
                 if (const json::Value* p = cont->find("parts"); p && p->is_array()) parts = p;
-            // Gemini finishReason -> OpenAI finish_reason.
-            const std::string_view fr = c0.str_or("finishReason", "STOP");
-            finish = fr == "MAX_TOKENS" ? "length"
-                   : (fr == "SAFETY" || fr == "RECITATION" || fr == "BLOCKLIST" ||
-                      fr == "PROHIBITED_CONTENT") ? "content_filter"
-                   : "stop";
+            finish = finish_of(spec(Venue::Gemini), c0.str_or("finishReason", "STOP"));
         }
+        // A prompt Gemini blocks has no candidate at all, only the reason.
+        else if (const json::Value* pf = v.find("promptFeedback"); pf && !pf->str_or("blockReason").empty())
+            finish = openai::Finish::ContentFilter;
+        if (finish == openai::Finish::Error) return false;
 
         long long total = -1;
         if (const json::Value* m = v.find("usageMetadata"))
@@ -146,7 +157,7 @@ namespace llmbridge::provider
         if (parts)
             for (const auto& part : parts->arr) out += part.str_or("text");
         out += '"';
-        e.end_choice(finish).close(&usage, false, total);
+        e.end_choice(openai::finish_name(finish)).close(&usage, false, total);
         return true;
     }
 

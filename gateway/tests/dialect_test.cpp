@@ -125,28 +125,49 @@ TEST(Dialect, BedrockRefusesAStreamedRequest)
     const TranslationPlan p =
         resolve_translation(Dialect::OpenAI, UpstreamDialect::Bedrock, /*stream=*/true);
     EXPECT_FALSE(p.ok);
-    EXPECT_STREQ(p.why, "bedrock venue cannot stream");
+    EXPECT_STREQ(p.why, "venue cannot stream");
     // And the same venue still serves a non-streamed request.
     EXPECT_TRUE(resolve_translation(Dialect::OpenAI, UpstreamDialect::Bedrock,
                                     /*stream=*/false).ok);
 }
 
-TEST(Dialect, StreamingChangesNothingForEveryOtherVenue)
+// Streaming is a venue capability in its table. A translated Gemini or Cohere request
+// that asked to stream got a whole JSON body back, which an OpenAI SDK reads as an
+// empty stream; it is refused, like Bedrock's.
+TEST(Dialect, OnlyAVenueThatStreamsServesAStreamedTranslation)
 {
-    // The flag is a Bedrock fact, not a general one: every other venue streams, and a
-    // guard that quietly refused elsewhere would break the workload we are built for.
-    for (UpstreamDialect v : {UpstreamDialect::OpenAI, UpstreamDialect::Anthropic,
-                            UpstreamDialect::Gemini, UpstreamDialect::Cohere,
-                            UpstreamDialect::Azure})
+    for (UpstreamDialect v : {UpstreamDialect::Gemini, UpstreamDialect::Cohere, UpstreamDialect::Bedrock})
+    {
+        const TranslationPlan s = resolve_translation(Dialect::OpenAI, v, /*stream=*/true);
+        EXPECT_FALSE(s.ok) << llmbridge::provider::spec(v).name;
+        EXPECT_STREQ(s.why, "venue cannot stream");
+        EXPECT_TRUE(resolve_translation(Dialect::OpenAI, v, /*stream=*/false).ok);
+    }
+    for (UpstreamDialect v : {UpstreamDialect::OpenAI, UpstreamDialect::Anthropic, UpstreamDialect::Azure})
     {
         const TranslationPlan s = resolve_translation(Dialect::OpenAI, v, /*stream=*/true);
         const TranslationPlan n = resolve_translation(Dialect::OpenAI, v, /*stream=*/false);
-        EXPECT_EQ(s.ok, n.ok) << static_cast<int>(v);
-        EXPECT_TRUE(s.ok) << static_cast<int>(v);
-        EXPECT_EQ(s.translate, n.translate) << static_cast<int>(v);
-        EXPECT_EQ(s.venue, n.venue) << static_cast<int>(v);
+        EXPECT_TRUE(s.ok) << llmbridge::provider::spec(v).name;
+        EXPECT_EQ(s.translate, n.translate);
+        EXPECT_EQ(s.venue, n.venue);
     }
-    // An Anthropic client streaming to an Anthropic venue is the Claude Code path.
-    EXPECT_TRUE(resolve_translation(Dialect::Anthropic, UpstreamDialect::Anthropic,
-                                    /*stream=*/true).ok);
+    // A same-dialect client byte-forwards its own stream: the Claude Code path, and a
+    // Gemini client on a Gemini venue.
+    EXPECT_TRUE(resolve_translation(Dialect::Anthropic, UpstreamDialect::Anthropic, true).ok);
+    EXPECT_TRUE(resolve_translation(Dialect::Gemini, UpstreamDialect::Gemini, true).ok);
+}
+
+// One table names every venue: the flag, the config file and the logs read it.
+TEST(Dialect, EveryVenueHasOneName)
+{
+    const auto names = llmbridge::provider::venue_names();
+    ASSERT_EQ(names.size(), 6u);
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        const auto v = static_cast<UpstreamDialect>(i);
+        EXPECT_EQ(llmbridge::provider::spec(v).name, names[i]);
+        EXPECT_EQ(llmbridge::provider::venue_named(names[i]), v) << names[i];
+    }
+    EXPECT_EQ(llmbridge::provider::venue_named("Anthropic"), std::nullopt) << "exact spelling";
+    EXPECT_EQ(llmbridge::provider::venue_named("none"), std::nullopt);
 }
