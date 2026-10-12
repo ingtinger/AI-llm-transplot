@@ -8,6 +8,34 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.91.0]. 2026-10-11
+
+### Changed
+
+- **Large bodies translate faster.** At 10 MB, translating a chat transcript to
+  Anthropic went from 24.0 to 15.5 ms (best of 15 runs; BENCHMARKS.md), and a body of
+  tool schemas from 48.9 to 23.5 ms, with no allocation left at `--retain-mb 16`.
+  The bytes sent are unchanged: the translate goldens and the bijection test are
+  byte-identical.
+  - A string's plain run is found sixteen bytes a step (SSE2 on x86-64, an
+    eight-byte word scan elsewhere) instead of a branch per byte, in the parser and
+    in the streamed-body scan.
+  - A request body is parsed for translation with a tool's `parameters` opaque: the
+    schema is checked exactly as before, repeated keys at any depth included, but no
+    node is built for it, since every translator forwards it byte for byte.
+- `json::parse()` takes a list of opaque member names; `provider::parse_request_body()`
+  and `kOpaqueRequestMembers` name the request's. `json::detail::string_stop()`.
+
+### Tests
+
+- The run scanner against a byte loop at every offset of random strings; an opaque
+  member is its span with no children and gets every refusal a built one does
+  (repeated key, unescaped repeat, bad escape, control byte, leading zero, trailing
+  comma, nesting past `kMaxDepth`, more than `kMaxNodes` values). `fuzz_json` checks
+  the scanner against the byte loop, and the same verdict and the same tree with and
+  without opaque members, on every input.
+
+
 ## [0.90.0]. 2026-10-11
 
 ### Added

@@ -210,6 +210,27 @@ client's first byte:
   10 MB of schemas, whose document is about three times the body, still allocates 43
   times.
 
+**v0.91.0, faster large-body translation.** Translation was the larger cost of a
+translated 10 MB request, so the parser now finds the end of a plain string run
+sixteen bytes at a time and leaves a tool's `parameters` schema unbuilt (checked,
+then forwarded as a span). One 10 MB translation, the best of 15 runs, with the
+instructions counted under callgrind:
+
+| 10 MB body | 0.90.0 | 0.91.0 |
+|---|---|---|
+| transcript: translate | 24.0 ms, 151 M instructions | **15.5 ms**, 59 M |
+| transcript: parse alone | 19.2 ms | **10.6 ms** |
+| tool schemas: translate | 48.9 ms, 302 M instructions | **23.5 ms**, 206 M |
+| tool schemas: allocations at `--retain-mb 4` / `16` | 55 / 43 | **1 / 0** |
+
+Through the gateway at 100 Mbit/s the reply to a translated 10 MB transcript came
+at 877 ms instead of 890 (871 instead of 886 with `--retain-mb 16`), and to 10 MB
+of schemas at 879 ms instead of 946 (874 instead of 928). The rest is the upload.
+What is left of a transcript's translation is the copy of its text into the
+venue's body and one pass over every escape; a 10 MB `memcpy` alone takes 3 ms on
+this host. Streaming the translation as the body arrives would hide it behind the
+upload, but it changes when a bad body can be refused, so it is not done.
+
 ## B. Streaming (SSE): time to first token and delivered tokens
 
 > Every latency figure in this document is defined in [LATENCY.md](LATENCY.md):

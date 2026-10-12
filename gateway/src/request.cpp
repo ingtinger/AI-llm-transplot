@@ -487,7 +487,7 @@ namespace llmbridge::detail
         out.clear();
         const provider::VenueSpec& s = provider::spec(mode);
         bool ok = false;
-        const provider::json::Value v = provider::json::parse(body, ok);
+        const provider::json::Value v = provider::parse_request_body(body, ok);
         if (!ok || !v.is_object() || !s.request) return false;
         // An override replaces a model the client named, never a missing one.
         const provider::json::Value* m = v.find("model");

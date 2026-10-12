@@ -809,6 +809,90 @@ TEST(JsonArena, ADroppedDocumentParksItsArenaForTheNextParse)
     EXPECT_EQ(spare.n, 4u);
 }
 
+// ── Large bodies: the run scanner and opaque members ─────────────────────────────
+
+TEST(JsonFast, TheRunScannerStopsWhereTheByteLoopDoes)
+{
+    using llmbridge::provider::json::detail::string_stop;
+    std::mt19937 rng(11);
+    const char kBytes[] = {'a', ' ', '"', '\\', '\x1f', '\x00', '\x7f', '\x80', '\xff', '/', 'u', '\x20'};
+    for (int round = 0; round < 3000; ++round)
+    {
+        // Mostly plain, so runs cross the 8- and 16-byte steps at every alignment.
+        std::string s(rng() % 70, 'x');
+        for (char& c : s)
+            if (rng() % 9 == 0) c = kBytes[rng() % sizeof(kBytes)];
+        for (size_t i = 0; i <= s.size(); ++i)
+        {
+            size_t want = i;
+            while (want < s.size() && s[want] != '"' && s[want] != '\\' &&
+                   static_cast<unsigned char>(s[want]) >= 0x20)
+                ++want;
+            ASSERT_EQ(string_stop(s.data(), i, s.size()), want) << "offset " << i << " of " << s.size();
+        }
+    }
+}
+
+TEST(JsonFast, AnOpaqueMemberIsItsSpanWithNoChildren)
+{
+    using llmbridge::provider::json::Keys;
+    constexpr std::string_view kOpaque[] = {"parameters"};
+    const std::string doc =
+        R"({"tools":[{"function":{"name":"f","parameters":{"type":"object","properties":{"a":{"type":"string"}}}}}],)"
+        R"("parameters":[1,{"b":2}],"x":{"parameters":"plain"}})";
+    bool ok = false;
+    const Value v = parse(doc, ok, Keys::Unique, kOpaque);
+    ASSERT_TRUE(ok);
+    const Value* fn = v.find("tools")->arr[0].find("function");
+    const Value* p = fn->find("parameters");
+    ASSERT_TRUE(p && p->is_object());
+    EXPECT_EQ(p->sv, R"({"type":"object","properties":{"a":{"type":"string"}}})");
+    EXPECT_EQ(p->find("type"), nullptr) << "not built";
+    EXPECT_TRUE(v.find("parameters")->is_array());
+    EXPECT_TRUE(v.find("parameters")->arr.empty());
+    EXPECT_EQ(v.find("parameters")->sv, R"([1,{"b":2}])");
+    // A scalar of that name is an ordinary value.
+    EXPECT_EQ(v.find("x")->str_or("parameters"), "plain");
+    EXPECT_EQ(fn->str_or("name"), "f");
+}
+
+TEST(JsonFast, AnOpaqueMemberIsCheckedAsFullyAsABuiltOne)
+{
+    using llmbridge::provider::json::Keys;
+    using llmbridge::provider::json::kMaxNodes;
+    using llmbridge::provider::json::detail::kMaxDepth;
+    constexpr std::string_view kOpaque[] = {"parameters"};
+    const auto both = [&](const std::string& doc) {
+        bool whole = false, lazy = false;
+        (void)parse(doc, whole);
+        (void)parse(doc, lazy, Keys::Unique, kOpaque);
+        EXPECT_EQ(whole, lazy) << doc.substr(0, 120);
+        return lazy;
+    };
+    EXPECT_TRUE(both(R"({"parameters":{"a":{"b":[1,2,{"c":null}]}}})"));
+    EXPECT_FALSE(both(R"({"parameters":{"a":1,"a":2}})")) << "a repeated key";
+    EXPECT_FALSE(both(R"({"parameters":{"x":{"m\u006fdel":1,"model":2}}})")) << "repeated once unescaped";
+    EXPECT_FALSE(both(R"({"parameters":{"a":"\q"}})")) << "a bad escape";
+    EXPECT_FALSE(both("{\"parameters\":{\"a\":\"\x01\"}}")) << "a control byte";
+    EXPECT_FALSE(both(R"({"parameters":{"a":01}})")) << "a leading zero";
+    EXPECT_FALSE(both(R"({"parameters":{"a":1,}})")) << "a trailing comma";
+    EXPECT_FALSE(both(R"({"parameters":[1 2]})"));
+    EXPECT_FALSE(both(R"({"parameters":{"a":tru}})"));
+    EXPECT_FALSE(both(R"({"parameters":{"a":1})"));
+    std::string deep = R"({"parameters":)";
+    for (int d = 0; d < kMaxDepth; ++d) deep += '[';
+    for (int d = 0; d < kMaxDepth; ++d) deep += ']';
+    EXPECT_FALSE(both(deep + "}")) << "nesting past kMaxDepth";
+    std::string wide = R"({"parameters":[0)";
+    for (size_t k = 0; k < kMaxNodes; ++k) wide += ",0";
+    EXPECT_FALSE(both(wide + "]}")) << "more than kMaxNodes values";
+    // Many keys take the sorted check: a repeat among 40 is still found.
+    std::string many = R"({"parameters":{)";
+    for (int k = 0; k < 40; ++k) many += "\"k" + std::to_string(k) + "\":" + std::to_string(k) + ",";
+    EXPECT_TRUE(both(many + R"("end":0}})"));
+    EXPECT_FALSE(both(many + R"("k17":0}})"));
+}
+
 // ── BodyScan: a body checked as it arrives ──────────────────────────────────────
 
 namespace
