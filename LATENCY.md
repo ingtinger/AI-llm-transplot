@@ -284,6 +284,9 @@ and t1, and `body_work_ns` is 0. Its decision ran during the upload and is in no
 as the upload is not. A body a confirm redid is timed the same way, as a fresh attempt: t0
 at its last byte and `body_work_ns` 0, so nothing done for the venue it left is counted;
 `body_streamed` stays set to say a venue had part of it.
+A model substitution spliced into a streamed body (GATEWAY-INTERNALS.md 12d) moves no
+stamp either: the splice is done as each part is staged, so after t3 it is in
+`body_work_ns`, and the trailing spaces go with the last byte, before `ts_body_sent`.
 
 
 ## 3. Per-request headers (`--timing-headers`)

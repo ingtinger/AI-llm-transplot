@@ -601,6 +601,17 @@ explicit because a confirm that changes its mind wastes a partial upload, a cost
 gateway records (`RequestRecord::decided_on_head`, `confirm_outcome`) so a deployment can
 measure it before turning it on. GATEWAY-INTERNALS.md 12c.
 
+A head decision cannot rewrite a model it has not seen, and the SDKs send `model` after the
+messages. `Decision::substitute_model` with `substitute_for` is the rewrite it can make: a
+conditional substitution, "if the body's top-level `model` is the plain string
+`substitute_for`, send this instead". On a streamed body the gateway splices it in as the
+model's bytes pass, holding back only that value until it closes, and declares the
+Content-Length itself: the client's, plus what the replacement adds. A body whose model is
+something else goes as sent with spaces after its last byte, so the declared length holds
+and the JSON stays valid; a shorter replacement is followed by spaces instead. The policy's
+confirm sees the client's model and `model_substituted`, and keeping it is no redo. On a
+body sent whole the substitution is an ordinary override. GATEWAY-INTERNALS.md 12d.
+
 ### Selecting a venue
 
 `Decision::upstream_index` picks one entry from the gateway's upstream table. The table
