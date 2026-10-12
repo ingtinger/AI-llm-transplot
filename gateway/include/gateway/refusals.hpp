@@ -33,6 +33,14 @@ namespace llmbridge
             "a Bedrock venue is signed with the caller's AWS access key pair, sent as "
             "Bearer ACCESS_KEY_ID:SECRET or ACCESS_KEY_ID:SECRET:SESSION_TOKEN; the bearer "
             "sent is not one (a Bedrock API key is not accepted here)";
+        inline constexpr const char* kKeyHeaderMissing =
+            "the provider key header this request is routed with is missing or empty";
+        inline constexpr const char* kKeyHeaderRepeated =
+            "the provider key header this request is routed with appears more than once";
+        inline constexpr const char* kKeyHeaderUnusable =
+            "the provider key header this request is routed with cannot be used for its venue";
+        inline constexpr const char* kKeyHeaderTooMany =
+            "a request routed with a provider key header carries at most 8 x-kottos-key- headers";
         inline constexpr const char* kNotJson = "request translate: body is not valid JSON";
         inline constexpr const char* kRepeatedKey =
             "request translate: an object in the body repeats a key";

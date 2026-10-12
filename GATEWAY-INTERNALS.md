@@ -142,7 +142,9 @@ constructs a fresh `ReqState` in place rather than assigning one, which writes o
 the scalars and leaves the string buffers' bytes alone. Strings the request keeps
 are `FixedStr` copies, never views: the policy's `model` and `service_tier` are
 copied at the decision (a longer one is refused with a 500, never cut), and a
-failover takes `Retry`'s.
+failover takes `Retry`'s. So is `credential_header`, the family header holding the
+attempt's key, once `key_header_ok` passes it (a name outside the family is a 400);
+the key itself stays in the head, found through the spans `HeadFacts` recorded.
 
 ### 3c. Phases
 

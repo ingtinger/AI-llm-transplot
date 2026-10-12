@@ -121,6 +121,15 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
 - **Client headers are not echoed.** A translated request is rebuilt from an explicit
   whitelist, so cookies, tracing headers and anything else a client sends do not reach
   the provider.
+- **Provider keys in the `x-kottos-key-` family never leave as sent.** No header with
+  that prefix, in any case, reaches an upstream on any path, with or without a policy,
+  and a sink cannot capture one, nor any credential header however its name is spelt
+  (`Authorization:` included). A key a policy names (`Decision::credential_header`)
+  goes out as the venue's own key header and is the only credential it receives; one
+  that is absent, repeated or malformed is a `400` before any upstream is contacted,
+  never a fallback to `Authorization`; one named for a venue past the gateway's table is
+  a `500`, never sent to the first venue; and a failover carries the next venue's key,
+  never the first one's.
 - **Malformed input fails closed**: a malformed credential returns `400` without
   contacting the upstream at all.
 - **An unfinished handshake cannot buffer without bound.** Measured, not assumed: a
@@ -153,6 +162,10 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   `--client-idle`, three days by default, so a descriptor cannot be held forever. That
   is a resource bound, not a fairness mechanism: nothing limits how much a single
   client may send.
+- **A key in the request target is forwarded.** A Gemini client byte-forwarding to a
+  Gemini venue may carry its own key as `?key=`; a named key header goes beside it, not
+  instead, so the venue receives two keys and Google decides which applies. The start
+  line logged at debug level carries it too.
 
 ## Security best practices for users
 

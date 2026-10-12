@@ -18,6 +18,7 @@
 #include <string_view>
 #include <type_traits>
 
+#include "gateway/policy.hpp"
 #include "gateway/sink.hpp"
 #include "gateway/venue.hpp"
 #include "net/http.hpp"
@@ -57,7 +58,8 @@ namespace llmbridge
 
     /// What the gateway reads from a client's request head in the framing walk, as
     /// offsets from the head's start: a request put back at the front of its buffer
-    /// for a failover reads the same. A header the operator strips is not seen.
+    /// for a failover reads the same. A header the operator strips is not seen, but for
+    /// the key family, which never leaves anyway.
     struct HeadFacts
     {
         struct Span
@@ -78,6 +80,11 @@ namespace llmbridge
         uint8_t expect = 0; ///< the first Expect: 0 none, 1 another, 2 100-continue
         bool content_length = false;
         Span content_type; ///< the first Content-Type value, as sent
+        /// Each family line a policy could name, in order, and its trimmed value. Past
+        /// kKeyHeaders the count stops at one more, and a named key is refused.
+        static constexpr uint8_t kKeyHeaders = 8;
+        Span key_name[kKeyHeaders], key_value[kKeyHeaders];
+        uint8_t key_headers = 0;
     };
 
     /// Everything a request owns that is trivially copyable. Never assigned field by
@@ -153,6 +160,7 @@ namespace llmbridge
         /// Copied from the policy's Decision, or from Retry on failover; never longer.
         FixedStr<255> model_override;
         FixedStr<32> tier_override;
+        FixedStr<kMaxKeyHeaderName> key_header; ///< the family header holding this attempt's key
         FixedStr<64> model;          ///< the client's, for the policy and the sink
         FixedStr<16> asked_tier;     ///< the client's own service_tier
         FixedStr<32> upstream_error; ///< the venue's name for a failure

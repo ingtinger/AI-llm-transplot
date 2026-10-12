@@ -17,8 +17,8 @@
 /// supplies a Policy. A stock build installs none. Design: DESIGN.md "The policy seam".
 namespace llmbridge
 {
-    /// Metadata only, no route to the body. `head` carries the client's Authorization: never
-    /// log a RequestFacts or keep a view; read headers with net::http::find_header.
+    /// Metadata only, no route to the body. `head` carries the client's keys (Authorization,
+    /// x-kottos-key-*): never log a RequestFacts or keep a view; use net::http::find_header.
     struct RequestFacts
     {
         std::string_view head;  ///< request line + headers, through the CRLFCRLF
@@ -48,14 +48,36 @@ namespace llmbridge
         return n > 0;
     }
 
+    /// Headers holding provider keys: no name with this prefix, in any case, goes upstream.
+    inline constexpr std::string_view kKeyHeaderPrefix = "x-kottos-key-";
+    inline constexpr size_t kMaxKeyHeaderName = 64;
+
+    /// The rule for Decision::credential_header and Retry::credential_header, public so a
+    /// policy can static_assert its own: the prefix in any case, then at least one of
+    /// [A-Za-z0-9._-], kMaxKeyHeaderName bytes in all.
+    [[nodiscard]] constexpr bool key_header_ok(std::string_view name) noexcept
+    {
+        if (name.size() <= kKeyHeaderPrefix.size() || name.size() > kMaxKeyHeaderName) return false;
+        for (size_t i = 0; i < name.size(); ++i)
+        {
+            const char c = net::http::detail::lc(name[i]);
+            const bool ok = i < kKeyHeaderPrefix.size()
+                                ? c == kKeyHeaderPrefix[i]
+                                : (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+                                      c == '_' || c == '.';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
     struct Decision
     {
         /// `= false` so `Decision d;` refuses too; `Decision{}` zeroes it either way.
         bool allow = false;
         /// Must be 400-599; the gateway substitutes 403 for anything else and warns.
         int deny_status = 401;
-        /// Index into the gateway's upstream table; out of range (the -1 default too) means
-        /// the first one. Ignored when `allow` is false.
+        /// Index into the gateway's upstream table; out of range (the -1 default too) means the
+        /// first one, but past the end with credential_header set is a 500. Ignored unless `allow`.
         int upstream_index = -1;
 
         /// Rewrite the request's `model` before sending; empty leaves the client's. Valid
@@ -70,6 +92,12 @@ namespace llmbridge
         const char* reason = "policy denied";
         const char* message = nullptr;
         uint64_t tag = 0;
+
+        /// The client header holding the key for the venue picked here, key_header_ok,
+        /// such as `x-kottos-key-anthropic`; empty sends the client's own credentials. Its
+        /// value goes as the venue's own key header and is the only credential sent: absent,
+        /// empty, repeated or unsafe is a 400, never another header. Copied, like `model`.
+        std::string_view credential_header{};
     };
 
     /// A venue did not answer (refused connect, failed write, EOF before the response, idle
@@ -93,6 +121,9 @@ namespace llmbridge
         /// the failed venue's. Valid until on_failure returns.
         std::string_view model{};
         std::string_view service_tier{};
+        /// As Decision::credential_header, for the venue named here. Left empty after any
+        /// attempt that named one, the decision or a retry, the request is not retried.
+        std::string_view credential_header{};
     };
 
     /// Non-owning, fixed at Gateway construction, called on its loop thread once per framed

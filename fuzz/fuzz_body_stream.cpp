@@ -30,8 +30,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     uint32_t rng = data[0] | 1u; // the chunk sizes
     const std::string_view body(reinterpret_cast<const char*>(data + 1), size - 1);
     const std::string head = "POST /v1/chat/completions HTTP/1.1\r\nHost: client\r\nContent-Type: "
-                             "application/json\r\nConnection: keep-alive\r\nContent-Length: " +
-                             std::to_string(body.size()) + "\r\n\r\n";
+                             "application/json\r\nX-Kottos-Key-Fuzz: k\r\nConnection: keep-alive\r\n"
+                             "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
     const std::vector<std::string> strip;
     HeadFacts f;
     if (!net::http::walk_headers(std::string_view(head).substr(0, head.size() - 4),
@@ -71,6 +71,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     } while (have < body.size());
 
     assert(held.compare(0, sent.size(), sent) == 0); // never a byte the held request lacks
+    // No key family header in either head, whatever the body holds.
+    for (const std::string* s : {&held, &sent})
+        assert(!net::http::detail::contains_ci(s->substr(0, s->find("\r\n\r\n")), "kottos-key"));
     if (v == provider::BodyScan::Verdict::Done)
     {
         assert(good);

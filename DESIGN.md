@@ -293,17 +293,20 @@ continuously fuzzed:
   - **One walk of a request head.** `parse_request` takes a visitor, and the gateway's
     (`HeadReader`) reads the credentials (`Authorization`, `x-api-key`, `api-key`,
     `x-goog-api-key`, `anthropic-version`; the first of each, a stripped one unseen),
-    `Expect` and every `Connection` value in the framing walk, as offsets into the
-    head. The translated request is written from them straight into the scratch; the
-    Bearer scheme matches in any case.
+    up to eight `x-kottos-key-*` lines a policy could name, stripped or not ("Naming
+    the key for a venue"), `Expect` and every `Connection` value in the framing walk,
+    as offsets into the head. The translated request is written from them straight
+    into the scratch; the Bearer scheme matches in any case.
   - **What a byte-forward drops.** The hop-by-hop headers (`Connection`, `Keep-Alive`,
     `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`) and any header a `Connection` line
     names belong to the client's hop; forwarded, `Connection: close` kept the venue's
     connection out of the pool and `Upgrade` invited a 101 the gateway cannot relay.
-    `Host`, `Content-Length`, `Expect` and `Accept-Encoding` are dropped too, and an
-    HTTP/1.0 request line goes as HTTP/1.1. Whether the venue's connection is pooled
-    is the venue's response alone. A head with more than four `Connection` lines is
-    refused rather than forwarded with a listed header kept.
+    `Host`, `Content-Length`, `Expect` and `Accept-Encoding` are dropped too, every
+    `x-kottos-key-*` header in any case, and with a key named the client's
+    `Authorization`, `x-api-key`, `api-key` and `x-goog-api-key` ("Naming the key for
+    a venue"); an HTTP/1.0 request line goes as HTTP/1.1. Whether the venue's
+    connection is pooled is the venue's response alone. A head with more than four
+    `Connection` lines is refused rather than forwarded with a listed header kept.
   - **What a relayed response keeps** (`net/http_write.hpp`). A reply the gateway
     re-frames (a translated provider error, a chunked byte-forward, a stream's head)
     keeps the upstream's `Retry-After`, `retry-after-ms`, rate-limit headers
@@ -576,7 +579,8 @@ have to know which venue it lands on, which defeats routing.
 
 Two rules make the single-upstream gateway a special case of this one, not a different
 thing. An index that is unset (-1) or past the end of the table means the
-First upstream, so a policy that only authenticates never learns the table exists. And
+First upstream, so a policy that only authenticates never learns the table exists (past
+the end with a key named is refused: "Naming the key for a venue"). And
 **pools are per venue**: a keep-alive connection to one provider is never handed to a
 request bound for another, because that would put the request, and its credential, on a
 socket to the wrong company. A retry after a stale pooled connection stays on the same
@@ -604,6 +608,48 @@ the client already has.
 Still not in the seam: the body itself, and anything derived from it beyond the model
 name and the opt-in prefix hash.
 
+### Naming the key for a venue (`Decision::credential_header`)
+
+A request may carry one provider key per `x-kottos-key-<domain>` header, so one route can
+list venues that take different keys. The policy names the header holding the key for
+the venue it picked, and a failover names the next venue's in
+`Retry::credential_header`. The value goes out as the venue's own key header, by its
+`VenueSpec` auth kind: `x-api-key` for Anthropic, `Authorization: Bearer` for
+OpenAI-compatible venues and Cohere, `x-goog-api-key` for Gemini, `api-key` for Azure.
+A request translated for Anthropic carries the client's `anthropic-version`, or
+2023-06-01; a byte-forward keeps the client's head, so its `anthropic-version` goes as
+sent, and none is added. The named key is the only credential the venue receives: a
+byte-forward drops the client's `Authorization`, `x-api-key`, `x-goog-api-key` and
+`api-key`.
+
+The name is not known while the head is framed, so the framing walk records every family
+line a policy could name (`key_header_ok`) with its trimmed value, as offsets into the
+head, up to eight: a request reaches at most three venues, and there are six kinds. At
+dispatch, per attempt, `named_key` matches the policy's name against that table and
+reads nothing else. A translated request is still one walk of the head and a
+byte-forward two, framing and the rebuild, whether or not a key is named, and nothing is
+allocated. A strip-list entry for the named header does not hide it from that read: the
+family never leaves anyway.
+
+A named key never falls back to `Authorization`, which may hold another provider's key.
+The request gets a 400 with fixed text, before any upstream is contacted, when the named
+header is absent or empty, appears more than once in any case, or holds a control or
+8-bit byte or more than 8 KiB; when the name is outside the family; when the head carries
+more than eight nameable family lines, since a repeat could hide past the table; and
+when the venue is Bedrock, which signs with a key pair and has no header for a bearer
+key. A decision naming a key with an index past the end of the table gets a 500, before
+any upstream is contacted. Unnamed, such an index means the first venue; named, the
+first venue would receive a key meant for another provider as its own. -1, the default,
+means the first venue either way. A failover that names no header after any earlier
+attempt that named one, the decision or a retry, gives up, and the client sees the
+failure; one that names a header the client never sent gets the 400.
+
+The family itself never leaves. Every header whose name starts with `x-kottos-key-`, in
+any case, is dropped from every byte-forwarded request, with or without a policy: at
+dispatch, in the head of a body sent as it arrives, and in a stale connection's retry.
+The strip list matches exact names, and a client picks the suffix. A translated request
+is rebuilt from a whitelist and never carried one, and a sink cannot capture one.
+
 ### Dropping headers before they leave (`upstream.strip_headers`)
 
 A policy decides; it cannot rewrite. So the companion to the seam is a list of header
@@ -615,7 +661,8 @@ Empty by default, which keeps passthrough a single memcpy. It exists because
 a byte-forward carried the client's bytes verbatim, headers included, which is
 the "echo" this repo's own rule forbids: a header meant for this gateway, or an internal
 routing header, reached a third-party provider. Translating modes were never affected;
-they rebuild from a whitelist already.
+they rebuild from a whitelist already. The key family is dropped whatever the list says
+(above).
 
 ## Logging
 

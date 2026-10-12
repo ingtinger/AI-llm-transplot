@@ -110,11 +110,27 @@ namespace llmbridge::detail
             return true;
         }
 
+        /// The line a venue takes a named key on, up to the key; none for one that signs.
+        std::string_view key_line_for(UpstreamDialect venue) noexcept
+        {
+            using provider::Auth;
+            switch (provider::spec(venue).auth)
+            {
+                case Auth::Forward:
+                case Auth::Bearer: return "Authorization: Bearer ";
+                case Auth::XApiKey: return "x-api-key: ";
+                case Auth::GoogApiKey: return "x-goog-api-key: ";
+                case Auth::ApiKey: return "api-key: ";
+                case Auth::SigV4: break;
+            }
+            return {};
+        }
+
         /// The client's credential lines in the venue's terms, appended to `out`. Every
         /// credential the client sent is checked first, whether or not this venue reads
         /// it, so a malformed value cannot route around the check by picking another.
         const char* append_auth(UpstreamDialect mode, std::string_view head, const HeadFacts& f,
-                                std::string& out)
+                                const NamedKey& key, std::string& out)
         {
             const std::string_view auth = f.authorization.in(head), x_api_key = f.x_api_key.in(head),
                                    api_key = f.api_key.in(head), goog = f.x_goog_api_key.in(head),
@@ -126,6 +142,13 @@ namespace llmbridge::detail
                 out.append(name).append(": ").append(v).append("\r\n");
             };
             using provider::Auth;
+            if (!key.empty())
+            {
+                out.append(key.line).append(key.value).append("\r\n");
+                if (provider::spec(mode).auth == Auth::XApiKey)
+                    line("anthropic-version", version.empty() ? kAnthropicVersionDefault : version);
+                return nullptr;
+            }
             switch (provider::spec(mode).auth)
             {
                 case Auth::XApiKey:
@@ -249,22 +272,67 @@ namespace llmbridge::detail
                 if (f.connections < HeadFacts::kConnections) f.connection[f.connections] = span(h.value);
                 if (f.connections <= HeadFacts::kConnections) ++f.connections;
                 break;
+            case Field::Other:
+                // Every line a policy could name, stripped or not: no name is known yet.
+                if (!key_header_ok(h.name)) break;
+                if (f.key_headers < HeadFacts::kKeyHeaders)
+                {
+                    f.key_name[f.key_headers] = span(h.name);
+                    f.key_value[f.key_headers] = span(rtrim_ows(net::http::detail::ltrim(h.value)));
+                }
+                if (f.key_headers <= HeadFacts::kKeyHeaders) ++f.key_headers;
+                break;
             default: break;
         }
         return true;
     }
 
+    Refusal named_key(std::string_view head, const HeadFacts& f, std::string_view name,
+                      UpstreamDialect venue, NamedKey& out) noexcept
+    {
+        out = {};
+        // A signature covers a key pair; a bearer key has no header there to go in.
+        const std::string_view line = key_line_for(venue);
+        if (line.empty()) return {kWhyKeyUnusable, refuse::kKeyHeaderUnusable};
+        // Every line that could match is in the table, so a repeat is never missed.
+        if (f.key_headers > HeadFacts::kKeyHeaders) return {kWhyKeyTooMany, refuse::kKeyHeaderTooMany};
+        std::string_view value;
+        int seen = 0;
+        for (uint8_t i = 0; i < f.key_headers; ++i)
+            if (net::http::detail::same_ci(f.key_name[i].in(head), name) && seen++ == 0)
+                value = f.key_value[i].in(head);
+        if (seen > 1) return {kWhyKeyRepeated, refuse::kKeyHeaderRepeated};
+        if (value.empty()) return {kWhyKeyMissing, refuse::kKeyHeaderMissing};
+        if (!header_value_safe(value)) return {"malformed credential", refuse::kCredential};
+        out = {line, value};
+        return {};
+    }
+    // Spliced into a JSON string unescaped, as a policy's message is.
+    static_assert(deny_message_ok(refuse::kKeyHeaderMissing) && deny_message_ok(refuse::kKeyHeaderRepeated) &&
+                  deny_message_ok(refuse::kKeyHeaderUnusable) && deny_message_ok(refuse::kKeyHeaderTooMany));
+    static_assert(HeadFacts::kKeyHeaders == 8, "refuse::kKeyHeaderTooMany states the bound");
+
     // A test seam over one header block: the facts a framing walk would read.
     bool auth_headers_for(UpstreamDialect mode, std::string_view client_headers,
-                          const std::vector<std::string>& strip, std::string& out)
+                          const std::vector<std::string>& strip, std::string& out,
+                          std::string_view key_header, Refusal* refused)
     {
+        const auto fail = [&](Refusal r) {
+            if (refused) *refused = r;
+            out.clear();
+            return false;
+        };
         out.clear();
         while (client_headers.size() >= 2 && client_headers.substr(client_headers.size() - 2) == "\r\n")
             client_headers.remove_suffix(2);
         const std::string head = "POST / HTTP/1.1\r\n" + std::string(client_headers);
         HeadFacts f;
-        if (!net::http::walk_headers(head, HeadReader{head, strip, f})) return false;
-        return append_auth(mode, head, f, out) == nullptr;
+        if (!net::http::walk_headers(head, HeadReader{head, strip, f})) return fail({"request framing", nullptr});
+        NamedKey key;
+        if (!key_header.empty())
+            if (const Refusal r = named_key(head, f, key_header, mode, key)) return fail(r);
+        if (const char* bad = append_auth(mode, head, f, key, out)) return fail({bad, nullptr});
+        return true;
     }
 
     Dialect client_dialect_of(std::string_view head) noexcept
@@ -403,14 +471,15 @@ namespace llmbridge::detail
     /// because the request goes to a different origin than the client addressed; the
     /// Content-Length is ours, from the bytes actually sent; Expect asks the upstream
     /// for an interim reply we cannot relay; Accept-Encoding goes so the provider
-    /// answers in a body we can measure; and the hop-by-hop headers and any the client's
-    /// Connection names are this hop's, so the venue alone decides its own keep-alive.
+    /// answers in a body we can measure; the hop-by-hop headers and any the client's
+    /// Connection names are this hop's, so the venue alone decides its own keep-alive;
+    /// and an x-kottos-key- header holds a provider key no venue may see.
     /// The request line is copied, never tested as a header, and an HTTP/1.0 one goes
     /// as 1.1 so the upstream connection can be pooled.
     const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
                               const std::vector<std::string>& strip, std::string_view host_hdr,
                               std::string_view base_path, std::string_view body,
-                              std::string& into, size_t declared)
+                              std::string& into, size_t declared, const NamedKey& key)
     {
         using net::http::Field;
         into.clear();
@@ -428,7 +497,8 @@ namespace llmbridge::detail
         if (!target_path_ok(target)) return "request target not origin-form";
         const std::string_view version = rl.substr(sp2 + 1);
 
-        const size_t need = header_len + host_hdr.size() + base_path.size() + body.size() + 64;
+        const size_t need = header_len + host_hdr.size() + base_path.size() + body.size() +
+                            key.line.size() + key.value.size() + 64;
         if (into.capacity() < need) into.reserve(need + need / 8);
         into.append(rl.substr(0, sp1 + 1)).append(base_path).append(target).append(" ");
         into.append(version == "HTTP/1.0" ? std::string_view("HTTP/1.1") : version).append("\r\n");
@@ -436,6 +506,8 @@ namespace llmbridge::detail
         // A bodyless request that carried no length keeps carrying none. A body still
         // arriving declares all of it.
         if (f.content_length || declared) net::http::append_content_length(into, declared);
+        // A named key is the one credential: every one the client sent goes.
+        if (!key.empty()) into.append(key.line).append(key.value).append("\r\n");
         const auto listed = [&](std::string_view name) {
             for (uint8_t i = 0; i < f.connections; ++i)
                 if (net::http::has_token(f.connection[i].in(msg), name)) return true;
@@ -447,7 +519,11 @@ namespace llmbridge::detail
             const bool drop = (h.field == Field::Host && !host_hdr.empty()) ||
                               h.field == Field::ContentLength || h.field == Field::Expect ||
                               h.field == Field::AcceptEncoding || net::http::hop_by_hop(h.field) ||
-                              stripped(h.name, strip) || (h.field == Field::Other && listed(h.name));
+                              stripped(h.name, strip) ||
+                              (!key.empty() && (h.field == Field::Authorization || h.field == Field::XApiKey ||
+                                                h.field == Field::ApiKey || h.field == Field::XGoogApiKey)) ||
+                              (h.field == Field::Other &&
+                               (net::http::detail::line_is(h.name, kKeyHeaderPrefix) || listed(h.name)));
             if (!drop) return true;
             const size_t at = static_cast<size_t>(h.name.data() - head.data());
             if (at > run) into.append(head.substr(run, at - run));
@@ -463,13 +539,25 @@ namespace llmbridge::detail
     bool request_without(std::string_view msg, size_t header_len,
                          const std::vector<std::string>& strip,
                          std::string_view host_hdr, std::string_view base_path,
-                         std::string_view body_override, std::string& into)
+                         std::string_view body_override, std::string& into,
+                         std::string_view key_header, UpstreamDialect venue, Refusal* refused)
     {
+        const auto fail = [&](Refusal r) {
+            if (refused) *refused = r;
+            into.clear();
+            return false;
+        };
         HeadFacts f;
         const std::string_view head = msg.substr(0, header_len < 4 ? 0 : header_len - 4);
-        if (!net::http::walk_headers(head, HeadReader{msg, strip, f})) { into.clear(); return false; }
+        if (!net::http::walk_headers(head, HeadReader{msg, strip, f})) return fail({"request framing", nullptr});
+        NamedKey key;
+        if (!key_header.empty())
+            if (const Refusal r = named_key(msg, f, key_header, venue, key)) return fail(r);
         const std::string_view body = body_override.empty() ? msg.substr(header_len) : body_override;
-        return build_forward(msg, header_len, f, strip, host_hdr, base_path, body, into, body.size()) == nullptr;
+        if (const char* bad = build_forward(msg, header_len, f, strip, host_hdr, base_path, body, into,
+                                            body.size(), key))
+            return fail({bad, nullptr});
+        return true;
     }
 
     /// Everything between a client request and the bytes for a translated venue, written
@@ -481,7 +569,8 @@ namespace llmbridge::detail
                                   std::string_view body, std::string_view head,
                                   const HeadFacts& f, std::string& out,
                                   std::string& body_scratch, const char*& why,
-                                  std::string_view model_override, bool* wants_stream_usage)
+                                  std::string_view model_override, bool* wants_stream_usage,
+                                  const NamedKey& key)
     {
         why = "translate";
         out.clear();
@@ -498,7 +587,8 @@ namespace llmbridge::detail
         if (wants_stream_usage) *wants_stream_usage = o.include_usage;
         const std::string_view tbody = body_scratch;
 
-        const size_t need = tbody.size() + up.base_path.size() + up.query.size() + up.host_hdr.size() + 640;
+        const size_t need = tbody.size() + up.base_path.size() + up.query.size() + up.host_hdr.size() +
+                            key.value.size() + 640;
         if (out.capacity() < need) out.reserve(need + need / 8);
         // The venue's path from the model it is asked for; its query, not the client's:
         // Azure's api-version rides there.
@@ -511,10 +601,12 @@ namespace llmbridge::detail
         {
             // Signed over exactly the target written above, between "POST " and " HTTP/1.1".
             const std::string path(out.data() + 5, out.find(" HTTP/1.1") - 5);
+            // Never signed with whatever Authorization holds beside a named key.
+            if (!key.empty()) { why = "credential"; out.clear(); return false; }
             if (!sign_bedrock(up, f.authorization.in(head), path, tbody, out, why))
             { out.clear(); return false; }
         }
-        else if (const char* bad = append_auth(mode, head, f, out))
+        else if (const char* bad = append_auth(mode, head, f, key, out))
         { why = bad; out.clear(); return false; }
         out.append("Content-Type: application/json\r\nConnection: keep-alive\r\n");
         net::http::append_content_length(out, tbody.size());

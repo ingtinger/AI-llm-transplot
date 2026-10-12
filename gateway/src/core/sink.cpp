@@ -24,11 +24,12 @@ namespace llmbridge::detail
 
     // The header names that carry a credential, which is the set this gateway extracts
     // and re-emits: authorization and x-api-key (Bearer / Anthropic), x-goog-api-key
-    // (Gemini), and api-key (Azure).
+    // (Gemini), api-key (Azure), and the key family.
     static bool is_credential_header(std::string_view lowered) noexcept
     {
         return lowered == "authorization" || lowered == "x-api-key" ||
-               lowered == "x-goog-api-key" || lowered == "api-key";
+               lowered == "x-goog-api-key" || lowered == "api-key" ||
+               lowered.starts_with(kKeyHeaderPrefix);
     }
 
     void Engine::set_request_sink(RequestSink* sink, std::vector<std::string> capture)
@@ -40,10 +41,13 @@ namespace llmbridge::detail
             if (_sink_capture_names.size() == kSinkCaptureMax) break;
             for (char& ch : h)
                 ch = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
-            if (is_credential_header(h))
+            // Checked as find_header will read it, without its colon. One left inside
+            // names no header, yet would match into a value.
+            while (!h.empty() && (h.back() == ':' || h.back() == ' ' || h.back() == '\t')) h.pop_back();
+            if (is_credential_header(h) || h.find(':') != std::string::npos)
             {
                 LB_ERROR("sink capture refused for header ", h.c_str(),
-                         ": it carries a credential, which must never reach a sink");
+                         ": it can carry a credential, which must never reach a sink");
                 continue;
             }
             _sink_capture_names.push_back(std::move(h));
