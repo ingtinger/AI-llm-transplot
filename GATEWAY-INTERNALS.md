@@ -706,7 +706,8 @@ are not scanned; their translators would refuse a bad one, and here none runs.
 in `rbuf` and counts the rest of the body as `discard`: those bytes are read and
 thrown away as they arrive, so the client connection stays in step for its next
 request. A reply that closes the connection waits for that drain
-(`close_on_drain`).
+(`close_on_drain`). It takes a response byte: a TLS venue's session tickets arrive
+after its handshake as records with no plaintext, and the body goes on past them.
 
 **Stamps.** t0 is the head's framing, so the rest of the upload is not request-path
 time: it lands in the upstream wait, where the venue is reading it. t3 is restamped

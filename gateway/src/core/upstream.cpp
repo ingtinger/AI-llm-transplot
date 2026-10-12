@@ -240,7 +240,8 @@ namespace llmbridge::detail
         // over; kept, they would be the next client's response.
         if (!client) return _ops->close(*u);
         client->req.f.ts_progress = now_ns();
-        if (client->req.f.body_in_rbuf) end_body_stream(client, u);
+        // A TLS record may hold no response byte (a session ticket); only a byte ends the body.
+        if (client->req.f.body_in_rbuf && !u->rbuf.empty()) end_body_stream(client, u);
         if (client->req.f.streaming) return stream_pump(u);
 
         const int64_t t4 = now_ns(); // before the parse, so it counts in the response path

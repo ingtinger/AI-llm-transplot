@@ -941,6 +941,29 @@ TEST_P(GatewayTls, TlsHandshakeIsAttributedToConnectStreaming)
     expect_handshake_in_connect(all);
 }
 
+// A streamed body to a TLS venue. The venue's session tickets follow its handshake as
+// records with no response byte in them, and the first one ended the body as though the
+// venue had answered: the rest was dropped, the venue waited for it, and the client got
+// nothing.
+TEST_P(GatewayTls, AStreamedBodyReachesATlsVenueWhole)
+{
+    start();
+    const std::string req = make_request(R"({"model":"gpt","messages":[{"role":"user","content":")" +
+                                         std::string(64 * 1024, 'p') + R"("}]})");
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(req.substr(0, 20000))); // the head and a part: it streams
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_TRUE(c.send(req.substr(20000)));
+    const std::string r = c.recv_response(3000);
+    EXPECT_EQ(Client::status_of(r), 200) << r.substr(0, 300);
+    EXPECT_EQ(_backend.requests(), 1);
+    _gw->request_stop();
+    _gt.join();
+    EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
+    EXPECT_EQ(_gw->stats().upstream_unsent, 0u) << "the body was cut short";
+}
+
 TEST_P(GatewayTls, PooledConnectionSkipsSecondHandshake)
 {
     start();
