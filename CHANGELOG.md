@@ -8,6 +8,87 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.88.0]. 2026-10-11
+
+### Fixed
+
+- **A relayed provider error keeps the headers that say when to retry.** A translated
+  non-200 reply and a chunked byte-forwarded reply were re-framed with only
+  `Content-Type`, `Connection` and `Content-Length`, so a client got the provider's 429
+  without its `Retry-After`, rate-limit counts or request id. Both now keep the
+  upstream's `Retry-After`, `retry-after-ms`, `x-ratelimit-*`, `anthropic-ratelimit-*`,
+  `ratelimit*`, `x-request-id`, `request-id` and `x-amzn-requestid` headers, verbatim;
+  nothing else crosses. A stream's head carries them too.
+- **A chunked byte-forwarded reply keeps its `Content-Type`** (and its
+  `Content-Encoding`), where it was always labelled `application/json`.
+- **A policy's refusal keeps any 4xx or 5xx it names.** A code the error table did
+  not list (405, 409, 422, 451, 501, 599) went out as `502 Bad Gateway`, with
+  a 4xx's own message under it. One status table now serves every reply the gateway
+  writes; an unlisted code keeps its number and its class's phrase and error type.
+- **A byte-forward no longer passes the client's hop-by-hop headers upstream.**
+  `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade` and any
+  header a `Connection` line names are dropped, so a client sending
+  `Connection: close` no longer costs the provider leg a fresh connection (and over
+  TLS a handshake) per request, and `Upgrade` no longer invites a 101.
+- **`/v1/threads/{id}/messages` and other OpenAI paths ending in `/messages` are
+  OpenAI.** The client's dialect was a substring search of a request line cut at 128
+  bytes, so an OpenAI venue refused these with "no translator". It is now an exact
+  route on the method and the full target, the query stripped.
+- **Azure's `api-key` header is a credential.** It was not read, so an AzureOpenAI
+  SDK client was refused with "control characters are refused". Azure takes
+  `api-key`, then `x-api-key`, then a Bearer token; with none of them the request is
+  refused as having no credential.
+- **The Bearer scheme is matched in any case** (RFC 9110 11.1): `BEARER k` was not
+  mapped, so the provider answered 401.
+
+### Changed
+
+- **Behaviour change: an HTTP/1.0 request is byte-forwarded as HTTP/1.1**, and the
+  venue's connection is pooled on the venue's response alone, whatever the client's
+  `Connection` said. The client's own connection still closes as it asked.
+- **Behaviour change: a head with more than four `Connection` lines is refused**
+  (400) on a byte-forward, rather than forwarded with a listed header kept.
+- **Behaviour change: a client's dialect is an exact route.** A POST ending in
+  `/v1/messages` or `/v1/messages/count_tokens`, or any method under
+  `/v1/messages/batches`, is Anthropic; a POST ending in `:generateContent` or
+  `:streamGenerateContent` is Gemini; a POST ending in `/v2/chat` is Cohere. Anything
+  else is OpenAI. `client_dialect_from_target` is replaced by
+  `client_wire(method, target)` in `gateway/dialect.hpp`.
+- An Azure request with no credential is refused with its own message
+  (`refuse::kNoCredential`).
+- The reason phrase for 413 is `Content Too Large` (RFC 9110) everywhere, where a
+  relayed 413 said `Payload Too Large`.
+- **The request head is walked once.** `net::http::parse_request` takes a visitor, and
+  the gateway reads the credentials, `Expect` and `Connection` in the framing walk.
+  `scan_auth_headers`, `expects_continue` and the walk in `request_without` are gone;
+  `Field` names the hop-by-hop, credential and request-id headers, and
+  `net::http::hop_by_hop` says which are which.
+- **The request builders write straight into the kept scratch**: the byte-forward
+  rebuild (`build_forward`) in one pass, the translated request with its credential
+  lines appended in place. `net/http_write.hpp` holds the status table, the head
+  writers and the relay allowlist; `append_http_status` and `reason_for` are gone.
+
+### Performance
+
+- A byte-forwarded request makes no allocation once warm, from 3 (the head copy, the
+  `Content-Length` and the `Host` line); a translated request and a translated stream
+  make none either, from 2 (the credential lines' temporary). `alloc_test` ceilings
+  lowered to 0.
+
+### Tests
+
+- `ProxyRelay.*` (a translated 429, a chunked byte-forward 429, a stream head),
+  `ProxyPolicy.ADenyKeepsAnyStatusItNames`, `ProxyHop.*` (hop-by-hop dropped, clients
+  that close sharing one pooled upstream, HTTP/1.0 sent as 1.1, an Assistants path
+  byte-forwarded), `ProxyAuth.TheBearerSchemeIsCaseInsensitive`,
+  `ProxyAzure.AnApiKeyHeaderIsTheCredential` and `NoCredentialIsNamedAsMissing`: each
+  fails on both backends against 0.85.0.
+- `AuthHeaders.AnAzureApiKeyIsACredential`, `TheBearerSchemeIsCaseInsensitive`,
+  `ErrorReply.AnyStatusKeepsItsOwnCode`, `Rebuild.HopByHopAndConnectionListedHeadersAreDropped`,
+  `AnHttp10RequestLineGoesAsHttp11`, `MoreConnectionLinesThanTheWalkHoldsAreRefused`,
+  `Dialect.OnlyAnExactRouteNamesAnotherDialect`, and `net` tests for the visitor, the
+  field names, the status table and the allowlist.
+
 ## [0.87.0]. 2026-10-11
 
 **Behaviour change: io_uring pauses a slow client's stream instead of dropping it.**
