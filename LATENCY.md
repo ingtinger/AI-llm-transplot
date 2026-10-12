@@ -271,9 +271,19 @@ before bodies streamed; `--stream-body off`, which holds every body, and
 `--stream-openai-body off`, which holds an OpenAI client's, do the same, as does a body
 held because the worker already streams `--stream-body-max`. A streamed body cut for
 arriving too slowly is a 408 the gateway wrote, with `ts_body_end` 0 (GATEWAY-INTERNALS.md
-12b). In v0.90.0 and v0.91.0 a streamed body's t3 moved with each
-part, so its upload landed in `upwrite-us`, `request-path` and `added-total`,
-overflowing both histograms, while `client_upload_ns` read about 0.
+12b). In v0.90.0 and v0.91.0 a streamed body's t3 moved with each part, so its upload
+landed in `upwrite-us`, `request-path` and `added-total`, overflowing both histograms,
+while `client_upload_ns` read about 0.
+
+A policy that decides on the head (GATEWAY-INTERNALS.md 12c) changes none of this. A body
+it lets stream is timed as above: t0 is the head, its `decide()` runs between t0 and t1,
+so it is ours in `request-path`, and its `confirm()` runs at the last byte, after t3, so
+it is in `body_work_ns`. A body it parks is sent only at its last byte, and is timed as a
+held body: t0 moves to that byte (`ts_body_end` equals t0), its confirm falls between t0
+and t1, and `body_work_ns` is 0. Its decision ran during the upload and is in no interval,
+as the upload is not. A body a confirm redid is timed the same way, as a fresh attempt: t0
+at its last byte and `body_work_ns` 0, so nothing done for the venue it left is counted;
+`body_streamed` stays set to say a venue had part of it.
 
 
 ## 3. Per-request headers (`--timing-headers`)

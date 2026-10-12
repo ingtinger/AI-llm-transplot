@@ -132,6 +132,11 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   never the first one's.
 - **Malformed input fails closed**: a malformed credential returns `400` without
   contacting the upstream at all.
+- **A policy's refusal reaches no provider.** Decided on the whole body, nothing has left;
+  decided on the head of a body still arriving (`decides_on_head`), nothing has left
+  either, and once part of the body has gone its last byte waits for the policy's
+  `confirm()`, so a refusal there leaves the provider a reset body short of its
+  Content-Length, which it never runs.
 - **An unfinished handshake cannot buffer without bound.** Measured, not assumed: a
   peer that dribbles a record or declares a 16 MB ClientHello is refused at roughly
   16 KiB, the TLS record ceiling. A connection that never completes setup is closed
@@ -187,6 +192,21 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   `--client-idle`, three days by default, so a descriptor cannot be held forever. That
   is a resource bound, not a fairness mechanism: nothing limits how much a single
   client may send.
+- **A policy that decides on the head lets a venue see part of a prompt it may refuse.**
+  With `Policy::decides_on_head()`, off by default, a large body goes to the venue as it
+  arrives, before the policy has seen all of it. Its last byte is withheld until
+  `confirm()` keeps the decision, so a venue never holds a request it can run: a refusal
+  or a change of venue resets the connection with the body short of its Content-Length,
+  and the provider never runs it. The bytes before that byte did reach the provider,
+  which may log them. A policy that must not show a venue a prompt it might refuse
+  answers `hold` on the head, which keeps the body in the gateway to its last byte, or
+  does not opt in. GATEWAY-INTERNALS.md 12c.
+- **A non-OpenAI client's top-level keys are not checked.** The gateway refuses an OpenAI
+  client's body whose top-level keys a provider could read differently from it (a
+  repeated, escaped or excess key), held or arriving; another dialect's body is not
+  checked, so an Anthropic client's `{"model":"a",...,"model":"b"}` shows the policy and
+  the sink `a` while a provider that takes the last key runs `b`. This predates head
+  decisions, and a withheld last byte does not close it: nothing reads the second key.
 - **A key in the request target is forwarded.** A Gemini client byte-forwarding to a
   Gemini venue may carry its own key as `?key=`; a named key header goes beside it, not
   instead, so the venue receives two keys and Google decides which applies. The start

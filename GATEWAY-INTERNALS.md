@@ -682,7 +682,8 @@ as it arrives instead, when nothing about it needs the whole body:
 
 - the head is complete, the body is at least 16 KiB and not yet all here, and it is
   not content-encoded;
-- no policy is installed (a policy reads the body before it routes);
+- no policy is installed (a policy reads the body before it routes), or one that
+  decides on the head (12c);
 - the plan is a byte-forward: a translation reads the whole body;
 - `--stream-body on`, the default, and for an OpenAI client `--stream-openai-body on`
   too. Off, a body is held to its last byte exactly as before;
@@ -780,9 +781,9 @@ venue's, a 504 and `upstream_timeouts`. Only a send that moves bytes is the venu
 progress; before 0.94.0 staging a part was, so a venue that stopped reading timed out
 only once the client finished.
 
-**Never resent as whole.** A stalled body is not failed over and not retried. Failover
-needs a policy, and a policy's requests are never streamed; the stall path replies
-itself, never through `fail_request`. The stale-connection retry runs only on a venue
+**Never resent as whole.** A stalled body is not failed over and not retried. The stall
+path replies itself, never through `fail_request`, so not even a policy that decides on
+the head (12c) is asked to fail it over. The stale-connection retry runs only on a venue
 failure inside a second of taking a pooled connection, and resends the head and the
 bytes sent so far under the declared `Content-Length`, the rest following as it
 arrives: a venue that loses the client again holds a body short of its length.
@@ -793,3 +794,71 @@ path ends it: a refusal, a deadline, a stall, an error reply, the client leaving
 never pooled. On io_uring a close shuts the socket down first, so its operations
 complete; a reset shuts only the read side (`reset_on_close`), so the venue gets the
 RST with no FIN ahead of it.
+
+### 12c. A policy that decides on the head
+
+A policy routes on the head, and with `wants_prefix_hash()` on the body's leading 4 KiB:
+nothing past them chooses a venue or a key. One that returns true from
+`decides_on_head()`, read once at construction, is asked on the head of a body that
+qualifies under 12, as long as one venue in the table byte-forwards this client's dialect
+(`any_venue_streams`) and the worker streams fewer than `--stream-body-max` bodies. Every
+other request is decided whole, as before, and so is every request of a policy without the
+opt-in: `body_streamable` refuses those first, and they take the path they always did.
+
+**The decision.** With the hash wanted, `try_frame` waits for `decide_want`: the head and
+the first min(body, 4 KiB) bytes. It opens the request there, t0, and calls `decide()` with
+`body_whole` false: the head, the Content-Length, a top-level `model` that has closed in the
+bytes so far (`model_of` on a prefix gives nothing or the whole body's own model, never a
+cut name: `ModelOf.EveryPrefixYieldsNothingOrTheWholeBodysModel`), `stream` and
+`include_usage` false, and the prefix hash a held body would carry. Then one of three:
+
+- **Refused.** The reply goes at once, while the client is still uploading, and no venue is
+  contacted. It says `Connection: keep-alive`: the rest of the body is read and dropped
+  (`discard`, on the body's deadline), and the connection carries the next request.
+- **Allowed as is.** No override, no `hold`, and the venue it names byte-forwards: the body
+  streams there as in 12, in a `--stream-body-max` slot.
+- **Allowed otherwise.** An override, `hold`, or a venue that translates needs the whole
+  body. It is **parked** (`body_parked`): kept in rbuf with nothing sent, holding no venue
+  and no slot, an OpenAI client's JSON still checked by BodyScan as it arrives, and the
+  upload deadline of 12b still running, in `pump_body` and the sweep alike. At its last
+  byte it is sent as a held body.
+
+**The last byte waits for the confirm.** No byte that lets a venue run the request leaves
+before `confirm()`: while `confirm_pending`, `dispatch` and `pump_body` stage at most
+`body_len - 1` bytes, and the read that brings the last byte stages nothing until the
+confirm has answered. At that read `end_upload` takes the whole body's facts exactly as a
+held body's (`capture_model`, whose key check refuses a repeated, escaped or excess
+top-level key there, the venue reset) and calls `confirm(whole, early)`, `early` being the
+decision in force (`decision_in_effect`: the venue serving now, after any failover, and
+never -1). Its answer:
+
+- **Keep**: the same venue, model, service tier and key; the tag may change, and is kept.
+  The rest of the body goes, or a parked body is sent.
+- **Refuse**: as a BodyScan refusal. `cut_body` resets a venue holding part of the body, so
+  it holds one short of its Content-Length and never runs it, and the client gets the
+  policy's status and message, checked as decide's are.
+- **Redo**: any other allowed decision. The venue is reset, the decision applied by
+  `apply_decision`, the one decide uses, and the whole body sent as a held body under it.
+
+So a venue may see a prompt the policy then refuses or sends elsewhere, but never a
+request it can run: the cost of a change of mind is a partial upload, dropped.
+
+**Failover and retry.** A body decided on its head stays in rbuf (`body_in_rbuf`) until the
+first response byte, so a failover resends it from there, never from `saved`, and a request
+pipelined behind it keeps its place. While it is still arriving, a failover to a venue that
+takes it as it is streams it there from its first byte; with an override, or to a venue
+that translates, it parks. Once whole it goes as a held body. A stale connection's retry
+rebuilds a body that went in parts (`body_parts`) from rbuf, with the key the policy named
+(`named_key`), and resends one that went whole from its staged copy.
+
+**Stamps.** A streamed body is timed as in 12: t0 is its head, the decision falls between
+t0 and t1, and the confirm is part of `body_work_ns`. A parked body, and a redone one, is
+timed as a held body: `dispatch_whole` moves t0 to its last byte and zeroes
+`body_work_ns`, so the upload stays the client's and nothing done for an abandoned attempt
+is counted (LATENCY.md 2b).
+
+**Counted.** `policy_head_decisions`; `streamed_body_parked`, failover parks included;
+`streamed_body_redone`, redos of a body a venue held part of; and
+`streamed_body_confirm_refusals`, which `policy_denied` counts too. A sink record carries
+`decided_on_head` and `confirm_outcome`; with `body_streamed`, which a redo leaves set, a
+refusal or a redo of a body a venue had part of is a wasted partial upload.

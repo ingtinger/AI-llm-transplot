@@ -550,12 +550,16 @@ class Policy {
     virtual Decision decide(const RequestFacts&) noexcept = 0;
     virtual Retry on_failure(const FailureFacts&) noexcept { return {}; }
     virtual bool wants_prefix_hash() const noexcept { return false; }
+    virtual bool decides_on_head() const noexcept { return false; }
+    virtual Decision confirm(const RequestFacts& whole, const Decision& early) noexcept { return early; }
 };
 ```
 
 Supplied at `Gateway` construction, non-owning, stored `const` so there is no setter to
 race. Called at one site per backend, after framing and before translation, credential
-mapping or upstream acquisition, so a refusal reaches no provider.
+mapping or upstream acquisition, so a refusal reaches no provider. A policy that decides on
+the head is called there too, on the head: its refusal reaches no provider either, and a
+refusal from its confirm reaches one only as a reset body short of its Content-Length.
 
 Two separate defaults, answering different questions. `Gateway`'s policy pointer is
 null in a stock build, so no call is made and the request forwards: absent, not
@@ -573,6 +577,29 @@ One more field crosses the seam, and only on request: `prefix_hash`, a 64-bit id
 of the body's leading bytes (SHA-256, truncated to its leading eight bytes; the field
 promises the identity and not the function), computed when the policy returns true
 from `wants_prefix_hash()` and 0 otherwise.
+
+### Deciding on the head of a body (`decides_on_head`, `confirm`)
+
+A policy routes on the head and at most the leading 4 KiB, so holding a large body to its
+last byte for it costs the request one whole upload. A policy that returns true from
+`decides_on_head()` is asked on the head instead, with `RequestFacts::body_whole` false: a
+top-level `model` only once it has closed in the bytes so far, the streaming flags false,
+the prefix hash as a held body's (the gateway waits for its bytes). It may refuse there,
+and the refusal reaches no provider: the client is answered while still uploading, and
+the rest of its body is read and dropped. Allowed, the body streams to the venue as it
+arrives, or, when the decision needs all of it (an override, `Decision::hold`, a venue
+that translates), parks in the gateway unsent until its last byte.
+
+Either way the last byte waits for `confirm(whole, early)`, called once with the whole
+body's facts, exactly a held body's. Returning `early` keeps the decision; refusing answers
+the client with the policy's status and message, and a venue reaches the request only as
+a reset body short of its Content-Length, which it never runs; any other allowed decision
+redoes the request, the venue reset and the whole body sent under the new one. So a
+provider may see part of a prompt the policy then refuses or moves, never a request it can
+run, and what a policy decides on a whole body is what the provider runs. The opt-in is
+explicit because a confirm that changes its mind wastes a partial upload, a cost the
+gateway records (`RequestRecord::decided_on_head`, `confirm_outcome`) so a deployment can
+measure it before turning it on. GATEWAY-INTERNALS.md 12c.
 
 ### Selecting a venue
 
@@ -615,7 +642,7 @@ honestly, because no LLM API can resume mid-stream and a reconnect would replay 
 the client already has.
 
 Still not in the seam: the body itself, and anything derived from it beyond the model
-name and the opt-in prefix hash.
+name, the two streaming flags and the opt-in prefix hash.
 
 ### Naming the key for a venue (`Decision::credential_header`)
 
