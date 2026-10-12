@@ -41,10 +41,13 @@ namespace llmbridge::detail
             if (_sink_capture_names.size() == kSinkCaptureMax) break;
             for (char& ch : h)
                 ch = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
-            if (is_credential_header(h))
+            // Checked as find_header will read it, without its colon. One left inside
+            // names no header, yet would match into a value.
+            while (!h.empty() && (h.back() == ':' || h.back() == ' ' || h.back() == '\t')) h.pop_back();
+            if (is_credential_header(h) || h.find(':') != std::string::npos)
             {
                 LB_ERROR("sink capture refused for header ", h.c_str(),
-                         ": it carries a credential, which must never reach a sink");
+                         ": it can carry a credential, which must never reach a sink");
                 continue;
             }
             _sink_capture_names.push_back(std::move(h));

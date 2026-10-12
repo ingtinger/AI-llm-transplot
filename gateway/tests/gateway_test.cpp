@@ -11011,6 +11011,35 @@ TEST_P(ProxyKeyHeader, AKeyHeaderCanNeverBeCaptured)
     }
 }
 
+// A capture name is read as the lookup reads it, without its colon, so `Authorization:` is
+// refused as `authorization` is. A colon inside a name can only match into a value: refused
+// too, or `authorization: bearer akid` would capture a key pair's secret.
+TEST_P(ProxyKeyHeader, NoCredentialIsCapturedUnderAnotherSpelling)
+{
+    for (const char* name : {"Authorization:", "X-Api-Key: ", "authorization ::", "api-key\t:",
+                             "authorization: bearer akid", "X-Kottos-Key-Together:"})
+    {
+        SCOPED_TRACE(name);
+        NamedBackend b;
+        b.start("alpha");
+        RecordingSink sink;
+        start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, nullptr, &sink,
+              {name, "x-kottos-run"});
+        const std::string resp = exchange(openai_request_hdrs(
+            "hi", "Authorization: Bearer AKID:sk-AUTH-CAPTURED\r\nx-api-key: sk-XAPI-CAPTURED\r\n"
+                  "api-key: sk-AZURE-CAPTURED\r\nx-kottos-key-together: KEY-CAPTURED\r\n"
+                  "x-kottos-run: my-run\r\n"));
+        restart();
+        b.stop();
+        EXPECT_EQ(Client::status_of(resp), 200) << resp;
+        const auto recs = sink.records();
+        ASSERT_EQ(recs.size(), 1u);
+        EXPECT_EQ(recs[0].cap[0], "my-run") << "the name was registered for capture";
+        for (size_t i = 0; i < llmbridge::kSinkCaptureMax; ++i)
+            EXPECT_EQ(recs[0].cap[i].find("CAPTURED"), std::string::npos) << "slot " << i << ": " << recs[0].cap[i];
+    }
+}
+
 // Each translating venue gets the named key in its own header: x-api-key, x-goog-api-key,
 // Authorization: Bearer and api-key.
 TEST_P(ProxyKeyHeader, ATranslatedRequestCarriesOnlyTheNamedKey)
