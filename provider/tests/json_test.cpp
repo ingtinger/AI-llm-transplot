@@ -985,3 +985,76 @@ TEST(BodyScan, RandomBodiesAgreeWithTheHeldVerdict)
         EXPECT_EQ(scanned(s, 1 + next() % 9, b), held_verdict(s)) << s;
     }
 }
+
+// Tracking the top-level model (GATEWAY-INTERNALS.md 12d): its value, of any kind, is held
+// back until it closes, then told as its exact span, however the body is cut.
+TEST(BodyScan, TracksTheTopLevelModelValueOfAnyKind)
+{
+    const std::vector<std::string> values = {R"("auto")", R"("\u0061uto")", R"("")", "12", "-1.5e3", "0",
+                                             "true", "null", R"({"model":"x","a":[1]})", "[]", R"(["m"])"};
+    const std::vector<std::string> shapes = {R"({"messages":[{"model":"n"}],"model":@,"stream":true})",
+                                             R"({"model": @ ,"x":1})", R"({"model":@})"};
+    for (const std::string& v : values)
+        for (const std::string& shape : shapes)
+        {
+            std::string s = shape;
+            const size_t at = s.find('@');
+            s.replace(at, 1, v);
+            for (const size_t step : {size_t{1}, size_t{2}, size_t{5}, s.size()})
+            {
+                BodyScan b;
+                b.reset(/*all_keys=*/true, /*track_model=*/true);
+                size_t have = 0;
+                BodyScan::Verdict verdict = BodyScan::Verdict::More;
+                do
+                {
+                    have = std::min(s.size(), have + step);
+                    verdict = b.feed(std::string_view(s).substr(0, have), have == s.size());
+                    ASSERT_NE(verdict, BodyScan::Verdict::Refused) << s;
+                    if (b.model_end() == SIZE_MAX)
+                    {
+                        EXPECT_LE(b.safe(), at) << s << " cut at " << have;
+                    }
+                } while (have < s.size());
+                EXPECT_EQ(verdict, BodyScan::Verdict::Done) << s;
+                EXPECT_EQ(b.model_at(), at) << s;
+                EXPECT_EQ(b.model_end(), at + v.size()) << s;
+                EXPECT_EQ(b.safe(), s.size());
+            }
+        }
+}
+
+TEST(BodyScan, ABodyWithoutATopLevelModelTellsNoSpan)
+{
+    const std::string s = R"({"messages":[{"model":"auto"}],"x":{"model":"auto"}})";
+    BodyScan b;
+    b.reset(true, true);
+    EXPECT_EQ(b.feed(s, true), BodyScan::Verdict::Done);
+    EXPECT_EQ(b.model_end(), SIZE_MAX);
+    EXPECT_EQ(b.safe(), s.size());
+}
+
+// Another dialect's body: only `model` may not repeat, and no top-level key may be escaped,
+// so the model the gateway read and spliced is the one the venue reads.
+TEST(BodyScan, WithoutAllKeysOnlyTheModelMayNotRepeat)
+{
+    const auto verdict = [](const std::string& s) {
+        BodyScan b;
+        b.reset(/*all_keys=*/false, /*track_model=*/true);
+        return b.feed(s, true);
+    };
+    EXPECT_EQ(verdict(R"({"a":1,"a":2,"model":"m"})"), BodyScan::Verdict::Done);
+    EXPECT_EQ(verdict(R"({"stream_options":{"x":1,"x":2}})"), BodyScan::Verdict::Done);
+    EXPECT_EQ(verdict(R"({"model":"m","a":1,"model":"m"})"), BodyScan::Verdict::Refused);
+    EXPECT_EQ(verdict(R"({"model":"m","mo\u0064el":"x"})"), BodyScan::Verdict::Refused);
+    EXPECT_EQ(verdict(R"({"a":1,"a":2)"), BodyScan::Verdict::Refused) << "still JSON";
+    // A repeat is refused before any of it is safe to forward.
+    const std::string s = R"({"model":"auto","messages":[],"model":"evil"})";
+    for (size_t cut = 1; cut < s.size(); ++cut)
+    {
+        BodyScan b;
+        b.reset(false, true);
+        if (b.feed(std::string_view(s).substr(0, cut), false) == BodyScan::Verdict::Refused) break;
+        EXPECT_LE(b.safe(), s.rfind(R"("model")")) << "cut at " << cut;
+    }
+}
