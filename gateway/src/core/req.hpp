@@ -97,6 +97,15 @@ namespace llmbridge
         int64_t ts_wire_ready = 0;
         int64_t ts_up_sent = 0;
         int64_t ts_up_recvd = 0;
+        /// A streamed body's last byte in from the client and out to the kernel, and
+        /// our work on its later parts (LATENCY.md 2b); held, t0, t3 and 0.
+        int64_t ts_body_end = 0;
+        int64_t ts_body_sent = 0;
+        int64_t body_work_ns = 0;
+        /// The attempt's first send, the head and the body there at dispatch: its
+        /// plaintext length, and the upstream's sent_bytes once it is in, which t3 waits for.
+        uint64_t first_send_len = 0;
+        uint64_t first_send_end = 0;
         /// Streaming, outside t0-t6: first content token, first thinking delta, the
         /// latest chunk and the longest gap between chunks once tokens started.
         int64_t ts_first_token = 0;
@@ -155,10 +164,12 @@ namespace llmbridge
         /// A body forwarded as it arrives (GATEWAY-INTERNALS.md 12): bytes of it staged
         /// upstream, more still due, the request still at the front of rbuf for a
         /// resend, and each chunk checked by BodyScan first (an OpenAI client).
+        /// `body_streamed` stays set once the request is done.
         uint32_t body_sent = 0;
         bool body_streaming = false;
         bool body_in_rbuf = false;
         bool body_scanned = false;
+        bool body_streamed = false;
     };
     static_assert(std::is_trivially_copyable_v<ReqState>);
     static_assert(std::is_trivially_destructible_v<ReqState>);

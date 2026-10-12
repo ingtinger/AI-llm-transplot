@@ -220,7 +220,7 @@ def main():
     if latency.exists():
         doc = latency.read_text()
         lines = text.splitlines()
-        row = re.compile(r"^\|\s*\*\*(t\d)\*\*\s*\|\s*`(\w+)`\s*\|.*\|([^|]*)\|\s*$", re.M)
+        row = re.compile(r"^\|\s*\*\*(t\d|body \w+)\*\*\s*\|\s*`(\w+)`\s*\|.*\|([^|]*)\|\s*$", re.M)
         seen = 0
         for m in row.finditer(doc):
             stamp, ident, sites = m.group(1), m.group(2), m.group(3)
@@ -245,8 +245,8 @@ def main():
                     failures.append(
                         f"LATENCY.md:{doc_line}: STAMP: {stamp} says `{f}()` assigns "
                         f"`{ident}`, but it does not")
-        if seen < 7:
-            failures.append(f"LATENCY.md: STAMP: parsed only {seen} of 7 stamp rows; "
+        if seen < 9:
+            failures.append(f"LATENCY.md: STAMP: parsed only {seen} of 9 stamp rows; "
                             f"the table or this check is broken")
 
     # ---------------------------------------------------------------- 5

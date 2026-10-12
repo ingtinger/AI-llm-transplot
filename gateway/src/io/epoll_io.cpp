@@ -227,15 +227,14 @@ namespace llmbridge::detail
         return tls_read(c) && tls_flush(c, &done);
     }
 
-    // The request too, once the handshake completed: stamp t3 on the transition.
+    // The request too, once the handshake completed.
     bool EpollIo::tls_drain_read(UpstreamConn* u) noexcept
     {
+        const uint64_t sent = u->sent_bytes;
         if (!tls_read(u)) return false;
-        const bool was_flushed = u->client && _e.tls_out_flushed(u);
         bool done = false;
         if (!tls_flush(u, &done)) return false;
-        if (u->client && !was_flushed && _e.tls_out_flushed(u))
-            u->client->req.f.ts_up_sent = now_ns();
+        progressed(u, sent);
         return true;
     }
 
@@ -261,6 +260,8 @@ namespace llmbridge::detail
     {
         const int fd = net::make_client_socket();
         if (fd < 0) return false;
+        if (_e._upstream_sndbuf > 0)
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_e._upstream_sndbuf, sizeof(_e._upstream_sndbuf));
         if (::connect(fd, reinterpret_cast<const sockaddr*>(&u.up_addr), sizeof(u.up_addr)) < 0 &&
             errno != EINPROGRESS)
         {
@@ -379,27 +380,27 @@ namespace llmbridge::detail
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->tls)
         {
-            const bool was_flushed = u->client && _e.tls_out_flushed(u);
             bool tdone = false;
             if (!tls_flush(u, &tdone)) return _e.upstream_lost(u, Engine::UpFail::Write);
-            if (u->client && u->sent_bytes != sent) u->client->req.f.ts_progress = now_ns();
-            if (!tdone) return; // EPOLLOUT re-armed by tls_flush
-            disarm_write(u);    // handshake replies arrive via read
-            if (u->client && !was_flushed && _e.tls_out_flushed(u))
-                u->client->req.f.ts_up_sent = now_ns();
+            progressed(u, sent);
+            if (tdone) disarm_write(u); // handshake replies arrive via read; else tls_flush re-armed
             return;
         }
 #endif
         bool done = false;
         if (!pump_write(u, &done)) return _e.upstream_lost(u, Engine::UpFail::Write);
-        if (u->client && u->sent_bytes != sent) u->client->req.f.ts_progress = now_ns();
-        if (!done)
-        {
-            arm_write(u);
-            return;
-        }
-        disarm_write(u);
-        if (u->client) u->client->req.f.ts_up_sent = now_ns(); // end of request-path work
+        progressed(u, sent);
+        if (done) disarm_write(u);
+        else arm_write(u);
+    }
+
+    // Bytes went: the idle clock restarts, and t3 or a body's last byte may be in.
+    void EpollIo::progressed(UpstreamConn* u, uint64_t sent_before) noexcept
+    {
+        if (!u->client || u->sent_bytes == sent_before) return;
+        const int64_t now = now_ns();
+        u->client->req.f.ts_progress = now;
+        _e.note_sent(u, now);
     }
 
     void EpollIo::on_upstream_readable(UpstreamConn* u) noexcept

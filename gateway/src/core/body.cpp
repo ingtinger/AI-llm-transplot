@@ -42,9 +42,13 @@ namespace llmbridge::detail
     }
 
     // New body bytes: scanned first, then whatever is known good goes upstream. The body
-    // stays in rbuf, so a stale-connection retry can resend it.
+    // stays in rbuf, so a stale-connection retry can resend it. The time this takes after
+    // t3 is ours (body_work_ns); before it, connect or upwrite holds it. The last byte's
+    // arrival ends the client's upload.
     void Engine::pump_body(ClientConn* c) noexcept
     {
+        const int64_t t = now_ns();
+        const bool after_t3 = c->req.f.ts_up_sent != 0;
         const std::string_view body = body_so_far(c);
         const bool last = body.size() == c->msg.body_len;
         size_t safe = body.size();
@@ -56,20 +60,23 @@ namespace llmbridge::detail
         if (last)
         {
             c->req.f.body_streaming = false;
+            c->req.f.ts_body_end = t;
+            c->req.f.client_upload_ns = span_since(c->ts_first_byte, t);
+            // Setup holds the upload, as a held body's does, so subtracting it still works.
+            if (!c->req.f.client_conn_reused) c->req.f.client_conn_setup_ns = span_since(c->ts_accepted, t);
+            c->ts_first_byte = c->rbuf.size() > c->msg.total_len ? t : 0; // as open_request
             if (_sink) (void)capture_model(c); // the facts only: every byte already passed
         }
         UpstreamConn* u = c->up;
-        if (!u || safe <= c->req.f.body_sent) return;
-        u->out.stage().append(body.substr(c->req.f.body_sent, safe - c->req.f.body_sent));
-        c->req.f.body_sent = static_cast<uint32_t>(safe);
-        c->req.f.ts_progress = now_ns();
-        if (!u->connected) return; // the connect's completion sends it
-        switch (_ops->send(*u))
+        if (u && safe > c->req.f.body_sent)
         {
-            case Sent::Done: c->req.f.ts_up_sent = now_ns(); return;
-            case Sent::Queued: return;
-            case Sent::Failed: return upstream_lost(u, UpFail::Write);
+            u->out.stage().append(body.substr(c->req.f.body_sent, safe - c->req.f.body_sent));
+            c->req.f.body_sent = static_cast<uint32_t>(safe);
+            c->req.f.ts_progress = t;
+            // Unconnected, the connect's completion sends it.
+            if (u->connected && !send_upstream(u)) return;
         }
+        if (after_t3) c->req.f.body_work_ns += now_ns() - t;
     }
 
     // The body failed its scan after part of it went: stop, and reset the upstream so
@@ -115,7 +122,9 @@ namespace llmbridge::detail
         const size_t n = static_cast<size_t>(std::min<uint64_t>(c->req.discard, c->rbuf.size()));
         c->rbuf.erase(0, n);
         c->req.discard -= n;
-        if (c->req.discard || !c->req.close_on_drain) return;
+        if (c->req.discard) return;
+        c->ts_first_byte = c->rbuf.empty() ? 0 : now_ns(); // the next request's arrival
+        if (!c->req.close_on_drain) return;
         c->req.close_on_drain = false;
         _ops->close(*c);
     }

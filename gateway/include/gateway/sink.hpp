@@ -29,15 +29,16 @@ namespace llmbridge
     {
         uint64_t seq = 0;         ///< the global request sequencer
         int64_t wall_t0_ns = 0;   ///< CLOCK_REALTIME at framing; the cross-process merge key
-        /// How long the request took to arrive: t0 minus the first byte seen. Zero
-        /// when it arrived in one read.
+        /// How long the request took to arrive: its first byte to its last, which is t0,
+        /// or `ts_body_end` for a streamed body. Zero when it arrived in one read.
         int64_t client_upload_ns = 0;
         /// Total request bytes on the wire, head plus body. Paired with
         /// client_upload_ns it gives effective upload throughput, which is what
         /// separates a full pipe from a congestion window still opening.
         uint64_t request_bytes = 0;
         bool client_conn_reused = false;
-        /// Inbound leg, first request on the connection only, else 0: accept to t0.
+        /// Inbound leg, first request on the connection only, else 0: accept to its last
+        /// byte, t0 or a streamed body's `ts_body_end`.
         /// Contains the TLS handshake, the client's idle time, and the request upload
         /// (`client_upload_ns`, subtract it). Excludes the TCP handshake because it
         /// completes before `accept()`. For handshake alone prefer the `accept(TLS)`.
@@ -45,9 +46,9 @@ namespace llmbridge
         int64_t ts_req_recvd = 0;  ///< t0
         int64_t ts_req_built = 0;  ///< t1
         int64_t ts_wire_ready = 0; ///< t2; == t1 when the connection was pooled
-        int64_t ts_up_sent = 0;    ///< t3
+        int64_t ts_up_sent = 0;    ///< t3: the head, and the body there at dispatch, in the kernel
         int64_t ts_up_recvd = 0;   ///< t4: ttfb
-        int64_t ts_first_token = 0; ///< streaming only: ttft, the first token shown
+        int64_t ts_first_token = 0; ///< streaming only: the first token shown; ttft from ts_body_end
         /// Streaming only, and 0 unless the model emitted reasoning. The first thinking delta.
         int64_t ts_first_thinking = 0;
         /// Streaming only: the longest gap between two chunks after the first visible
@@ -116,6 +117,12 @@ namespace llmbridge
         uint64_t prefix_hash = 0;
         /// Valid only during on_request: they point into the connection. Copy out.
         std::string_view captured[kSinkCaptureMax];
+        /// A body forwarded to the venue as it arrived (LATENCY.md 2b). Held, these
+        /// read t0, t3, 0 and false, so one formula serves every request.
+        int64_t ts_body_end = 0;  ///< its last byte in from the client; 0 if cut short
+        int64_t ts_body_sent = 0; ///< its last byte in the kernel: the venue's wait begins
+        int64_t body_work_ns = 0; ///< scanning, copying and sending its parts after t3
+        bool body_streamed = false;
     };
 
     /// Called on the loop thread once per completed request, streams included.

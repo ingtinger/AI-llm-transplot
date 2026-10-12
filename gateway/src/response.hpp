@@ -17,6 +17,12 @@
 
 #include "provider/openai.hpp"
 
+namespace llmbridge
+{
+    struct ReqState;
+    struct TimingSplit;
+}
+
 namespace llmbridge::detail
 {
     // Client-facing SSE response head. The stream is close-delimited: the body
@@ -36,10 +42,8 @@ namespace llmbridge::detail
         "Transfer-Encoding: chunked\r\n"
         "\r\n";
 
-    void append_timing_headers(std::string& out, int64_t t0, int64_t gateway_us,
-                               int64_t connect_us, int64_t upwrite_us,
-                               int64_t upstream_us, const char* upstream_key, uint64_t seq,
-                               int64_t client_upload_us);
+    void append_timing_headers(std::string& out, const ReqState& f, const TimingSplit& sp,
+                               const char* upstream_key);
     void append_usage_headers(std::string& out, const provider::openai::Usage& u);
     /// The builders append to `out`, a connection's stage, whose capacity is kept.
     void append_error(std::string& out, int code, const char* detail = nullptr);

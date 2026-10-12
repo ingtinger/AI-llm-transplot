@@ -232,6 +232,33 @@ TEST(TimingSplit, StreamingPassesT5EqualT4SoComputeIsRequestLegOnly)
     EXPECT_EQ(s.compute_ns, 100) << "a stream must report the request leg, not an invention";
 }
 
+// A streamed request body: t3 is the first send, the provider waits from the body's last
+// byte sent, and the work on its later parts is ours. A held body passes t3 and 0, or
+// nothing, and gets the split it always had.
+TEST(TimingSplit, AStreamedBodysWaitStartsAtItsLastByteAndItsWorkIsOurs)
+{
+    const TimingSplit s = timing_split(0, 100, 100, 140, 300'009'000, 300'009'000,
+                                       /*body_sent*/ 300'000'140, /*body_work*/ 2000);
+    EXPECT_EQ(s.upwrite_ns, 40) << "the upload is not a write";
+    EXPECT_EQ(s.upstream_ns, 8860) << "the provider cannot answer before the last byte";
+    EXPECT_EQ(s.req_path_ns, 2140);
+    EXPECT_EQ(s.compute_ns, 100);
+}
+
+TEST(TimingSplit, AHeldBodysSplitIsUnchanged)
+{
+    const TimingSplit a = timing_split(0, 100, 100, 140, 9000, 9100);
+    const TimingSplit b = timing_split(0, 100, 100, 140, 9000, 9100, /*body_sent = t3*/ 140, 0);
+    for (const TimingSplit& s : {a, b})
+    {
+        EXPECT_EQ(s.compute_ns, 200);
+        EXPECT_EQ(s.connect_ns, 0);
+        EXPECT_EQ(s.upwrite_ns, 40);
+        EXPECT_EQ(s.upstream_ns, 8860);
+        EXPECT_EQ(s.req_path_ns, 140);
+    }
+}
+
 // The handshake histograms need a different range from the overhead ones, and this
 // is not a preference: the default is 20 ns buckets over 2.62 ms, sized for a
 // sub-millisecond overhead claim, while LATENCY.md section 3 documents a cold

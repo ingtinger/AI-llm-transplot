@@ -155,6 +155,10 @@ namespace llmbridge::detail
         r.tool_prompt_tokens = static_cast<int32_t>(u.tool_prompt);
         for (size_t i = 0; i < kSinkCaptureMax; ++i)
             r.captured[i] = c->req.f.captured[i].view();
+        r.ts_body_end = c->req.f.ts_body_end;
+        r.ts_body_sent = c->req.f.ts_body_sent;
+        r.body_work_ns = c->req.f.body_work_ns;
+        r.body_streamed = c->req.f.body_streamed;
         _sink->on_request(r);
     }
 

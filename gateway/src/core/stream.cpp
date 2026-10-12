@@ -38,16 +38,14 @@ namespace llmbridge::detail
     {
         if (now_ns() - _t_start < _warmup_ns) return;
         // t4 stands in for the absent t5; only the request-side fields are read.
-        const TimingSplit sp = timing_split(client->req.f.ts_req_recvd, client->req.f.ts_req_built,
-                                            client->req.f.ts_wire_ready, client->req.f.ts_up_sent,
-                                            client->req.f.ts_up_recvd, client->req.f.ts_up_recvd);
+        const TimingSplit sp = split_of(client->req.f, client->req.f.ts_up_recvd);
         if (sp.req_path_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(sp.req_path_ns));
         if (sp.connect_ns >= 0) _stats.connect.record(static_cast<uint64_t>(sp.connect_ns));
-        // Zero means no content chunk ever arrived, not an instant answer.
-        if (client->req.f.ts_first_token > 0 && client->req.f.ts_req_recvd > 0 &&
-            client->req.f.ts_first_token >= client->req.f.ts_req_recvd)
-            _stats.first_token.record(
-                static_cast<uint64_t>(client->req.f.ts_first_token - client->req.f.ts_req_recvd));
+        // Zero means no content chunk ever arrived, not an instant answer. The wait starts
+        // at the body's last byte, t0 when held: a streamed body's upload is the client's.
+        const int64_t from = client->req.f.ts_body_end ? client->req.f.ts_body_end : client->req.f.ts_req_recvd;
+        if (client->req.f.ts_first_token > 0 && from > 0 && client->req.f.ts_first_token >= from)
+            _stats.first_token.record(static_cast<uint64_t>(client->req.f.ts_first_token - from));
     }
 
     // The upstream answered text/event-stream: stage the client's SSE head, then
@@ -74,13 +72,8 @@ namespace llmbridge::detail
         {
             // t5 = t4, stamped by the caller: a stream's response is not built at one
             // instant, so the compute leg is the request side alone.
-            const TimingSplit sp = timing_split(
-                client->req.f.ts_req_recvd, client->req.f.ts_req_built, client->req.f.ts_wire_ready,
-                client->req.f.ts_up_sent, client->req.f.ts_up_recvd, client->req.f.ts_up_recvd);
-            append_timing_headers(out, client->req.f.ts_req_recvd, sp.compute_ns / 1000,
-                                  sp.connect_ns / 1000, sp.upwrite_ns / 1000,
-                                  sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
-                                  client->req.f.req_seq, client->req.f.client_upload_ns / 1000);
+            const TimingSplit sp = split_of(client->req.f, client->req.f.ts_up_recvd);
+            append_timing_headers(out, client->req.f, sp, "x-llmbridge-upstream-ttfb-us");
         }
         // The venue's request id and rate limits, as on a whole reply.
         net::http::append_relayed(out, std::string_view(u->rbuf.data(), h.header_len - 4), false);

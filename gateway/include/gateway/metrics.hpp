@@ -60,8 +60,8 @@ namespace llmbridge
         int64_t compute_ns;  // (t1-t0) + (t5-t4)  our compute, both legs
         int64_t connect_ns;  // (t2-t1)            handshake only; 0 on a pooled conn
         int64_t upwrite_ns;  // (t3-t2)            the write() into the socket buffer
-        int64_t upstream_ns; // (t4-t3)            the provider
-        int64_t req_path_ns; // (t1-t0) + (t3-t2)  histogram grouping: compute + write
+        int64_t upstream_ns; // (t4-body_sent)     the provider, from the last body byte
+        int64_t req_path_ns; // (t1-t0) + (t3-t2) + body_work: compute + write
     };
 
     // t2 == 0 means "no connect ever happened" (pooled reuse never stamped it), in
@@ -69,9 +69,10 @@ namespace llmbridge
     //
     // Streaming callers have no t5 (the response is not built at one instant): pass
     // t5 = t4 and compute_ns collapses to the request leg alone, which is the honest
-    // answer instead of an invented one.
+    // answer instead of an invented one. A streamed request body passes its last byte's
+    // send and its work after t3 (LATENCY.md 2b); a held one passes neither.
     TimingSplit timing_split(int64_t t0, int64_t t1, int64_t t2, int64_t t3, int64_t t4,
-                             int64_t t5) noexcept;
+                             int64_t t5, int64_t body_sent = 0, int64_t body_work_ns = 0) noexcept;
 
     class Histogram
     {

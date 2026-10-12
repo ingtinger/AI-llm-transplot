@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "gateway/dialect.hpp"
+#include "gateway/metrics.hpp"
 #include "core/conn.hpp"
 #include "engine.hpp"
 #include "provider/translate.hpp"
@@ -55,6 +56,13 @@ namespace llmbridge::detail
     [[nodiscard]] inline int64_t span_since(int64_t start, int64_t end) noexcept
     {
         return (start > 0 && end >= start) ? end - start : 0;
+    }
+
+    /// A request's intervals (LATENCY.md); a stream passes t4 for the t5 it has none of.
+    [[nodiscard]] inline TimingSplit split_of(const ReqState& f, int64_t t5) noexcept
+    {
+        return timing_split(f.ts_req_recvd, f.ts_req_built, f.ts_wire_ready, f.ts_up_sent,
+                            f.ts_up_recvd, t5, f.ts_body_sent, f.body_work_ns);
     }
 
     constexpr std::string_view kContinue = "HTTP/1.1 100 Continue\r\n\r\n";

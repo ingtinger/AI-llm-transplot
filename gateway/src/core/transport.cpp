@@ -6,7 +6,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 // Bytes between a socket and a connection's plaintext buffers: the TLS Session on
-// either leg, and the sent-request test.
+// either leg, and the sent-request test and stamp.
 
 #include "engine.hpp"
 
@@ -31,6 +31,11 @@ namespace llmbridge::detail
     }
 
 #ifdef LLMBRIDGE_HAVE_TLS
+
+    namespace
+    {
+        constexpr uint64_t kUnmeasured = UINT64_MAX; // a first send not yet encrypted
+    }
 
     // ── TLS plumbing ────────────────────────────────────────────────────────
     // The invariant (see gateway.hpp): rbuf and `out` are plaintext, always. TLS lives
@@ -98,10 +103,11 @@ namespace llmbridge::detail
         if (unsent > _stats.tls_buffered_peak) _stats.tls_buffered_peak = unsent;
     }
 
-    void Engine::tls_push_out(ConnBase* u) noexcept
+    void Engine::tls_push_out(ConnBase* u, size_t limit) noexcept
     {
-        // Feed as much plaintext as the Session accepts; its ciphertext lands straight
-        // in tls_out's stage, behind any flight already staged: order is the wire's.
+        // Feed as much plaintext as the Session accepts, up to `limit`; its ciphertext
+        // lands straight in tls_out's stage, behind any flight already staged: order is
+        // the wire's. Reserved for all of `out`, so a limited push is not a second grow.
         tls_pump_out(u);
         std::string& sink = u->tls_out.stage();
         const size_t todo = u->out.wire().size();
@@ -114,14 +120,23 @@ namespace llmbridge::detail
             sink.reserve(need + need / 8);
         }
         u->tls->set_sink(&sink);
-        while (!u->out.wire().empty())
+        while (limit && !u->out.wire().empty())
         {
-            const std::string_view w = u->out.wire();
+            const std::string_view w = u->out.wire().substr(0, limit);
             const size_t n = u->tls->write_plaintext({reinterpret_cast<const uint8_t*>(w.data()), w.size()});
             if (n == 0) break; // handshake not done, or session back-pressured
             u->out.sent(n);
+            limit -= n;
         }
         u->tls->set_sink(nullptr);
+    }
+
+    // Encrypted alone, so no part staged behind it shares its last record, then counted.
+    void Engine::tls_measure_first_send(UpstreamConn* u) noexcept
+    {
+        ReqState& f = u->client->req.f;
+        tls_push_out(u, f.first_send_len);
+        f.first_send_end = u->sent_bytes + u->tls_out.unsent();
     }
 
     bool Engine::tls_out_flushed(const ConnBase* u) const noexcept
@@ -201,12 +216,50 @@ namespace llmbridge::detail
             // gateway/tests/gateway_tls_test.cpp. The request has waited in `out`.
             u->wire_ready = true;
             if (u->client) u->client->req.f.ts_wire_ready = now_ns();
+            // The first send goes first, measured; parts that came meanwhile follow it.
+            if (u->client && u->client->req.f.first_send_end == kUnmeasured) tls_measure_first_send(u);
             if (!u->out.idle()) tls_push_out(u);
         }
         return r != TlsIn::Failed;
     }
 
 #endif // LLMBRIDGE_HAVE_TLS
+
+    // The attempt's first send is what `u->out` holds now: the head and the body there at
+    // dispatch. t3 waits for the wire bytes that carry it, never for parts staged behind
+    // it (LATENCY.md 2b); TLS counts ciphertext, so the Session measures it as it encrypts.
+    void Engine::mark_first_send(UpstreamConn* u) noexcept
+    {
+        ReqState& f = u->client->req.f;
+        f.first_send_len = u->out.unsent();
+        f.first_send_end = u->sent_bytes + f.first_send_len;
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (!u->tls) return;
+        f.first_send_end = kUnmeasured; // until the handshake is done (tls_feed)
+        if (u->tls->handshake_done()) tls_measure_first_send(u);
+#endif
+    }
+
+    // Every send that moved a client's bytes, on both backends: t3 once the first send is
+    // in, and ts_body_sent each time all that is staged is, last at a streamed body's end.
+    void Engine::note_sent(UpstreamConn* u, int64_t now) noexcept
+    {
+        ReqState& f = u->client->req.f;
+        if (!f.ts_up_sent && u->sent_bytes >= f.first_send_end) f.ts_up_sent = now;
+        if (upstream_request_sent(u)) f.ts_body_sent = now;
+    }
+
+    bool Engine::send_upstream(UpstreamConn* u) noexcept
+    {
+        const uint64_t before = u->sent_bytes;
+        if (_ops->send(*u) == Sent::Failed)
+        {
+            upstream_lost(u, UpFail::Write);
+            return false;
+        }
+        if (u->sent_bytes != before) note_sent(u, now_ns());
+        return true;
+    }
 
     bool Engine::upstream_request_sent(const UpstreamConn* u) const noexcept
     {

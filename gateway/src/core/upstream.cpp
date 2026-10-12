@@ -178,6 +178,7 @@ namespace llmbridge::detail
             return false;
         }
         client->req.f.upstream_ip = uf->up_addr.sin_addr.s_addr;
+        client->req.f.ts_up_sent = client->req.f.ts_body_sent = 0; // this attempt's own send
         // Plaintext, re-pushed through the new session; a send still reading it gets a copy.
         if (!client->req.f.body_in_rbuf) uf->out.stage() = u->out.take();
         _upconns->add(uf);
@@ -188,6 +189,7 @@ namespace llmbridge::detail
         LB_WARN("upstream stale, resending on a fresh connection ", *u);
         _ops->close(*u); // discard the dead connection; unpairs it
         pair(client, uf);
+        mark_first_send(uf); // the resend so far is this attempt's first send
         return true;
     }
 
@@ -240,7 +242,8 @@ namespace llmbridge::detail
         // over; kept, they would be the next client's response.
         if (!client) return _ops->close(*u);
         client->req.f.ts_progress = now_ns();
-        if (client->req.f.body_in_rbuf) end_body_stream(client, u);
+        // A TLS record may hold no response byte (a session ticket); only a byte ends the body.
+        if (client->req.f.body_in_rbuf && !u->rbuf.empty()) end_body_stream(client, u);
         if (client->req.f.streaming) return stream_pump(u);
 
         const int64_t t4 = now_ns(); // before the parse, so it counts in the response path
@@ -303,13 +306,8 @@ namespace llmbridge::detail
             if (_timing_headers)
             {
                 const int64_t ts_resp_built = now_ns(); // t5: built here, written next
-                const TimingSplit sp = timing_split(
-                    client->req.f.ts_req_recvd, client->req.f.ts_req_built, client->req.f.ts_wire_ready,
-                    client->req.f.ts_up_sent, client->req.f.ts_up_recvd, ts_resp_built);
-                append_timing_headers(timing, client->req.f.ts_req_recvd, sp.compute_ns / 1000,
-                                      sp.connect_ns / 1000, sp.upwrite_ns / 1000,
-                                      sp.upstream_ns / 1000, "x-llmbridge-upstream-us",
-                                      client->req.f.req_seq, client->req.f.client_upload_ns / 1000);
+                const TimingSplit sp = split_of(client->req.f, ts_resp_built);
+                append_timing_headers(timing, client->req.f, sp, "x-llmbridge-upstream-us");
                 append_usage_headers(timing, client->req.f.tok);
             }
             append_http(client->out.stage(), "HTTP/1.1 200 OK", client->xlate_scratch, timing);

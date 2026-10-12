@@ -130,6 +130,8 @@ namespace llmbridge
         /// SO_SNDBUF for accepted clients, 0 for the kernel's: a fixed value turns off
         /// the autotuning that can absorb a whole stream on loopback.
         void set_client_sndbuf_for_test(int bytes) noexcept;
+        /// SO_SNDBUF for upstream connections, 0 for the kernel's: a venue's writes back up.
+        void set_upstream_sndbuf_for_test(int bytes) noexcept;
         /// Epoll only: at most `bytes` per socket write pass, then it behaves as EAGAIN.
         void set_epoll_write_cap_for_test(size_t bytes) noexcept;
         /// Prefault the scratch buffers now and report how much of one is resident.

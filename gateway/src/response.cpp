@@ -9,7 +9,8 @@
 
 #include <string>
 
-#include "gateway/metrics.hpp" // wall_ns
+#include "core/req.hpp"
+#include "gateway/metrics.hpp" // wall_ns, TimingSplit
 #include "net/http_write.hpp"
 #include "scan.hpp"
 
@@ -53,10 +54,8 @@ namespace llmbridge::detail
     // The opt-in timing headers (--timing-headers). LATENCY.md section 3 is normative:
     // what each one spans, why connect is apart from the gateway's compute, and why a
     // stream reports ttfb instead of t4. Durations and one timestamp, never content.
-    void append_timing_headers(std::string& out, int64_t t0, int64_t gateway_us,
-                               int64_t connect_us, int64_t upwrite_us,
-                               int64_t upstream_us, const char* upstream_key, uint64_t seq,
-                               int64_t client_upload_us)
+    void append_timing_headers(std::string& out, const ReqState& f, const TimingSplit& sp,
+                               const char* upstream_key)
     {
         const auto add = [&out](const char* k, int64_t v) {
             if (v < 0) return; // a stamp we never took; omit instead of lie
@@ -65,14 +64,16 @@ namespace llmbridge::detail
             out.append(std::to_string(v));
             out.append("\r\n");
         };
-        add("x-llmbridge-t0", wall_ns(t0));
-        add("x-llmbridge-seq", static_cast<int64_t>(seq));
-        add("x-llmbridge-gateway-us", gateway_us);
-        add("x-llmbridge-connect-us", connect_us); // the connect(TLS) histogram's span
-        add("x-llmbridge-upwrite-us", upwrite_us);
+        add("x-llmbridge-t0", wall_ns(f.ts_req_recvd));
+        add("x-llmbridge-seq", static_cast<int64_t>(f.req_seq));
+        add("x-llmbridge-gateway-us", sp.compute_ns / 1000);
+        add("x-llmbridge-connect-us", sp.connect_ns / 1000); // the connect(TLS) histogram's span
+        add("x-llmbridge-upwrite-us", sp.upwrite_ns / 1000);
+        // A streamed body's later parts, scanned, copied and sent; a held body has none.
+        if (f.body_streamed) add("x-llmbridge-body-work-us", f.body_work_ns / 1000);
         // The client's own upload, first byte to last; not part of `added`.
-        add("x-llmbridge-client-upload-us", client_upload_us);
-        add(upstream_key, upstream_us);
+        add("x-llmbridge-client-upload-us", f.client_upload_ns / 1000);
+        add(upstream_key, sp.upstream_ns / 1000);
     }
 
     // Token counts, non-streaming only: a stream's counts are end-of-stream facts, and
