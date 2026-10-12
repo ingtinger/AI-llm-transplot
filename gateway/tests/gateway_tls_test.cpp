@@ -759,6 +759,34 @@ namespace
         return "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " +
                std::to_string(body.size()) + "\r\n\r\n" + body;
     }
+
+    /// The last record a test's gateway emitted, a fixture member so TearDown's join
+    /// comes before it goes: an ASSERT that returns early leaves the loop running.
+    class LastRecord final : public llmbridge::RequestSink
+    {
+      public:
+        void on_request(const llmbridge::RequestRecord& r) noexcept override
+        {
+            std::lock_guard<std::mutex> g(_mu);
+            _r = r;
+            ++_n;
+        }
+        int n()
+        {
+            std::lock_guard<std::mutex> g(_mu);
+            return _n;
+        }
+        llmbridge::RequestRecord last()
+        {
+            std::lock_guard<std::mutex> g(_mu);
+            return _r;
+        }
+
+      private:
+        std::mutex _mu;
+        llmbridge::RequestRecord _r;
+        int _n = 0;
+    };
 } // namespace
 
 // Parameterized over the two event-loop backends: the pump wiring is entirely
@@ -848,6 +876,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     std::string _ca_path;
     size_t _write_cap = 0; // set before start_inbound(); epoll only
     llmbridge::RequestSink* _sink = nullptr; // set before start(); read after the join
+    LastRecord _last;                        // a sink for _sink, alive until the join
 };
 
 TEST_P(GatewayTls, RoundTripThroughTlsUpstream)
@@ -971,39 +1000,9 @@ TEST_P(GatewayTls, AStreamedBodyReachesATlsVenueWhole)
 // A streamed body over a TLS upstream: every part's flush completes the request again,
 // and only the first is t3 (LATENCY.md 2b). The write cap has epoll finish each part on
 // writability; io_uring finishes every send on a completion.
-namespace
-{
-    class LastRecord final : public llmbridge::RequestSink
-    {
-      public:
-        void on_request(const llmbridge::RequestRecord& r) noexcept override
-        {
-            std::lock_guard<std::mutex> g(_mu);
-            _r = r;
-            ++_n;
-        }
-        int n()
-        {
-            std::lock_guard<std::mutex> g(_mu);
-            return _n;
-        }
-        llmbridge::RequestRecord last()
-        {
-            std::lock_guard<std::mutex> g(_mu);
-            return _r;
-        }
-
-      private:
-        std::mutex _mu;
-        llmbridge::RequestRecord _r;
-        int _n = 0;
-    };
-} // namespace
-
 TEST_P(GatewayTls, AStreamedBodysLaterPartsDoNotMoveT3)
 {
-    LastRecord sink;
-    _sink = &sink;
+    _sink = &_last;
     _write_cap = 4096;
     start();
     const std::string req = make_request(R"({"model":"gpt","messages":[{"role":"user","content":")" +
@@ -1022,8 +1021,8 @@ TEST_P(GatewayTls, AStreamedBodysLaterPartsDoNotMoveT3)
     _gw->request_stop();
     _gt.join();
 
-    ASSERT_EQ(sink.n(), 1);
-    const llmbridge::RequestRecord r = sink.last();
+    ASSERT_EQ(_last.n(), 1);
+    const llmbridge::RequestRecord r = _last.last();
     const int64_t upload = int64_t{kParts - 1} * kGapMs * 1'000'000;
     EXPECT_TRUE(r.body_streamed);
     EXPECT_GE(r.client_upload_ns, upload * 3 / 4);

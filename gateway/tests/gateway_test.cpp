@@ -11482,7 +11482,7 @@ TEST_P(ProxyBodyStream, AStaleRetryOfAStreamedBodyStampsTheFreshAttempt)
     ASSERT_EQ(recs.size(), 2u);
     const llmbridge::RequestRecord& r = recs[1].r;
     EXPECT_TRUE(r.body_streamed);
-    EXPECT_GE(r.ts_wire_ready, r.ts_req_built) << "the fresh connection's connect";
+    EXPECT_GT(r.ts_wire_ready, r.ts_req_built) << "the fresh connection's connect";
     EXPECT_GE(r.ts_up_sent, r.ts_wire_ready) << "t3 is the stale attempt's";
     EXPECT_LT(r.ts_up_sent - r.ts_wire_ready, 50'000'000);
     EXPECT_GE(r.ts_body_end - r.ts_up_sent, 100'000'000);
