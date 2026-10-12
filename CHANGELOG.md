@@ -8,6 +8,43 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.87.0]. 2026-10-11
+
+**Behaviour change: io_uring pauses a slow client's stream instead of dropping it.**
+
+### Changed
+
+- **io_uring applies back-pressure to streams**, as epoll does. When a stream owes its
+  client more than 1 MiB, the upstream's multishot recv is cancelled and the venue is
+  read no further until the client has drained what it is owed; then the recv is
+  re-armed. Before, the io_uring backend kept reading and dropped the stream once
+  8 MiB was owed (`CAP stream buffer exceeded`), so a client that paused for a moment
+  on a long answer lost it. That stream now completes, byte for byte.
+- **The 8 MiB cap stays on io_uring as a ceiling**, paused or not: bytes the kernel
+  placed before the cancel still arrive. It now counts ciphertext as well as plaintext,
+  so it bounds a TLS client too. epoll still has no cap; its reads are budgeted per
+  event.
+- **A client that stops reading mid-stream is held, not dropped, on io_uring**: its
+  upstream is paused and the stream is cut when `--upstream-timeout` passes with
+  neither leg moving, logged `client stalled` and counted in `client_idle_timeouts`, as
+  on epoll. `stream_pauses` now counts io_uring pauses, and each one logs
+  `CAP backpressure`.
+- A paused io_uring upstream is not polled, so a venue that resets during the pause is
+  noticed when the client has drained and reads resume.
+- `IoCaps` carries the threshold (`stream_pause_above`: 0 on epoll, a short write;
+  1 MiB on io_uring, where every send is queued while in flight) and the cap
+  (`stream_cap`).
+
+### Measured
+
+- The 32 MiB flood to a TLS client that never reads
+  (`GatewayTls.ClientThatNeverReadsCannotGrowUsWithoutBound`): process peak RSS on
+  io_uring 55 MB, from 69 MB when the cap dropped the stream (5 runs each, no overlap);
+  epoll 53 MB, unchanged.
+- Stream saturation on io_uring at 512 and 2,048 streams, and the request benchmarks,
+  are within noise.
+
+
 ## [0.86.0]. 2026-10-11
 
 ### Changed
