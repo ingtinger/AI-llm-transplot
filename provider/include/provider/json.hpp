@@ -18,6 +18,7 @@
 // general-purpose JSON library; it is fast and correct for the shapes we move.
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -41,10 +42,29 @@ namespace llmbridge::provider::json
     inline constexpr size_t kMaxNodes = size_t{1} << 20;
 
     inline Value parse(std::string_view text, bool& ok, Keys keys = Keys::Unique);
+
+    namespace detail
+    {
+        inline std::atomic<size_t>& retain_bytes() noexcept;
+    }
+    /// Parse storage each thread keeps between documents, arena and scratch each
+    /// (default 4 MiB); a deployment of large bodies raises it to keep them warm.
+    inline void set_retain_bytes(size_t n) noexcept
+    {
+        detail::retain_bytes().store(n, std::memory_order_relaxed);
+    }
     inline std::string unescape_string(std::string_view raw);
 
     namespace detail
     {
+        /// Parse storage a thread keeps between documents: the arena blocks and the
+        /// scratch stacks, each. Bounded so one huge body does not pin memory forever.
+        inline std::atomic<size_t>& retain_bytes() noexcept
+        {
+            static std::atomic<size_t> n{size_t{4} << 20};
+            return n;
+        }
+
         // One document, one allocation chain.
         //
         // Every object and array used to own a std::vector, which is two allocations
@@ -72,7 +92,7 @@ namespace llmbridge::provider::json
             {
                 // Bounded, so one pathological document cannot pin memory for the
                 // life of the thread.
-                if (_held + size > kMaxHeld) return;
+                if (_held + size > retain_bytes().load(std::memory_order_relaxed)) return;
                 _held += size;
                 _free.emplace_back(std::move(block), size);
             }
@@ -80,7 +100,6 @@ namespace llmbridge::provider::json
             ~BlockPool() = default;
 
         private:
-            static constexpr size_t kMaxHeld = size_t{4} << 20;
             std::vector<std::pair<std::unique_ptr<char[]>, size_t>> _free;
             size_t _held = 0;
         };
@@ -150,13 +169,19 @@ namespace llmbridge::provider::json
             size_t _next = 4096;
         };
 
-        // One emptied arena kept per thread, so a parse costs no allocation for the
-        // arena or its block list. Parked with no blocks, so its destruction at
+        // Emptied arenas kept per thread, so a parse costs no allocation for the arena
+        // or its block list; four, because a translator parses tool arguments inside
+        // the parse of their body. Parked with no blocks, so their destruction at
         // thread exit never reaches a block_pool() that may already be gone.
-        inline std::unique_ptr<Arena>& spare_arena() noexcept
+        struct SpareArenas
         {
-            thread_local std::unique_ptr<Arena> a;
-            return a;
+            std::unique_ptr<Arena> a[4];
+            size_t n = 0;
+        };
+        inline SpareArenas& spare_arenas() noexcept
+        {
+            thread_local SpareArenas s;
+            return s;
         }
     } // namespace detail
 
@@ -246,16 +271,19 @@ namespace llmbridge::provider::json
     {
         inline Arena* take_arena(size_t hint)
         {
-            if (Arena* a = spare_arena().release()) { a->start(hint); return a; }
-            return new Arena(hint);
+            SpareArenas& s = spare_arenas();
+            if (s.n == 0) return new Arena(hint);
+            Arena* a = s.a[--s.n].release(); // the last parked: an outer parse gets its own back
+            a->start(hint);
+            return a;
         }
 
         inline void drop_arena(Arena* a)
         {
             a->clear();
-            std::unique_ptr<Arena>& spare = spare_arena();
-            if (spare) delete a;
-            else spare.reset(a);
+            SpareArenas& s = spare_arenas();
+            if (s.n == std::size(s.a)) delete a;
+            else s.a[s.n++].reset(a);
         }
     } // namespace detail
 
@@ -322,9 +350,6 @@ namespace llmbridge::provider::json
             std::vector<std::string_view> keys;
             bool busy = false;
         };
-
-        // Scratch capacity kept past a parse, BlockPool's kMaxHeld for the same reason.
-        inline constexpr size_t kScratchKeep = size_t{4} << 20;
 
         inline Scratch& scratch() noexcept
         {
@@ -656,16 +681,15 @@ namespace llmbridge::provider::json
         ok = p.ok && p.i == text.size();
         if (!reentrant)
         {
-            // Emptied, and shrunk only past kScratchKeep: the capacity is the point
+            // Emptied, and shrunk only past retain_bytes(): the capacity is the point
             // of keeping them, but not the capacity one hostile document asked for.
             sc.values.clear();
             sc.members.clear();
             sc.keys.clear();
-            if (sc.values.capacity() * sizeof(Value) > detail::kScratchKeep)
-                std::vector<Value>().swap(sc.values);
-            if (sc.members.capacity() * sizeof(Member) > detail::kScratchKeep)
-                std::vector<Member>().swap(sc.members);
-            if (sc.keys.capacity() * sizeof(std::string_view) > detail::kScratchKeep)
+            const size_t keep = detail::retain_bytes().load(std::memory_order_relaxed);
+            if (sc.values.capacity() * sizeof(Value) > keep) std::vector<Value>().swap(sc.values);
+            if (sc.members.capacity() * sizeof(Member) > keep) std::vector<Member>().swap(sc.members);
+            if (sc.keys.capacity() * sizeof(std::string_view) > keep)
                 std::vector<std::string_view>().swap(sc.keys);
             sc.busy = false;
         }

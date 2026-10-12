@@ -670,7 +670,8 @@ TEST(JsonBounds, NodeCapIsExactAndRefusesTheTinyValueFlood)
 
 TEST(JsonBounds, ScratchCapacityPastTheBudgetIsReleased)
 {
-    using llmbridge::provider::json::detail::kScratchKeep;
+    const size_t kScratchKeep = llmbridge::provider::json::detail::retain_bytes().load();
+    ASSERT_EQ(kScratchKeep, size_t{4} << 20) << "the default";
     auto& sc = llmbridge::provider::json::detail::scratch();
     // Small documents keep their capacity: that is what the scratch is for.
     std::string small = "[0";
@@ -689,6 +690,15 @@ TEST(JsonBounds, ScratchCapacityPastTheBudgetIsReleased)
     EXPECT_LE(sc.values.capacity() * sizeof(Value), kScratchKeep);
     EXPECT_LE(sc.members.capacity() * sizeof(llmbridge::provider::json::Member), kScratchKeep);
     EXPECT_LE(sc.keys.capacity() * sizeof(std::string_view), kScratchKeep);
+
+    // A deployment of large bodies keeps them: the same document leaves its capacity.
+    llmbridge::provider::json::set_retain_bytes(size_t{64} << 20);
+    (void)parse(wide, ok);
+    ASSERT_TRUE(ok);
+    EXPECT_GE(sc.values.capacity(), 300000u);
+    llmbridge::provider::json::set_retain_bytes(kScratchKeep);
+    (void)parse(wide, ok);
+    EXPECT_LE(sc.values.capacity() * sizeof(Value), kScratchKeep);
 }
 
 // ── One escaper ──────────────────────────────────────────────────────────────
@@ -764,24 +774,35 @@ TEST(JsonBuilder, EscaperMatchesTheReferenceOnEveryByteAndRandomStrings)
 
 TEST(JsonArena, ADroppedDocumentParksItsArenaForTheNextParse)
 {
-    auto& spare = llmbridge::provider::json::detail::spare_arena();
-    spare.reset();
+    auto& spare = llmbridge::provider::json::detail::spare_arenas();
+    for (auto& a : spare.a) a.reset();
+    spare.n = 0;
     bool ok = false;
-    const llmbridge::provider::json::detail::Arena* first = nullptr;
+    const llmbridge::provider::json::detail::Arena *outer = nullptr, *inner = nullptr;
     {
         const Value v = parse(std::string_view(R"({"a":[1,2,3]})"), ok);
         ASSERT_TRUE(ok);
-        EXPECT_EQ(spare, nullptr);
+        EXPECT_EQ(spare.n, 0u);
         {
             const Value w = parse(std::string_view("[1]"), ok); // a second live document
             ASSERT_TRUE(ok);
         }
-        first = spare.get();
-        EXPECT_NE(first, nullptr) << "w's arena is parked";
+        ASSERT_EQ(spare.n, 1u) << "w's arena is parked";
+        inner = spare.a[0].get();
     }
-    EXPECT_EQ(spare.get(), first) << "one is kept; v's is freed, not leaked";
+    ASSERT_EQ(spare.n, 2u) << "both are kept: a parse inside a parse allocates none";
+    outer = spare.a[1].get();
+    // The outer document gets its own arena back, and its block list with it.
     const Value again = parse(std::string_view(R"({"b":true})"), ok);
     ASSERT_TRUE(ok);
-    EXPECT_EQ(spare, nullptr) << "the parked arena was taken";
+    EXPECT_EQ(spare.n, 1u);
+    EXPECT_EQ(spare.a[0].get(), inner);
+    EXPECT_NE(outer, nullptr);
     EXPECT_TRUE(again.find("b")->boolean);
+    for (int k = 0; k < 6; ++k) // more live documents than slots: the extra ones are freed
+    {
+        std::vector<Value> live;
+        for (int j = 0; j < 6; ++j) live.push_back(parse(std::string_view("[1]"), ok));
+    }
+    EXPECT_EQ(spare.n, 4u);
 }
