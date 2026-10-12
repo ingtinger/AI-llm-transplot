@@ -83,8 +83,9 @@ namespace llmbridge::detail
         void send_continue(ClientConn* c) noexcept;     // the interim 100, staged like any reply
         void respond(ClientConn* client) noexcept;      // send what is owed; finish if it all went
         // A body forwarded as it arrives (core/body.cpp).
-        [[nodiscard]] bool body_streams(const ClientConn* c, const net::http::Message& m) const noexcept;
+        [[nodiscard]] bool body_streams(const ClientConn* c, const net::http::Message& m) noexcept;
         void pump_body(ClientConn* c) noexcept;       // scan, then stage what is safe upstream
+        void stop_body(ClientConn* c) noexcept;       // no more of it goes up: its slot is free
         void refuse_body(ClientConn* c) noexcept;     // reset the upstream, answer the 400
         void end_body_stream(ClientConn* c, UpstreamConn* u) noexcept; // a response byte arrived
         void drop_discard(ClientConn* c) noexcept;    // bytes of a request that is over
@@ -226,6 +227,8 @@ namespace llmbridge::detail
         bool _stream_body = true;
         bool _stream_openai_body = true;
         size_t _stream_body_min = 16 * 1024; ///< a body under this arrives too fast to matter
+        size_t _stream_body_max = Gateway::kDefaultStreamBodyMax; ///< at once; 0 = no cap
+        size_t _bodies_streaming = 0; ///< bodies arriving now, each with a venue connection held
         Policy* const _policy = nullptr; ///< `const`: swapping it under the loop would race
         bool _wants_prefix_hash = false; ///< Policy::wants_prefix_hash(), read once
         RequestSink* _sink = nullptr;

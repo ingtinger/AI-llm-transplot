@@ -65,5 +65,7 @@ namespace llmbridge
         /// Bodies forwarded as they arrived, and those refused part way (BodyScan).
         uint64_t streamed_bodies = 0;
         uint64_t streamed_body_refusals = 0;
+        /// Bodies held because the worker already streamed --stream-body-max of them.
+        uint64_t streamed_body_capped = 0;
     };
 } // namespace llmbridge

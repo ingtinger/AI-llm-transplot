@@ -21,7 +21,7 @@
 namespace llmbridge::detail
 {
 
-    bool Engine::body_streams(const ClientConn* c, const net::http::Message& m) const noexcept
+    bool Engine::body_streams(const ClientConn* c, const net::http::Message& m) noexcept
     {
         // A policy reads the body before it routes, so its requests wait for all of it.
         if (!_stream_body || _policy || m.body_len < _stream_body_min || m.encoded ||
@@ -32,7 +32,18 @@ namespace llmbridge::detail
         if (client == Dialect::OpenAI && !_stream_openai_body) return false;
         // A byte-forward only: a translation reads the whole body.
         const TranslationPlan plan = resolve_translation(client, _upstreams[0].dialect, false);
-        return plan.ok && !plan.translate;
+        if (!plan.ok || plan.translate) return false;
+        // Each holds a venue connection to its last byte; past the cap one waits, as before.
+        if (_stream_body_max == 0 || _bodies_streaming < _stream_body_max) return true;
+        ++_stats.streamed_body_capped;
+        return false;
+    }
+
+    void Engine::stop_body(ClientConn* c) noexcept
+    {
+        if (!c->req.f.body_streaming) return;
+        c->req.f.body_streaming = false;
+        --_bodies_streaming;
     }
 
     std::string_view Engine::body_so_far(const ClientConn* c) const noexcept
@@ -60,7 +71,7 @@ namespace llmbridge::detail
         }
         if (last)
         {
-            c->req.f.body_streaming = false;
+            stop_body(c);
             c->req.f.ts_body_end = t;
             c->req.f.client_upload_ns = span_since(c->ts_first_byte, t);
             // Setup holds the upload, as a held body's does, so subtracting it still works.
@@ -88,7 +99,7 @@ namespace llmbridge::detail
         const char* why = c->req.scan->why();
         LB_WARN(ReqId{c->req.f.req_seq}, " streamed body refused (", why, ") after ",
                 static_cast<uint64_t>(c->req.f.body_sent), " bytes went upstream; resetting it");
-        c->req.f.body_streaming = false;
+        stop_body(c);
         if (UpstreamConn* u = unpair(c))
         {
             u->peer_eof = true; // never pooled
@@ -107,7 +118,7 @@ namespace llmbridge::detail
         if (c->req.f.body_streaming && u)
         {
             // The response beat the request out: cut short, the connection is never pooled.
-            c->req.f.body_streaming = false;
+            stop_body(c);
             u->peer_eof = true;
             ++_stats.upstream_unsent;
             LB_WARN("response before the whole body went; the upstream will not be pooled ", *u);

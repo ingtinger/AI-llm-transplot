@@ -867,6 +867,7 @@ namespace
             if (!_stream_openai_body) _gw->set_stream_openai_body(false);
             if (_epoll_write_cap) _gw->set_epoll_write_cap_for_test(_epoll_write_cap);
             if (_upstream_sndbuf) _gw->set_upstream_sndbuf_for_test(_upstream_sndbuf);
+            if (_stream_body_max >= 0) _gw->set_stream_body_max(static_cast<size_t>(_stream_body_max));
             _proxy_port = _gw->bound_port();
             // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
@@ -905,6 +906,7 @@ namespace
         bool _stream_openai_body = true; // set before start()
         size_t _epoll_write_cap = 0;     // set before start(); 0 writes all it can
         int _upstream_sndbuf = 0;        // set before start(); pins SO_SNDBUF upstream
+        int64_t _stream_body_max = -1;   // set before start(); -1 keeps the default
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
@@ -12567,6 +12569,40 @@ TEST_P(ProxyBodyStream, StreamBodyOffHoldsEveryBodyWithAHeldBodysRecord)
         EXPECT_EQ(whole.ts_body_end, whole.ts_req_recvd);
         EXPECT_EQ(whole.ts_body_sent, whole.ts_up_sent);
     }
+}
+
+// Each streamed body holds a venue connection to its last byte, so a worker streams at
+// most --stream-body-max at once. Past it a body is held as before bodies streamed, the
+// venue seeing none of it until its last byte, and is still served; a slot frees when
+// its body ends.
+TEST_P(ProxyBodyStream, PastTheCapABodyIsHeldAndStillServed)
+{
+    _backend.set_response(http_ok("{}"));
+    _stream_body_max = 1;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client a, b, d;
+    ASSERT_TRUE(a.connect(_proxy_port));
+    ASSERT_TRUE(a.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; })) << "the first did not stream";
+    ASSERT_TRUE(b.connect(_proxy_port));
+    ASSERT_TRUE(b.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(_backend.accepted(), 1) << "the second went upstream past the cap";
+    ASSERT_TRUE(b.send(h.rest));
+    EXPECT_EQ(b.recv_status(), 200) << "a held body is still served";
+    ASSERT_TRUE(a.send(h.rest));
+    EXPECT_EQ(a.recv_status(), 200);
+    const size_t seen = _backend.bytes_seen();
+    ASSERT_TRUE(d.connect(_proxy_port));
+    ASSERT_TRUE(d.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > seen + 16 * 1024; })) << "the slot was not freed";
+    ASSERT_TRUE(d.send(h.rest));
+    EXPECT_EQ(d.recv_status(), 200);
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_bodies, 2u);
+    EXPECT_EQ(_gw->stats().streamed_body_capped, 1u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyBodyStream,

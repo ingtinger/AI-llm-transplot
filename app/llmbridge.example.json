@@ -67,6 +67,9 @@
     "_stream_body": "\"on\" (default) forwards a byte-forwarded body of 16 KiB or more to the venue as it arrives, so the venue does not wait for the whole upload. \"off\" holds every body until its last byte, for every client, exactly as before 0.90.0. A translated body, a body under 16 KiB, a compressed one, and every body while a policy is installed are always held.",
     "stream_body": "on",
 
+    "_stream_body_max": "How many bodies one worker forwards as they arrive at once, 0 to 1048576, 0 for no cap. Each holds a connection to the venue, and a second descriptor, until its last byte, so a client uploading slowly holds both for as long as it takes. Past the cap a body is held to its last byte as before 0.90.0, with one descriptor and no venue connection, and is still served: the cap costs the latency streaming saves, never a request.",
+    "stream_body_max": 256,
+
     "_stream_openai_body": "\"on\" (default) forwards an OpenAI client's byte-forwarded body as it arrives too, each chunk checked first: a repeated or escaped top-level key, or a byte that is not JSON, stops it, resets the upstream and answers 400. \"off\" holds an OpenAI client's body until its last byte; other clients' bodies follow stream_body alone.",
     "stream_openai_body": "on",
 

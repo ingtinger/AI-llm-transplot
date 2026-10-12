@@ -263,6 +263,7 @@ static int run(int argc, char** argv)
         gw->set_prefault_bytes(static_cast<size_t>(cfg.prefault_mb * (1 << 20)));
         gw->set_retain_bytes(static_cast<size_t>(cfg.retain_mb * (1 << 20)));
         gw->set_stream_body(cfg.stream_body == "on");
+        gw->set_stream_body_max(static_cast<size_t>(cfg.stream_body_max));
         gw->set_stream_openai_body(cfg.stream_openai_body == "on");
         gateways.push_back(std::move(gw));
     }

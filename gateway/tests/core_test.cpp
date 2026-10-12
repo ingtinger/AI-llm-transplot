@@ -93,6 +93,7 @@ namespace llmbridge
         void gone(ClientConn* c) { e.client_gone(c); }
         const Stats& stats() const { return g.stats(); }
         size_t pooled() const { return g.pooled_upstream_count(); }
+        size_t bodies_streaming() const { return e._bodies_streaming; }
     };
 } // namespace llmbridge
 
@@ -666,5 +667,80 @@ namespace
         EXPECT_EQ(c->req.f.phase, Phase::Idle) << "the reply finished";
         EXPECT_EQ(t.stats().requests, 1u);
         EXPECT_EQ(t.pooled(), 1u);
+    }
+
+    /// An OpenAI client's JSON body, declared whole, of which `part` bytes are in `c`:
+    /// it streams, on an upstream still connecting.
+    const std::string kBody = R"({"model":"m","messages":")" + std::string(20000, 'p') + R"("})";
+    UpstreamConn* stream_part(GatewayCoreTest& t, ClientConn* c, size_t part)
+    {
+        c->rbuf = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  "Content-Length: " + std::to_string(kBody.size()) + "\r\n\r\n" + kBody.substr(0, part);
+        t.bytes(c);
+        return c->up;
+    }
+
+    // A streamed body holds a slot from its head to whatever ends it, and no longer: its
+    // last byte, a response byte, a refusal, the client leaving, or an error reply.
+    TEST_F(Core, EveryWayAStreamedBodyEndsFreesItsSlot)
+    {
+        ClientConn* whole = t.client();
+        ASSERT_NE(stream_part(t, whole, 100), nullptr);
+        ASSERT_TRUE(whole->req.f.body_streaming);
+        EXPECT_EQ(t.bodies_streaming(), 1u);
+        whole->rbuf.append(kBody.substr(100));
+        t.bytes(whole);
+        EXPECT_FALSE(whole->req.f.body_streaming);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "its last byte";
+
+        UpstreamConn* u = stream_part(t, t.client(), 100);
+        ASSERT_NE(u, nullptr);
+        u->rbuf = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        t.upstream_bytes(u);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "a response byte";
+
+        ClientConn* refused = t.client();
+        stream_part(t, refused, 100);
+        refused->rbuf.append(R"(","model":"x")");
+        t.bytes(refused);
+        EXPECT_EQ(t.stats().streamed_body_refusals, 1u);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "a refusal";
+
+        ClientConn* gone = t.client();
+        stream_part(t, gone, 100);
+        t.gone(gone);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "the client leaving";
+
+        ClientConn* failed = t.client();
+        stream_part(t, failed, 100);
+        io.next_send = Sent::Queued; // the reply waits on the client, which stays open
+        t.error_respond(failed, 502);
+        EXPECT_FALSE(failed->doomed);
+        EXPECT_FALSE(failed->req.f.body_streaming);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "an error reply";
+        EXPECT_EQ(t.stats().streamed_bodies, 5u);
+    }
+
+    // Past the cap the next body is held, framed only at its last byte; a freed slot streams again.
+    TEST_F(Core, PastTheCapABodyIsHeldUntilItsLastByte)
+    {
+        gw->set_stream_body_max(1);
+        ClientConn* first = t.client();
+        ASSERT_NE(stream_part(t, first, 100), nullptr);
+        ClientConn* held = t.client();
+        EXPECT_EQ(stream_part(t, held, 100), nullptr);
+        EXPECT_FALSE(held->req.f.body_streaming);
+        EXPECT_EQ(held->req.f.phase, Phase::Idle) << "nothing framed before the last byte";
+        EXPECT_EQ(t.stats().streamed_body_capped, 1u);
+        held->rbuf.append(kBody.substr(100));
+        t.bytes(held);
+        ASSERT_NE(held->up, nullptr);
+        EXPECT_FALSE(held->req.f.body_streamed);
+        EXPECT_EQ(held->req.f.phase, Phase::Dispatched);
+
+        t.gone(first);
+        EXPECT_NE(stream_part(t, t.client(), 100), nullptr) << "the freed slot";
+        EXPECT_EQ(t.stats().streamed_bodies, 2u);
+        EXPECT_EQ(t.stats().streamed_body_capped, 1u);
     }
 } // namespace
