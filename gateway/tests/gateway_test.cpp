@@ -13531,6 +13531,113 @@ TEST_P(ProxyHeadDecide, ARepeatedModelAfterTheDecisionIsNeverForwarded)
     EXPECT_EQ(_gw->stats().streamed_body_refusals, 1u);
 }
 
+// A venue that refuses the connection mid-upload: the failover venue takes the body as it
+// is, so it streams there, from the first byte.
+TEST_P(ProxyHeadDecide, AFailoverMidUploadKeepsStreaming)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _second.bytes_seen() > 16 * 1024; })) << "the failover held the body";
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_NE(r.find("second"), std::string::npos) << r;
+    c.close();
+    shutdown();
+    EXPECT_EQ(body_of(_second.last_request()), whole_body(h));
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.upstream_failovers, 1u);
+    EXPECT_EQ(st.streamed_bodies, 1u);
+    EXPECT_EQ(st.streamed_body_parked, 0u);
+    ASSERT_EQ(pol.earlies().size(), 1u);
+    EXPECT_EQ(pol.earlies()[0].upstream_index, 1) << "confirm sees the venue serving now";
+}
+
+// A failover that names a model needs the whole body rewritten: it parks.
+TEST_P(ProxyHeadDecide, AFailoverWithAnOverrideParks)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1, .model = "other-model"};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(_second.bytes_seen(), 0u) << "a byte left before the body was complete";
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    c.close();
+    shutdown();
+    EXPECT_EQ(body_of(_second.last_request()), with_model(whole_body(h), "other-model"));
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+    ASSERT_EQ(pol.earlies().size(), 1u);
+    EXPECT_EQ(pol.earlies()[0].upstream_index, 1);
+    EXPECT_EQ(pol.earlies()[0].model, "other-model");
+}
+
+// Parked by a failover, a body holds no venue, so no venue's idle timeout runs on it: an
+// upload slower than --upstream-timeout is the body deadline's to judge, and is served.
+TEST_P(ProxyHeadDecide, AFailoverParkedBodyOutlivesTheVenueIdleTimeout)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1, .model = "other-model"};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port(), 200'000'000);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    c.close();
+    shutdown();
+    EXPECT_EQ(body_of(_second.last_request()), with_model(whole_body(h), "other-model"));
+    EXPECT_EQ(_second.requests_seen(), 1);
+    EXPECT_EQ(_gw->stats().upstream_timeouts, 0u);
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+}
+
+// The venue read the whole body and closed unanswered: the failover resends it from the
+// client's buffer, and a request pipelined behind it is served next, in step.
+TEST_P(ProxyHeadDecide, AFailoverAfterTheWholeBodyResendsItAndKeepsThePipeline)
+{
+    _backend.set_close_unanswered(true);
+    HeadPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1};
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest + make_request()));
+    const std::string r1 = c.recv_response();
+    const std::string r2 = c.recv_response();
+    EXPECT_EQ(Client::status_of(r1), 200) << r1;
+    EXPECT_EQ(Client::status_of(r2), 200) << r2;
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 2) << "the first venue read both whole";
+    EXPECT_EQ(_second.requests_seen(), 2);
+    const std::string all = _second.all_requests();
+    const std::string body = whole_body(h);
+    EXPECT_NE(all.find(body), std::string::npos) << "the big body was not resent whole";
+    EXPECT_EQ(body_of(_second.last_request()), "hello");
+    EXPECT_EQ(_gw->stats().upstream_failovers, 2u);
+}
+
 // A pooled venue that dropped the connection as the body began: the retry on a fresh
 // connection rebuilds the head with the key the policy named, and only that key.
 TEST_P(ProxyHeadDecide, AStaleRetryOfAStreamedBodySendsOnlyTheNamedKey)

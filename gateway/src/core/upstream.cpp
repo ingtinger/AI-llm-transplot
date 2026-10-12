@@ -342,14 +342,30 @@ namespace llmbridge::detail
 
         LB_WARN(ReqId{client->req.f.req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),
                 " failed (", why, "); retrying on ", static_cast<int64_t>(r.upstream_index));
-        if (UpstreamConn* u = unpair(client)) _ops->close(*u);
-        ++client->req.f.failover_attempts;
+        ReqState& f = client->req.f;
+        if (UpstreamConn* u = unpair(client))
+        {
+            if (f.body_streaming) reset_venue(u); // it holds part of a body it will not finish
+            _ops->close(*u);
+        }
+        ++f.failover_attempts;
         client->upstream_slot = r.upstream_index;
+        ++_stats.upstream_failovers;
         // The original request back at the front of rbuf. The forward rebuilds it for the
         // new venue's dialect and erases exactly these bytes again, so a pipelined
-        // request queued behind it keeps its place.
-        client->rbuf.insert(0, client->req.saved);
-        ++_stats.upstream_failovers;
+        // request queued behind it keeps its place. A body kept in rbuf is still there.
+        if (!f.body_in_rbuf) client->rbuf.insert(0, client->req.saved);
+        // A body still arriving goes on as it arrives to a venue that takes it as it is,
+        // else it parks to its last byte (GATEWAY-INTERNALS.md 12c).
+        else if (f.body_streaming && !(f.model_override.empty() && f.tier_override.empty() &&
+                                       venue_streams(client_dialect_of(client->rbuf), client->upstream_slot)))
+        {
+            stop_body(client);
+            f.body_parked = true;
+            f.ts_progress = 0; // no venue to time out: the body's deadline holds it (12b)
+            ++_stats.streamed_body_parked;
+            return true;
+        }
         dispatch(client);
         return true;
     }
@@ -365,7 +381,8 @@ namespace llmbridge::detail
         // No response byte may have arrived, or the venue may have acted on the request,
         // and nothing may be owed to the client, or a re-send duplicates output.
         if (!client->req.can_redispatch() || !client->out.idle()) return {};
-        if (client->req.saved.empty()) return {};
+        if (client->req.saved.empty() && !client->req.f.body_in_rbuf) return {};
+        if (client->req.f.body_parked) return {}; // no venue has it: nothing failed
         if (client->req.f.failover_attempts >= kMaxFailoverAttempts - 1) return {};
 
         const FailureFacts f{client->upstream_slot, status, why, client->req.f.failover_attempts,
