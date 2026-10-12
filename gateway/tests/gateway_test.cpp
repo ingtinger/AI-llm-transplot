@@ -11590,5 +11590,45 @@ TEST_P(ProxyBodyStream, OnAndOffReadTheSameUpload)
     EXPECT_LT(rec[1].body_work_ns, kUploadNs / 2) << "the scan's share";
 }
 
+// first-token is the provider's wait, so it starts at the body's last byte. It started
+// at a streamed body's head, so the client's upload landed in it: the same request read
+// ~300 ms streamed and ~4 ms held.
+TEST_P(ProxyBodyStream, OnAndOffReadTheSameFirstToken)
+{
+    llmbridge::RequestRecord rec[2];
+    uint64_t first_token[2] = {};
+    for (const bool on : {true, false})
+    {
+        TestBackend backend;
+        backend.set_response(openai_sse_response(4096));
+        backend.start();
+        RecordingSink sink;
+        Gateway gw(0, "127.0.0.1", backend.port(), 0, UpstreamDialect::OpenAI, GetParam());
+        gw.set_stream_openai_body(on);
+        gw.set_request_sink(&sink, {});
+        std::thread loop([&] { gw.run(); });
+        Client c;
+        const bool sent = c.connect(gw.bound_port()) && send_slowly(c, big_request(1024, true, true));
+        const std::string all = sent ? c.recv_stream() : std::string();
+        c.close();
+        gw.request_stop();
+        loop.join();
+        backend.stop();
+        ASSERT_NE(all.find("[DONE]"), std::string::npos) << "on=" << on;
+        const auto recs = sink.records();
+        ASSERT_EQ(recs.size(), 1u) << "on=" << on;
+        rec[on] = recs[0].r;
+        EXPECT_EQ(gw.stats().streamed_bodies, on ? 1u : 0u);
+        ASSERT_EQ(gw.stats().first_token.total(), 1u) << "on=" << on;
+        first_token[on] = gw.stats().first_token.max();
+    }
+    for (const bool on : {true, false})
+    {
+        const llmbridge::RequestRecord& r = rec[on];
+        EXPECT_EQ(first_token[on], static_cast<uint64_t>(r.ts_first_token - r.ts_body_end)) << "on=" << on;
+        EXPECT_LT(first_token[on], static_cast<uint64_t>(kUploadNs / 4)) << "on=" << on << ": the upload";
+    }
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyBodyStream,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));

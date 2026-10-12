@@ -243,7 +243,9 @@ our work and the venue's wait where a held body puts them:
 
 What is left between t3 and `ts_body_sent`, less `body_work_ns`, is the client's
 upload overlapping the venue's read of it: in no reported interval, because it is
-neither ours nor the provider's.
+neither ours nor the provider's. `first-token` (§4) starts at `ts_body_end` for the
+same reason, so a sink reader takes the time to first token as `ts_first_token` −
+`ts_body_end`, or − t0 when `ts_body_end` is 0 because the body was cut short.
 
 | body | client upload | ours (`request-path`) | provider |
 |---|---|---|---|
@@ -438,7 +440,7 @@ it is cumulative since start, so two dumps subtracted give you an interval.
 | `connect(TLS)` | (t2−t1) | handshake only: **no handshake at all** on a pooled connection, and this line existing separately is the point. See the note on resolution below |
 | `response-path` | t4 → t6 | translate-back **plus** the client write, through full flush |
 | `added-total` | request-path + response-path | everything the gateway did to this request; **both handshakes excluded** |
-| `first-token` | t0 → first content token | the client's real wait before anything appears, on a **streamed** request only. Almost none of it ours: it is the provider's queue, its prefill, and any reasoning it did before showing a token; see the note below on why it is reported and not folded in |
+| `first-token` | the body's last byte (`ts_body_end`, t0 when held) → first content token | the client's real wait before anything appears, on a **streamed** request only. Almost none of it ours: it is the provider's queue, its prefill, and any reasoning it did before showing a token; see the note below on why it is reported and not folded in |
 | `accept(TLS)` | client accept → inbound handshake done | the handshake we terminate for the client. **Printed only when it has samples**, i.e. only under `--listen-tls`; a plaintext listener never terminates one. Per connection, not per request, and unlike `connect(TLS)` it is genuinely ours; see §1 |
 
 `connect(TLS)` here and `x-llmbridge-connect-us` in §3 are **the same span**,

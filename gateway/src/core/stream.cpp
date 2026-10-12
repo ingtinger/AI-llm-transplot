@@ -41,11 +41,11 @@ namespace llmbridge::detail
         const TimingSplit sp = split_of(client->req.f, client->req.f.ts_up_recvd);
         if (sp.req_path_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(sp.req_path_ns));
         if (sp.connect_ns >= 0) _stats.connect.record(static_cast<uint64_t>(sp.connect_ns));
-        // Zero means no content chunk ever arrived, not an instant answer.
-        if (client->req.f.ts_first_token > 0 && client->req.f.ts_req_recvd > 0 &&
-            client->req.f.ts_first_token >= client->req.f.ts_req_recvd)
-            _stats.first_token.record(
-                static_cast<uint64_t>(client->req.f.ts_first_token - client->req.f.ts_req_recvd));
+        // Zero means no content chunk ever arrived, not an instant answer. The wait starts
+        // at the body's last byte, t0 when held: a streamed body's upload is the client's.
+        const int64_t from = client->req.f.ts_body_end ? client->req.f.ts_body_end : client->req.f.ts_req_recvd;
+        if (client->req.f.ts_first_token > 0 && from > 0 && client->req.f.ts_first_token >= from)
+            _stats.first_token.record(static_cast<uint64_t>(client->req.f.ts_first_token - from));
     }
 
     // The upstream answered text/event-stream: stage the client's SSE head, then
