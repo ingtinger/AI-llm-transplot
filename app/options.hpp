@@ -41,7 +41,8 @@ namespace llmbridge::app
         std::string io = "auto", log_level = "info";
         int workers = 1;
         bool timing_headers = false;
-        double duration_s = 0, warmup_s = 0, prefault_mb = 0;
+        double duration_s = 0, warmup_s = 0, prefault_mb = 0, retain_mb = 4;
+        std::string stream_openai_body = "on";
     };
 
     enum class Kind { Bool, Int, Number, Text, Choice, List };

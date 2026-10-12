@@ -261,6 +261,8 @@ static int run(int argc, char** argv)
         gw->set_pool_idle_ns(static_cast<int64_t>(cfg.pool_idle_s * 1e9));
         gw->set_connect_ns(static_cast<int64_t>(cfg.connect_s * 1e9));
         gw->set_prefault_bytes(static_cast<size_t>(cfg.prefault_mb * (1 << 20)));
+        gw->set_retain_bytes(static_cast<size_t>(cfg.retain_mb * (1 << 20)));
+        gw->set_stream_openai_body(cfg.stream_openai_body == "on");
         gateways.push_back(std::move(gw));
     }
     g_gateways.store(&gateways);

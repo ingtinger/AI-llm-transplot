@@ -61,6 +61,12 @@
     "_prefault_mb": "Megabytes to reserve and write through in every request buffer before it carries a request: the gateway's two scratch strings at start, each upstream connection's send buffer when it opens. Without it the first request through each buffer faults in fresh pages as it is written, measured at 2.6 ms for a 10 MB agent context. Memory is this size times the number of pooled upstream connections, resident for the life of the process, so leave it at 0 for small requests and set it to the largest request body you expect (16 for Claude Code sessions) when they are large.",
     "prefault_mb": 0,
 
+    "_retain_mb": "Megabytes of JSON parse storage (the node arena and the parser's stacks, each) a worker keeps between translated bodies, 0 to 16. Past it a large body's storage is freed after the request, so the next one allocates afresh. Raise it to 16 when bodies of several megabytes are common: it costs up to twice this much resident memory per worker.",
+    "retain_mb": 4,
+
+    "_stream_openai_body": "\"on\" (default) forwards an OpenAI client's byte-forwarded body to the venue as it arrives, each chunk checked first: a repeated or escaped top-level key, or a byte that is not JSON, stops it, resets the upstream and answers 400. \"off\" holds it until its last byte. Other clients' byte-forwarded bodies are always forwarded as they arrive; a translated body, a body under 16 KiB, and every body while a policy is installed are held.",
+    "stream_openai_body": "on",
+
     "_duration_s": "Self-stop after N seconds (fractions allowed; SIGINT/SIGTERM still stop it at once) and print the added-latency profile, for scripted benchmark runs. 0 runs until SIGINT/SIGTERM.",
     "duration_s": 0,
 

@@ -24,6 +24,7 @@ namespace llmbridge::app
         namespace json = llmbridge::provider::json;
 
         constexpr std::string_view kBackends[] = {"auto", "epoll", "uring"};
+        constexpr std::string_view kOnOff[] = {"on", "off"};
         constexpr std::string_view kLevels[] = {"trace", "debug", "info", "warn", "error", "off"};
         constexpr double kYear = 31536000; // a bigger timeout is a unit typo, not a policy
 
@@ -65,6 +66,12 @@ namespace llmbridge::app
              K::Number, 0, kYear, {}, &S::warmup_s},
             {"--prefault-mb", "runtime.prefault_mb", "MB", "prefault every request buffer to this size",
              K::Number, 0, 4096, {}, &S::prefault_mb},
+            {"--retain-mb", "runtime.retain_mb", "MB",
+             "JSON parse storage a worker keeps between bodies, up to the 16 MB body cap", K::Number,
+             0, 16, {}, &S::retain_mb},
+            {"--stream-openai-body", "runtime.stream_openai_body", "MODE",
+             "forward an OpenAI client's body as it arrives, each chunk checked first", K::Choice, 0, 0,
+             kOnOff, &S::stream_openai_body},
         };
 
         // Old spellings are refused by name: an alias would keep the old model alive.
