@@ -136,6 +136,20 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   peer that dribbles a record or declares a 16 MB ClientHello is refused at roughly
   16 KiB, the TLS record ceiling. A connection that never completes setup is closed
   after 30 seconds.
+- **A slow upload pays for the provider connection it holds.** Since 0.90.0 a
+  byte-forwarded body of 16 KiB or more is forwarded as it arrives, so while it arrives
+  it holds a connection to the provider (a TLS handshake when cold) and a second
+  descriptor. Until 0.94.0 nothing bounded how long: each byte restarted the idle
+  clock, so a client trickling its body (a slowloris) held both with almost no
+  bandwidth. Now such a body gets `--body-grace` (10 s) and one second more for every
+  `--body-min-rate` bytes it delivers (1 KiB a second, below any real link), and with
+  `--body-timeout` a limit on the whole upload. One that misses it gets a 408 and its
+  connection closes, and the provider's connection is reset, so the provider never
+  holds the whole body. A worker streams at most `--stream-body-max` bodies at once
+  (256); past that a body is held to its last byte, one descriptor and no provider
+  connection, and `--stream-body off` holds every one. A client that stops sending
+  mid-body is told apart from a provider that stops reading, and neither is retried or
+  failed over. GATEWAY-INTERNALS.md 12b.
 
 ### Known gaps, stated instead of implied
 
@@ -157,6 +171,13 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
 - **A slow client can hold memory.** Streaming output is bounded per connection (the
   upstream read is paused on both backends, past 1 MiB owed on io_uring, which also
   caps the buffer at 8 MiB), but that bound is per connection, not global.
+- **Slow uploads are bounded per connection, not per client.** A client with many
+  connections, each kept at the minimum rate, holds up to `--stream-body-max` provider
+  connections per worker for 1 KiB a second each; past the cap its bodies are held. A
+  held body has no rate floor: it must arrive within the setup deadline on a fresh
+  connection, but on a reused one only `--client-idle` bounds it, as before 0.90.0.
+  Raising `--body-min-rate` or lowering the cap makes the attack dearer and cuts
+  slower legitimate clients sooner; a per-client limit needs something in front.
 - **No per-client quota or rate limit.** Connection setup is bounded (30 s to frame a
   first request) and an established client that goes quiet is closed after
   `--client-idle`, three days by default, so a descriptor cannot be held forever. That

@@ -367,6 +367,13 @@ token-by-token, including the final usage chunk when the request sets
 `stream_options: {"include_usage": true}`. Both event-loop backends (epoll and
 io_uring) implement it, with back-pressure and an upstream idle timeout.
 
+**Large request bodies** go to the provider as they arrive when nothing in them needs
+rewriting (16 KiB or more, byte-forwarded, no policy installed), so a 10 MB agent context
+does not wait for its own upload; an OpenAI client's body is checked as it passes. Each
+holds a provider connection until its last byte, so a worker streams at most
+`--stream-body-max` at once and a body must keep up `--body-min-rate` (1 KiB a second)
+past `--body-grace`, or it is cut with a 408. `--stream-body off` holds every body.
+
 **Tool calling** is supported **streaming and non-streaming**, OpenAI ⇄ Anthropic:
 `tools` declarations (the JSON Schema is forwarded byte-for-byte, never rebuilt), all
 `tool_choice` forms, parallel calls, and the `tool_result` round-trip. OpenAI's
