@@ -307,8 +307,8 @@ namespace
     // Lower these when a change removes allocations; never raise them without a
     // reason in the commit message. io_uring's per-delta figure can read 0.02, not 0:
     // its 4 KiB receive buffers split the stream at different points.
-    constexpr Ceiling kEpoll{3, 2, 2, 0.03};
-    constexpr Ceiling kUring{3, 2, 2, 0.03};
+    constexpr Ceiling kEpoll{0, 0, 0, 0.03};
+    constexpr Ceiling kUring{0, 0, 0, 0.03};
 
     class AllocCeiling : public ::testing::TestWithParam<IoBackend>
     {

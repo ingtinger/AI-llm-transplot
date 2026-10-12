@@ -12,6 +12,7 @@
 
 #include "core/io.hpp"
 #include "core/limits.hpp"
+#include "net/http_write.hpp"
 #include "request.hpp"
 #include "response.hpp"
 #include "stream.hpp"
@@ -65,23 +66,24 @@ namespace llmbridge::detail
         if (client->req.f.sse_translating) client->sse_xlate.reset(-1, client->req.f.wants_usage);
         // Chosen once, before either head is built, and remembered.
         client->req.f.stream_chunked_out = stream_reusable_out(client);
+        std::string& out = client->out.stage();
+        const std::string_view base = client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead;
+        out.append(base.substr(0, base.size() - 2)); // its blank line comes last
         if (_timing_headers)
         {
             // t5 = t4, stamped by the caller: a stream's response is not built at one
             // instant, so the compute leg is the request side alone.
-            std::string timing;
             const TimingSplit sp = timing_split(
                 client->req.f.ts_req_recvd, client->req.f.ts_req_built, client->req.f.ts_wire_ready,
                 client->req.f.ts_up_sent, client->req.f.ts_up_recvd, client->req.f.ts_up_recvd);
-            append_timing_headers(timing, client->req.f.ts_req_recvd, sp.compute_ns / 1000,
+            append_timing_headers(out, client->req.f.ts_req_recvd, sp.compute_ns / 1000,
                                   sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                   sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
                                   client->req.f.req_seq, client->req.f.client_upload_ns / 1000);
-            append_sse_head(client->out.stage(), timing,
-                            client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
         }
-        else
-            client->out.stage().append(client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
+        // The venue's request id and rate limits, as on a whole reply.
+        net::http::append_relayed(out, std::string_view(u->rbuf.data(), h.header_len - 4), false);
+        out.append("\r\n");
         client->req.f.phase = Phase::Streaming;
 
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body

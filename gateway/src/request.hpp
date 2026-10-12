@@ -25,19 +25,8 @@
 
 namespace llmbridge::detail
 {
-    // Log-friendly name for the dialect. Kept next to the log sites, not on
-    // UpstreamDialect itself: the enum is part of the public API and does not need
-    // a printing concern attached to it.
-    /// [[maybe_unused]] because this is called only from an LB_DEBUG line, and at
-    /// the default info floor that line compiles to nothing, leaving an
-    /// unreferenced static. Clang makes that fatal under -Werror
-    /// (-Wunneeded-internal-declaration); GCC says nothing, which is how it
-    /// reached CI. Any helper used only from a compiled-out log line needs this.
-    ///
-    /// The request line ("POST /v1/chat/completions HTTP/1.1") for a log line,
-    /// bounded. Safe to log: the start line carries no credential, unlike every
-    /// header after it. Truncated hard so a hostile long URI cannot dominate the
-    /// log, and cut at the first CR so it can never run into a header.
+    /// The request line for a log line: no credential, unlike every header after it;
+    /// cut at 128 bytes so a hostile URI cannot dominate the log, and at the first CR.
     inline std::string_view request_line(std::string_view buf) noexcept
     {
         constexpr size_t kMax = 128;
@@ -47,9 +36,7 @@ namespace llmbridge::detail
         return buf.substr(0, n);
     }
 
-    /// Status code off the front of a response we are about to send. Reads the
-    /// buffer we built ourselves, so the "HTTP/1.x NNN" shape is guaranteed;
-    /// returns 0 if it is not, which is worth seeing in a log instead of hiding.
+    /// Status code off the front of a response we built; 0 if it is not one.
     inline int status_of(std::string_view resp) noexcept
     {
         if (resp.size() < 12 || resp.compare(0, 5, "HTTP/") != 0) return 0;
@@ -72,6 +59,19 @@ namespace llmbridge::detail
 
     constexpr std::string_view kContinue = "HTTP/1.1 100 Continue\r\n\r\n";
 
+    /// Fills a HeadFacts from each header line it is shown, offsets from `head`'s start;
+    /// handed to net::http::parse_request so framing and the facts are one walk.
+    struct HeadReader
+    {
+        std::string_view head;
+        const std::vector<std::string>& strip;
+        HeadFacts& f;
+        bool operator()(const net::http::HeaderLine& h) noexcept;
+    };
+
+    /// The client's dialect from the request line of `head`: client_wire on its method
+    /// and full target.
+    [[nodiscard]] Dialect client_dialect_of(std::string_view head) noexcept;
     /// Everything a policy or the sink reads from the body; the gateway calls this
     /// once per request.
     [[nodiscard]] provider::TopLevelFacts body_facts(std::string_view head,
@@ -81,28 +81,31 @@ namespace llmbridge::detail
     const char* dialect_name(UpstreamDialect m) noexcept;
     void append_http(std::string& out, std::string_view start_line, std::string_view body,
                      std::string_view extra); // appended: `out` is a stage, capacity kept
-    /// Into `into`, capacity kept, like request_without.
     void build_http_request(std::string_view start_line, std::string_view body,
                             std::string_view host, std::string_view extra, std::string& into);
-    [[nodiscard]] bool expects_continue(std::string_view head) noexcept;
-    /// Into `into`, whose capacity is kept: it is a buffer the pooled connections and
-    /// the loop pass around, so a request only a little larger than the last one does
-    /// not fault in a fresh copy of itself. False refuses the request; `into` is empty.
+    /// The byte-forwarded request into `into`, capacity kept: a pooled connection's
+    /// buffer, so a request a little larger than the last does not fault in a new
+    /// copy. Null, or why to refuse it, with `into` empty.
+    const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
+                              const std::vector<std::string>& strip, std::string_view host_hdr,
+                              std::string_view base_path, std::string_view body_override,
+                              std::string& into);
+    /// build_forward over a message whose facts are read here; false refuses it.
     bool request_without(std::string_view msg, size_t header_len,
                          const std::vector<std::string>& strip,
                          std::string_view host_hdr, std::string_view base_path,
                          std::string_view body_override, std::string& into);
-    /// `out` receives the framed request and `body_scratch` the translated body;
-    /// both keep their capacity across calls, which is the point of passing them.
+    /// `out` receives the framed request and `body_scratch` the translated body; both
+    /// keep their capacity. `head` is the client's, `f` its facts. On false, `why` is
+    /// "translate", "credential", "bedrock credential" or "no credential".
     bool build_translated_request(const Upstream& up, UpstreamDialect mode,
-                                  std::string_view body, std::string_view client_hdrs,
-                                  const std::vector<std::string>& strip,
-                                  std::string& out, std::string& body_scratch,
-                                  const char*& why, std::string_view model_override = {},
+                                  std::string_view body, std::string_view head,
+                                  const HeadFacts& f, std::string& out,
+                                  std::string& body_scratch, const char*& why,
+                                  std::string_view model_override = {},
                                   bool* wants_stream_usage = nullptr);
-    /// The credential headers for the translated upstream request.
-    /// Reached directly by request_test.cpp, the merged single-pass
-    /// header scan (`scan_auth_headers`) that replaced size find_header() walks.
+    /// The credential lines a translated request carries, from one header block. A test
+    /// seam over the facts the framing walk reads.
     bool auth_headers_for(UpstreamDialect mode, std::string_view client_headers,
                           const std::vector<std::string>& strip, std::string& out);
     bool xlate_resp(UpstreamDialect mode, std::string_view body, std::string& out,

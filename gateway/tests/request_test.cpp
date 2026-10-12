@@ -18,6 +18,7 @@
 // pathological regression can trip.
 
 #include "request.hpp"
+#include "response.hpp"
 
 #include <gtest/gtest.h>
 
@@ -150,6 +151,64 @@ TEST(AuthHeaders, GoldenSerializedResult)
 // live request, twenty times past this line. A tight tolerance would flake on a
 // shared runner; this one cannot without something being genuinely wrong.
 // Skipped under the sanitizers, which slow every path uniformly.
+// The AzureOpenAI SDK sends `api-key`; it was not read at all.
+TEST(AuthHeaders, AnAzureApiKeyIsACredential)
+{
+    const std::vector<std::string> strip;
+    std::string out;
+    ASSERT_TRUE(auth_headers_for(UpstreamDialect::Azure, "api-key: AZKEY\r\n", strip, out));
+    EXPECT_EQ(out, "api-key: AZKEY\r\n");
+    ASSERT_TRUE(auth_headers_for(UpstreamDialect::Azure,
+                                 "Authorization: Bearer B\r\napi-key: AZKEY\r\n", strip, out));
+    EXPECT_EQ(out, "api-key: AZKEY\r\n") << "Azure's own header wins";
+    EXPECT_FALSE(auth_headers_for(UpstreamDialect::Azure, "api-key: a\x01" "b\r\n", strip, out))
+        << "validated with the other credentials";
+    EXPECT_FALSE(auth_headers_for(UpstreamDialect::Anthropic, "api-key: a\x01" "b\r\n", strip, out))
+        << "validated whether or not the venue reads it";
+    EXPECT_FALSE(auth_headers_for(UpstreamDialect::Azure, "Host: x\r\n", strip, out))
+        << "no credential at all is refused";
+}
+
+// RFC 9110 11.1: the scheme is case-insensitive.
+TEST(AuthHeaders, TheBearerSchemeIsCaseInsensitive)
+{
+    const std::vector<std::string> strip;
+    std::string out;
+    for (const char* auth : {"Bearer k", "bearer k", "BEARER k", "bEaReR k", "Bearer   k"})
+    {
+        ASSERT_TRUE(auth_headers_for(UpstreamDialect::Anthropic,
+                                     std::string("Authorization: ") + auth + "\r\n", strip, out));
+        EXPECT_EQ(out, "x-api-key: k\r\nanthropic-version: 2023-06-01\r\n") << auth;
+    }
+    for (const char* auth : {"Bearerk", "Basic k", "Bearer"})
+    {
+        ASSERT_TRUE(auth_headers_for(UpstreamDialect::Anthropic,
+                                     std::string("Authorization: ") + auth + "\r\n", strip, out));
+        EXPECT_EQ(out, "anthropic-version: 2023-06-01\r\n") << auth;
+    }
+}
+
+// A policy may refuse with any 4xx or 5xx; one the table did not list became a 502.
+TEST(ErrorReply, AnyStatusKeepsItsOwnCode)
+{
+    for (const int code : {405, 409, 422, 451, 500, 501, 599})
+    {
+        std::string out;
+        llmbridge::detail::append_error(out, code, "why");
+        EXPECT_EQ(llmbridge::detail::status_of(out), code) << out;
+        EXPECT_EQ(out.find("Bad Gateway"), std::string::npos) << out;
+        EXPECT_NE(out.find(code < 500 ? "invalid_request_error" : "api_error"), std::string::npos) << out;
+        EXPECT_EQ(out.find("why") != std::string::npos, code < 500) << out;
+    }
+    std::string out;
+    llmbridge::detail::append_error(out, 422);
+    EXPECT_EQ(out.substr(0, out.find("\r\n")), "HTTP/1.1 422 Unprocessable Content");
+    out.clear();
+    llmbridge::detail::append_error(out, 502);
+    EXPECT_EQ(out.substr(0, out.find("\r\n")), "HTTP/1.1 502 Bad Gateway");
+    EXPECT_NE(out.find("upstream_error"), std::string::npos) << out;
+}
+
 #if defined(__has_feature)
     #define LLMBRIDGE_TEST_UNDER_CLANG_SANITIZER \
         (__has_feature(address_sanitizer) || __has_feature(thread_sanitizer))

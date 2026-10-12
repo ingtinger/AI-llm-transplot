@@ -11,11 +11,13 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <charconv>
 #include <string>
 
+#include "net/http_write.hpp"
 #include "net/sigv4.hpp"
 #include "provider/json.hpp" // translate_failure re-parses a refused body
 
@@ -59,27 +61,25 @@ namespace llmbridge::detail
             return v;
         }
 
-        // Every credential header we might care about, collected in one pass.
-        //
-        // The first version called find_header() six times: four to validate, then
-        // up to two to fetch; i.e. six full walks of the client's header block per
-        // request. Measured on a thermally-gated A/B at 20k RPS that cost ~40 us at
-        // p99 (~8%), with p50 unchanged: exactly the shape of "a little extra work
-        // on every request". One walk removes it.
-        struct AuthHeaders
+        /// Whether the operator's strip list names this header. Entries are lower-case,
+        /// with or without their colon.
+        bool stripped(std::string_view name, const std::vector<std::string>& strip) noexcept
         {
-            std::string_view authorization;
-            std::string_view x_api_key;
-            std::string_view x_goog_api_key;
-            std::string_view anthropic_version;
-        };
-
-        bool header_stripped(std::string_view line,
-                             const std::vector<std::string>& strip) noexcept
-        {
-            for (const std::string& s : strip)
-                if (net::http::detail::line_is(line, s)) return true;
+            for (std::string_view s : strip)
+            {
+                if (!s.empty() && s.back() == ':') s.remove_suffix(1);
+                if (net::http::detail::same_ci(name, s)) return true;
+            }
             return false;
+        }
+
+        /// "Bearer K" -> K, the scheme in any case (RFC 9110 11.1); empty for any other.
+        std::string_view bearer_token(std::string_view v) noexcept
+        {
+            if (v.size() <= 7 || !net::http::detail::same_ci(v.substr(0, 6), "bearer") ||
+                (v[6] != ' ' && v[6] != '\t'))
+                return {};
+            return net::http::detail::ltrim(v.substr(7));
         }
 
         /// Whether a client's origin-form path is safe to forward under a venue's base
@@ -109,171 +109,104 @@ namespace llmbridge::detail
             return true;
         }
 
-        /// Splice `base` in front of the request line's target, in place.
-        ///
-        /// False means refuse: the target is not origin-form (absolute-form would pick
-        /// the upstream vhost, authority-form is CONNECT's), or its path could resolve
-        /// outside the base. Checked with or without a base. We do not normalize: rewriting
-        /// a target we do not understand sends a request where its operator never listed.
-        bool prefix_target(std::string& req, std::string_view base)
+        /// The client's credential lines in the venue's terms, appended to `out`. Every
+        /// credential the client sent is checked first, whether or not this venue reads
+        /// it, so a malformed value cannot route around the check by picking another.
+        const char* append_auth(UpstreamDialect mode, std::string_view head, const HeadFacts& f,
+                                std::string& out)
         {
-            const size_t eol = req.find("\r\n");
-            if (eol == std::string::npos) return false;
-            const size_t sp1 = req.find(' ');
-            if (sp1 == std::string::npos || sp1 > eol) return false;
-            const size_t sp2 = req.find(' ', sp1 + 1);
-            if (sp2 == std::string::npos || sp2 > eol) return false;
-            if (sp2 == sp1 + 1 || req[sp1 + 1] != '/') return false;
-            if (!target_path_ok(std::string_view(req).substr(sp1 + 1, sp2 - sp1 - 1))) return false;
-            if (!base.empty()) req.insert(sp1 + 1, base);
-            return true;
-        }
-
-        AuthHeaders scan_auth_headers(std::string_view headers,
-                                      const std::vector<std::string>& strip) noexcept
-        {
-            AuthHeaders out;
-            size_t start = 0;
-            while (start < headers.size())
+            const std::string_view auth = f.authorization.in(head), x_api_key = f.x_api_key.in(head),
+                                   api_key = f.api_key.in(head), goog = f.x_goog_api_key.in(head),
+                                   version = f.anthropic_version.in(head);
+            for (const std::string_view v : {auth, x_api_key, api_key, goog, version})
+                if (!v.empty() && !header_value_safe(v)) return "credential";
+            const auto line = [&out](std::string_view name, std::string_view v) {
+                if (v.empty()) return;
+                out.append(name).append(": ").append(v).append("\r\n");
+            };
+            switch (mode)
             {
-                size_t eol = headers.find("\r\n", start);
-                if (eol == std::string_view::npos) eol = headers.size();
-                const std::string_view line = headers.substr(start, eol - start);
-                // A stripped header is invisible here too, or the tenant token in
-                // Authorization would still be mapped onto the provider credential.
-                if (header_stripped(line, strip)) { start = eol + 2; continue; }
-                // First occurrence wins (anti-smuggling: a duplicated credential must
-                // resolve the same way for us and for the upstream), hence the
-                // empty() guards.
-                if (out.authorization.empty() && net::http::detail::line_is(line, "authorization:"))
-                    out.authorization = rtrim_ows(net::http::detail::ltrim(line.substr(14)));
-                else if (out.x_api_key.empty() && net::http::detail::line_is(line, "x-api-key:"))
-                    out.x_api_key = rtrim_ows(net::http::detail::ltrim(line.substr(10)));
-                else if (out.x_goog_api_key.empty() && net::http::detail::line_is(line, "x-goog-api-key:"))
-                    out.x_goog_api_key = rtrim_ows(net::http::detail::ltrim(line.substr(15)));
-                else if (out.anthropic_version.empty() &&
-                         net::http::detail::line_is(line, "anthropic-version:"))
-                    out.anthropic_version = rtrim_ows(net::http::detail::ltrim(line.substr(18)));
-                start = eol + 2;
+                case UpstreamDialect::Anthropic:
+                    line("x-api-key", x_api_key.empty() ? bearer_token(auth) : x_api_key);
+                    line("anthropic-version", version.empty() ? kAnthropicVersionDefault : version);
+                    return nullptr;
+                case UpstreamDialect::Gemini:
+                    line("x-goog-api-key", goog.empty() ? bearer_token(auth) : goog);
+                    return nullptr;
+                case UpstreamDialect::Cohere:
+                    line("Authorization", auth); // Cohere speaks Bearer natively
+                    return nullptr;
+                case UpstreamDialect::Azure:
+                {
+                    // Azure's own `api-key` first; the OpenAI SDK against an Azure
+                    // endpoint sends Authorization, the normal case.
+                    std::string_view key = !api_key.empty() ? api_key : x_api_key;
+                    if (key.empty()) key = bearer_token(auth);
+                    if (key.empty()) return "no credential";
+                    line("api-key", key);
+                    return nullptr;
+                }
+                case UpstreamDialect::Bedrock: // signed instead: sign_bedrock
+                case UpstreamDialect::OpenAI:  // byte-forwarded, never rebuilt here
+                    break;
             }
-            return out;
+            return "credential";
         }
 
-        // Translate an OpenAI request body to the upstream dialect, also yielding
-        // the upstream start line. Empty return = malformed body. Shared by both
-        // event-loop backends.
-        bool xlate_req(UpstreamDialect mode, std::string_view body,
-                       std::string_view base_path, std::string_view query,
-                       std::string& start_line_store,
-                       std::string_view& start_line, std::string_view& target_out,
-                       bool* wants_stream_usage, std::string& out)
+        /// An OpenAI body in the venue's dialect, into `out`, and the venue's path for it,
+        /// into `target`. False refuses the request.
+        bool xlate_req(UpstreamDialect mode, std::string_view body, bool* wants_stream_usage,
+                       std::string& out, std::string& target)
         {
-            std::string target_store;
-            std::string_view target;
             out.clear();
             switch (mode)
             {
                 case UpstreamDialect::Anthropic:
                     target = "/v1/messages";
-                    if (!provider::openai_to_anthropic_request(body, out, wants_stream_usage))
-                        return false;
-                    break;
+                    return provider::openai_to_anthropic_request(body, out, wants_stream_usage);
                 case UpstreamDialect::Gemini:
                     target = "/v1beta/models/gemini:generateContent";
                     out = provider::openai_to_gemini_request(body);
-                    break;
+                    return !out.empty(); // Gemini and Cohere refuse by returning nothing
                 case UpstreamDialect::Cohere:
                     target = "/v2/chat";
                     out = provider::openai_to_cohere_request(body);
-                    break;
+                    return !out.empty();
                 case UpstreamDialect::Bedrock:
                 {
-                    // The model moves from the body into the path, so the target is
-                    // per-request and cannot be a literal. Encoded as one segment,
-                    // slashes included: an inference-profile id may contain them, and
-                    // a raw slash there would silently change which resource is named.
+                    // The model moves from the body into the path, encoded as one
+                    // segment, slashes included: an inference-profile id may hold them.
                     std::string model;
                     if (!provider::openai_to_bedrock_request(body, model, out) || model.empty())
                     { out.clear(); return false; }
-                    target_store.assign("/model/")
-                        .append(net::sigv4::uri_encode(model, true))
-                        .append("/invoke");
-                    target = target_store;
-                    break;
+                    target.assign("/model/").append(net::sigv4::uri_encode(model, true)).append("/invoke");
+                    return true;
                 }
                 case UpstreamDialect::Azure:
-                    // Nothing is translated: Azure serves the OpenAI dialect. The body
-                    // is forwarded as the client wrote it, so an option we do not
-                    // model is not silently dropped on the way through.
+                    // Azure serves the OpenAI dialect: the body goes as the client wrote it,
+                    // so an option we do not model is not dropped on the way through.
                     out.assign(body);
-                    if (out.empty()) return false;
                     target = "/chat/completions";
-                    break;
+                    return !out.empty();
                 case UpstreamDialect::OpenAI:
-                    return false;
+                    break;
             }
-            if (out.empty()) return false; // Gemini and Cohere refuse by returning nothing
-            // No base path is the common case and stays allocation-free: the view
-            // points at a literal with static storage. Bedrock never takes that path,
-            // because its target is built per request.
-            if (base_path.empty() && query.empty() && mode != UpstreamDialect::Bedrock &&
-                mode != UpstreamDialect::Azure)
-            {
-                switch (mode)
-                {
-                    case UpstreamDialect::Anthropic: start_line = "POST /v1/messages HTTP/1.1"; break;
-                    case UpstreamDialect::Gemini:
-                        start_line = "POST /v1beta/models/gemini:generateContent HTTP/1.1";
-                        break;
-                    case UpstreamDialect::Cohere: start_line = "POST /v2/chat HTTP/1.1"; break;
-                    case UpstreamDialect::Bedrock:
-                    case UpstreamDialect::Azure:
-                    case UpstreamDialect::OpenAI: out.clear(); return false;
-                }
-                target_out = start_line.substr(5, start_line.size() - 14);
-            }
-            else
-            {
-                start_line_store.assign("POST ").append(base_path).append(target);
-                // The venue's query, not the client's: a translating mode builds the
-                // whole target, so there is nothing to merge. Azure's api-version
-                // rides here; every other mode has an empty query.
-                if (!query.empty()) start_line_store.append("?").append(query);
-                start_line_store.append(" HTTP/1.1");
-                start_line = start_line_store;
-                // A view into the caller's store, so it outlives this frame: the
-                // signature is computed over exactly these bytes.
-                target_out = std::string_view(start_line_store).substr(
-                    5, start_line_store.size() - 14);  // between "POST " and " HTTP/1.1"
-            }
-            return true;
+            return false;
         }
 
-        /// Sign a rebuilt Bedrock request, or refuse it.
-        ///
-        /// Shared by both backends on purpose. This is the credential path, and the
-        /// three calls it replaces used to be repeated in the epoll and io_uring
-        /// dispatchers: a fix that lands on one of those misses the shipped one,
-        /// because io_uring is the default on Ubuntu 24.04.
-        ///
-        /// Signing must happen here and not at the client: the target and the body are
-        /// both rewritten above, so any signature a caller pre-computed is void by the
-        /// time these bytes exist.
-        bool sign_bedrock(const Upstream& up, std::string_view client_hdrs,
-                          const std::vector<std::string>& strip, std::string_view target,
-                          std::string_view body, std::string& out, const char*& why)
+        /// Sign a rebuilt Bedrock request into `out`, or refuse it. Here and not at the
+        /// client: the target and body are both rewritten, so any earlier signature is void.
+        bool sign_bedrock(const Upstream& up, std::string_view authorization,
+                          std::string_view target, std::string_view body, std::string& out,
+                          const char*& why)
         {
             why = "credential";
     #ifdef LLMBRIDGE_HAVE_TLS
             if (up.aws_region.empty()) return false;
-            const AuthHeaders h = scan_auth_headers(client_hdrs, strip);
-            if (!header_value_safe(h.authorization)) return false;
-            std::string_view bearer = h.authorization;
+            if (!header_value_safe(authorization)) return false;
             why = "bedrock credential";
-            if (bearer.size() <= 7 ||
-                (bearer.compare(0, 7, "Bearer ") != 0 && bearer.compare(0, 7, "bearer ") != 0))
-                return false;
-            bearer = net::http::detail::ltrim(bearer.substr(7));
+            const std::string_view bearer = bearer_token(authorization);
+            if (bearer.empty()) return false;
 
             net::sigv4::Credentials cred{};
             if (!net::sigv4::parse_credentials(bearer, cred)) return false;
@@ -299,121 +232,75 @@ namespace llmbridge::detail
 
             const auto headers = net::sigv4::sign(cred, r);
             if (headers.empty()) return false;
-            out.clear();
             for (const auto& hdr : headers)
                 out.append(hdr.name).append(": ").append(hdr.value).append("\r\n");
             return true;
     #else
-            (void)up; (void)client_hdrs; (void)strip; (void)target; (void)body; (void)out;
-            (void)why;
+            (void)up; (void)authorization; (void)target; (void)body; (void)out; (void)why;
             return false;   // no OpenSSL, no signature, and never an unsigned request
     #endif
         }
 
     } // namespace
 
-    // Build the auth/extra header lines to inject into the translated
-    // upstream request, from the client's request headers.
-    //
-    // Whitelist, not passthrough: the gateway rebuilds the upstream request,
-    // and only the credential headers the target dialect understands may
-    // cross the translation boundary. Echoing arbitrary client headers
-    // through a rebuilt request is a smuggling surface (and our own framing
-    // headers must stay authoritative). A byte-forward is untouched by all of
-    // this: it already carries every client header.
-    //
-    // Values re-emitted here cannot contain CR/LF: find_header() bounds each
-    // value by its own line's CRLF, so injection via a crafted credential is
-    // structurally impossible instead of filtered.
-    //
-    // Returns false when the client supplied a syntactically invalid credential
-    // (control characters). The caller must fail the request instead of
-    // forward. Silently dropping would still send a credential-less request
-    // upstream, which is a confusing 401; a 400 names the client's own bug.
+    bool HeadReader::operator()(const net::http::HeaderLine& h) noexcept
+    {
+        using net::http::Field;
+        const auto span = [this](std::string_view v) {
+            return HeadFacts::Span{static_cast<uint32_t>(v.data() - head.data()),
+                                   static_cast<uint32_t>(v.size())};
+        };
+        // First occurrence wins (anti-smuggling: a repeated credential must resolve the
+        // same way for us and the upstream). A stripped one is invisible, or a tenant's
+        // Authorization would still be mapped onto the provider credential.
+        const auto cred = [&](HeadFacts::Span& s) {
+            if (s.empty() && !stripped(h.name, strip))
+                s = span(rtrim_ows(net::http::detail::ltrim(h.value)));
+        };
+        switch (h.field)
+        {
+            case Field::Authorization: cred(f.authorization); break;
+            case Field::XApiKey: cred(f.x_api_key); break;
+            case Field::ApiKey: cred(f.api_key); break;
+            case Field::XGoogApiKey: cred(f.x_goog_api_key); break;
+            case Field::AnthropicVersion: cred(f.anthropic_version); break;
+            case Field::ContentLength: f.content_length = true; break;
+            case Field::Expect:
+                // RFC 9110 10.1.1: answer a 100 or a final status before reading the body.
+                if (f.expect == 0)
+                {
+                    const std::string_view v = net::http::detail::ltrim(h.value);
+                    f.expect = v.size() >= 12 && net::http::detail::line_is(v, "100-continue") ? 2 : 1;
+                }
+                break;
+            case Field::Connection:
+                if (f.connections < HeadFacts::kConnections) f.connection[f.connections] = span(h.value);
+                if (f.connections <= HeadFacts::kConnections) ++f.connections;
+                break;
+            default: break;
+        }
+        return true;
+    }
+
+    // A test seam over one header block: the facts a framing walk would read.
     bool auth_headers_for(UpstreamDialect mode, std::string_view client_headers,
                           const std::vector<std::string>& strip, std::string& out)
     {
         out.clear();
-        const AuthHeaders h = scan_auth_headers(client_headers, strip);
+        while (client_headers.size() >= 2 && client_headers.substr(client_headers.size() - 2) == "\r\n")
+            client_headers.remove_suffix(2);
+        const std::string head = "POST / HTTP/1.1\r\n" + std::string(client_headers);
+        HeadFacts f;
+        if (!net::http::walk_headers(head, HeadReader{head, strip, f})) return false;
+        return append_auth(mode, head, f, out) == nullptr;
+    }
 
-        // Validate every credential-bearing header the client sent, whether or
-        // not this dialect uses it. Otherwise a malformed value routes around
-        // the check by picking the other header.
-        for (const std::string_view v :
-             {h.authorization, h.x_api_key, h.x_goog_api_key, h.anthropic_version})
-            if (!v.empty() && !header_value_safe(v)) return false;
-
-        // "Bearer K" -> K (bearer scheme only; anything else is not a provider
-        // API key and is dropped instead of guessed at).
-        const auto bearer = [&]() -> std::string_view {
-            const std::string_view v = h.authorization;
-            if (v.size() > 7 &&
-                (v.compare(0, 7, "Bearer ") == 0 || v.compare(0, 7, "bearer ") == 0))
-                return net::http::detail::ltrim(v.substr(7));
-            return {};
-        };
-
-        switch (mode)
-        {
-            case UpstreamDialect::Anthropic:
-            {
-                std::string_view key = h.x_api_key.empty() ? bearer() : h.x_api_key;
-                if (!key.empty())
-                {
-                    out.append("x-api-key: ");
-                    out.append(key);
-                    out.append("\r\n");
-                }
-                out.append("anthropic-version: ");
-                out.append(h.anthropic_version.empty() ? kAnthropicVersionDefault
-                                                       : h.anthropic_version);
-                out.append("\r\n");
-                break;
-            }
-            case UpstreamDialect::Gemini:
-            {
-                std::string_view key = h.x_goog_api_key.empty() ? bearer() : h.x_goog_api_key;
-                if (!key.empty())
-                {
-                    out.append("x-goog-api-key: ");
-                    out.append(key);
-                    out.append("\r\n");
-                }
-                break;
-            }
-            case UpstreamDialect::Cohere:
-            {
-                // Cohere speaks Bearer natively -> forward the whole value.
-                if (!h.authorization.empty())
-                {
-                    out.append("Authorization: ");
-                    out.append(h.authorization);
-                    out.append("\r\n");
-                }
-                break;
-            }
-            case UpstreamDialect::Azure:
-            {
-                // `api-key`, Azure's own header. A client sending Authorization is
-                // using the OpenAI SDK against an Azure endpoint, which is the
-                // normal case and the reason the bearer is accepted here at all.
-                const std::string_view key = h.x_api_key.empty() ? bearer() : h.x_api_key;
-                if (key.empty()) return false;
-                out.append("api-key: ");
-                out.append(key);
-                out.append("\r\n");
-                break;
-            }
-            case UpstreamDialect::Bedrock:
-                // Never reached: build_translated_request routes Bedrock to
-                // sign_bedrock, because a signature covers the target and the body
-                // and neither exists yet at this point. Refuse, because falling
-                // through to `return true` would emit no credential at all.
-                return false;
-            case UpstreamDialect::OpenAI:
-                break; // byte-forward path; never called, but total anyway
-        }
-        return true;
+    Dialect client_dialect_of(std::string_view head) noexcept
+    {
+        const std::string_view rl = head.substr(0, head.find("\r\n"));
+        const size_t sp1 = rl.find(' '), sp2 = rl.rfind(' ');
+        if (sp1 == std::string_view::npos || sp2 <= sp1) return Dialect::OpenAI;
+        return client_wire(rl.substr(0, sp1), rl.substr(sp1 + 1, sp2 - sp1 - 1));
     }
 
     /// The translation for a request, from the client's dialect (read off the request
@@ -422,8 +309,7 @@ namespace llmbridge::detail
     /// because TranslationPlan lives in dialect.hpp which already includes gateway.hpp.
     provider::TopLevelFacts body_facts(std::string_view head, std::string_view body) noexcept
     {
-        if (client_dialect_from_target(request_line(head)) == Dialect::OpenAI)
-            return provider::top_level_facts(body);
+        if (client_dialect_of(head) == Dialect::OpenAI) return provider::top_level_facts(body);
         provider::TopLevelFacts f;
         f.model = provider::model_of(body);
         return f;
@@ -437,8 +323,7 @@ namespace llmbridge::detail
         // because Bedrock cannot stream from this endpoint, and answering it means walking
         // the body to its top-level `stream` key.
         const bool stream_matters = venue.dialect == UpstreamDialect::Bedrock;
-        return resolve_translation(client_dialect_from_target(request_line(head)),
-                                   venue.dialect,
+        return resolve_translation(client_dialect_of(head), venue.dialect,
                                    stream_matters && provider::wants_stream(body));
     }
 
@@ -524,214 +409,118 @@ namespace llmbridge::detail
         return "?";
     }
 
-    // Build a minimal HTTP/1.1 message (start line + JSON body) for a
-    // translated request/response. The benchmark backend ignores path and
-    // most headers; a real Anthropic target would add x-api-key /
-    // anthropic-version here (same cost class).
-    // `extra` is zero or more complete "Name: value\r\n" lines, inserted before
-    // the terminating CRLF (used for the opt-in timing headers).
+    // A minimal HTTP/1.1 message: start line, JSON type, keep-alive, length, `extra`
+    // (zero or more complete "Name: value\r\n" lines), then the body.
     void append_http(std::string& out, std::string_view start_line, std::string_view body,
                      std::string_view extra)
     {
         const size_t need = out.size() + start_line.size() + body.size() + extra.size() + 96;
         if (out.capacity() < need) out.reserve(need);
         out.append(start_line);
-        out.append("\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
-        char len[24];
-        out.append(len, static_cast<size_t>(std::to_chars(len, len + sizeof len, body.size()).ptr - len));
-        out.append("\r\n");
+        out.append("\r\nContent-Type: application/json\r\nConnection: keep-alive\r\n");
+        net::http::append_content_length(out, body.size());
         out.append(extra);
         out.append("\r\n");
         out.append(body);
     }
 
-    // Upstream request builder: append_http's shape plus a Host header (HTTP/1.1
-    // requires one; the benchmark mocks never cared, real providers reject
-    // without it) and the per-dialect auth/extra header lines.
+    // Kept so the framing has one test; build_translated_request writes the same shape.
     void build_http_request(std::string_view start_line, std::string_view body,
                             std::string_view host, std::string_view extra, std::string& into)
     {
-        std::string& out = into;
-        out.clear();
+        into.clear();
         const size_t need = start_line.size() + body.size() + host.size() + extra.size() + 128;
-        if (out.capacity() < need) out.reserve(need + need / 8);
-        out.append(start_line);
-        out.append("\r\nHost: ");
-        out.append(host);
-        out.append("\r\n");
-        out.append(extra); // zero or more complete "Name: value\r\n" lines
-        out.append("Content-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
-        out.append(std::to_string(body.size()));
-        out.append("\r\n\r\n");
-        out.append(body);
+        if (into.capacity() < need) into.reserve(need + need / 8);
+        into.append(start_line).append("\r\nHost: ").append(host).append("\r\n").append(extra);
+        into.append("Content-Type: application/json\r\nConnection: keep-alive\r\n");
+        net::http::append_content_length(into, body.size());
+        into.append("\r\n").append(body);
     }
 
-    /// Whether a request head carries `Expect: 100-continue`. RFC 9110 section
-    /// 10.1.1: a server that receives it must send an immediate 100 or a final
-    /// status before reading the body.
-    [[nodiscard]] bool expects_continue(std::string_view head) noexcept
+    /// A byte-forwarded request, rebuilt in one pass into `into`: Host names the venue,
+    /// because the request goes to a different origin than the client addressed; the
+    /// Content-Length is ours, from the bytes actually sent; Expect asks the upstream
+    /// for an interim reply we cannot relay; Accept-Encoding goes so the provider
+    /// answers in a body we can measure; and the hop-by-hop headers and any the client's
+    /// Connection names are this hop's, so the venue alone decides its own keep-alive.
+    /// The request line is copied, never tested as a header, and an HTTP/1.0 one goes
+    /// as 1.1 so the upstream connection can be pooled.
+    const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
+                              const std::vector<std::string>& strip, std::string_view host_hdr,
+                              std::string_view base_path, std::string_view body_override,
+                              std::string& into)
     {
-        size_t pos = head.find("\r\n");
-        while (pos != std::string_view::npos && pos + 2 < head.size())
-        {
-            const size_t eol = head.find("\r\n", pos + 2);
-            const std::string_view line =
-                head.substr(pos + 2, eol == std::string_view::npos ? std::string_view::npos
-                                                                    : eol - pos - 2);
-            if (net::http::detail::line_is(line, "expect:"))
-            {
-                std::string_view v = net::http::detail::ltrim(line.substr(7));
-                return v.size() >= 12 && net::http::detail::line_is(v, "100-continue");
-            }
-            pos = eol;
-        }
-        return false;
+        using net::http::Field;
+        into.clear();
+        if (f.connections > HeadFacts::kConnections) return "too many Connection headers";
+        const std::string_view head = msg.substr(0, header_len < 4 ? 0 : header_len - 4);
+        const size_t eol = std::min(head.find("\r\n"), head.size());
+        const std::string_view rl = head.substr(0, eol);
+        // Origin-form only: absolute-form would pick the upstream vhost, authority-form is
+        // CONNECT's, and a dot segment could resolve outside the base. Never normalized.
+        const size_t sp1 = rl.find(' ');
+        const size_t sp2 = sp1 == std::string_view::npos ? sp1 : rl.find(' ', sp1 + 1);
+        if (sp2 == std::string_view::npos || sp2 == sp1 + 1 || rl[sp1 + 1] != '/')
+            return "request target not origin-form";
+        const std::string_view target = rl.substr(sp1 + 1, sp2 - sp1 - 1);
+        if (!target_path_ok(target)) return "request target not origin-form";
+        const std::string_view version = rl.substr(sp2 + 1);
+        const std::string_view body = body_override.empty() ? msg.substr(header_len) : body_override;
+
+        const size_t need = header_len + host_hdr.size() + base_path.size() + body.size() + 64;
+        if (into.capacity() < need) into.reserve(need + need / 8);
+        into.append(rl.substr(0, sp1 + 1)).append(base_path).append(target).append(" ");
+        into.append(version == "HTTP/1.0" ? std::string_view("HTTP/1.1") : version).append("\r\n");
+        if (!host_hdr.empty()) into.append("Host: ").append(host_hdr).append("\r\n");
+        // A bodyless request that carried no length keeps carrying none.
+        if (f.content_length || !body.empty()) net::http::append_content_length(into, body.size());
+        const auto listed = [&](std::string_view name) {
+            for (uint8_t i = 0; i < f.connections; ++i)
+                if (net::http::has_token(f.connection[i].in(msg), name)) return true;
+            return false;
+        };
+        // Copied in runs: a flush happens only where a dropped line interrupts kept ones.
+        size_t run = eol + 2;
+        const bool ok = net::http::walk_headers(head, [&](const net::http::HeaderLine& h) noexcept {
+            const bool drop = (h.field == Field::Host && !host_hdr.empty()) ||
+                              h.field == Field::ContentLength || h.field == Field::Expect ||
+                              h.field == Field::AcceptEncoding || net::http::hop_by_hop(h.field) ||
+                              stripped(h.name, strip) || (h.field == Field::Other && listed(h.name));
+            if (!drop) return true;
+            const size_t at = static_cast<size_t>(h.name.data() - head.data());
+            if (at > run) into.append(head.substr(run, at - run));
+            run = static_cast<size_t>(h.value.data() + h.value.size() - head.data()) + 2;
+            return true;
+        });
+        if (!ok) { into.clear(); return "request head"; }
+        if (run < head.size()) into.append(head.substr(run)).append("\r\n");
+        into.append("\r\n").append(body);
+        return nullptr;
     }
 
-    /// Copy `msg` (one framed request) without the stripped header lines, and
-    /// with `Host` replaced by the venue's own. The request line survives because
-    /// every strip name ends in ':', which a request line never matches;
-    /// StrippingIsExactNotAPrefix locks that in.
-    ///
-    /// Rewriting Host is what makes byte-forward a correct reverse proxy: this
-    /// path sends the request to a different origin than the client addressed, and
-    /// HTTP/1.1 wants Host to name the origin being addressed. The translating
-    /// path has always emitted the venue's Host (build_http_request); byte-forward
-    /// passed the client's through, so a provider behind a CDN or serving several
-    /// vhosts saw a name that was never its own.
-    /// Empty return = refuse this request, never forward it. Today that is a
-    /// request line prefix_target could not read.
-    /// Rebuild a byte-forwarded request: strip what the venue must not see, name
-    /// the venue in Host, prefix the base path, and state the body length
-    /// Ourselves.
-    ///
-    /// The client's `Content-Length` is dropped and re-emitted from the bytes we
-    /// actually forward. Today those are the same number, so this changes nothing
-    /// observable; it is a precondition, not a fix. The moment anything edits a
-    /// forwarded body, a copied length becomes a lie.
-    ///
-    /// Unambiguous because parse_request refuses Transfer-Encoding outright, so
-    /// every request here is either Content-Length framed or has no body at all.
     bool request_without(std::string_view msg, size_t header_len,
                          const std::vector<std::string>& strip,
                          std::string_view host_hdr, std::string_view base_path,
                          std::string_view body_override, std::string& into)
     {
-        // Copy in runs, not per line: a flush happens only where a stripped line
-        // interrupts the kept ones, so one memcpy when nothing matches and two
-        // when one header does. Measured against a plain copy, min of 7
-        // interleaved rounds: +86/89/99 ns at 1/4/16 KB bodies, so the cost is
-        // the header scan and is flat in body size. Per-line appends cost ~45 ns
-        // more again.
-        // The HEAD is built on its own, and the body is appended once at the end.
-        // Host and Content-Length are inserted just after the request line.
-        std::string head;
-        head.reserve(header_len + 128);
-        std::string& out = head; // the loop below builds the head, unchanged
-        bool saw_cl = false;
-        // The request line is copied, never tested as a header: a first line that looks
-        // like one (`Expect: /v1/x HTTP/1.1`) was stripped, and the next line, which the
-        // policy never saw as the request line, became the upstream's.
-        const size_t first_eol = msg.find("\r\n");
-        if (first_eol == std::string_view::npos || first_eol >= header_len) { into.clear(); return false; }
-        size_t start = first_eol + 2, run = 0;
-        while (start < header_len)
-        {
-            const size_t eol = msg.find("\r\n", start);
-            if (eol == std::string_view::npos || eol >= header_len) break;
-            const std::string_view line = msg.substr(start, eol - start);
-            if (line.empty()) break; // the blank line closes the block
-            // Host is dropped here and re-emitted below, so exactly one survives
-            // however many the client sent.
-            const bool is_host =
-                !host_hdr.empty() && line.size() >= 5 &&
-                (line[0] == 'H' || line[0] == 'h') && (line[1] == 'o' || line[1] == 'O') &&
-                (line[2] == 's' || line[2] == 'S') && (line[3] == 't' || line[3] == 'T') &&
-                line[4] == ':';
-            const bool is_cl = net::http::detail::line_is(line, "content-length:");
-            if (is_cl) saw_cl = true;
-            // Expect: 100-continue asks the upstream for an interim response we
-            // have no way to relay: parse_response refuses a 1xx, so forwarding
-            // the header turns a legal client request into a 502. Drop it and
-            // send the body, which is what we do anyway.
-            const bool is_expect = net::http::detail::line_is(line, "expect:");
-            // Accept-Encoding is dropped so the provider answers in plain text,
-            // because a compressed body is a body this gateway cannot measure.
-            // Every real client asks for gzip; curl does not, which is how this
-            // survived a live test. With it, an Anthropic stream recorded
-            // tokens_in=-1 while the identical request without it recorded 8.
-            //
-            // The cost is bandwidth on the provider leg, and it is the right
-            // trade for a gateway whose product is the measurement. Clients
-            // always accept identity, so nothing downstream breaks.
-            const bool is_accept_encoding =
-                net::http::detail::line_is(line, "accept-encoding:");
-            if (is_host || is_cl || is_expect || is_accept_encoding ||
-                header_stripped(line, strip))
-            {
-                out.append(msg.substr(run, start - run));
-                run = eol + 2;
-            }
-            start = eol + 2;
-        }
-        // Headers and blank line, then the body: separately, so a replacement body
-        // can take the original's place and the length below describes what is
-        // actually sent.
-        out.append(msg.substr(run, header_len - run));
-        const std::string_view body =
-            body_override.empty() ? msg.substr(header_len) : body_override;
-        // Ours, from the body we are actually sending. Emitted when the client
-        // framed a body or there is one to frame; a bodyless request that carried
-        // no length keeps carrying none.
-        const size_t body_len = body.size();
-        if (saw_cl || body_len)
-        {
-            const size_t after_start_line = out.find("\r\n");
-            if (after_start_line == std::string::npos) { into.clear(); return false; }
-            out.insert(after_start_line + 2,
-                       "Content-Length: " + std::to_string(body_len) + "\r\n");
-        }
-        if (!host_hdr.empty())
-        {
-            // After the request line, which is where a Host belongs and where a
-            // reader looks for it. The request line always ends at the first CRLF.
-            const size_t after_start_line = out.find("\r\n");
-            if (after_start_line != std::string::npos)
-                out.insert(after_start_line + 2,
-                           "Host: " + std::string(host_hdr) + "\r\n");
-        }
-        if (!prefix_target(out, base_path)) { into.clear(); return false; }
-        // The head is final: the body joins it once, and nothing shifts it after.
-        //
-        // Into the caller's buffer, capacity kept, with an eighth of headroom when it
-        // has to grow. A fresh string of exactly the right size reallocates on every
-        // request of an agent whose context grows each turn.
-        const size_t need = head.size() + body.size();
-        into.clear();
-        if (into.capacity() < need) into.reserve(need + need / 8);
-        into.append(head);
-        into.append(body);
-        return true;
+        HeadFacts f;
+        const std::string_view head = msg.substr(0, header_len < 4 ? 0 : header_len - 4);
+        if (!net::http::walk_headers(head, HeadReader{msg, strip, f})) { into.clear(); return false; }
+        return build_forward(msg, header_len, f, strip, host_hdr, base_path, body_override, into) == nullptr;
     }
 
-    /// Everything between a client request and the bytes for a translated venue.
-    ///
-    /// One function because both event loops need identical behaviour on the
-    /// credential path, and because the ordering matters: the body and target are
-    /// built first, then signed, because a Bedrock signature covers both.
+    /// Everything between a client request and the bytes for a translated venue, written
+    /// straight into `out`. The body and target come first, because a Bedrock signature
+    /// covers both; the credential is the client's, from the framing walk, in the
+    /// venue's terms.
     bool build_translated_request(const Upstream& up, UpstreamDialect mode,
-                                  std::string_view body, std::string_view client_hdrs,
-                                  const std::vector<std::string>& strip,
-                                  std::string& out, std::string& body_scratch,
-                                  const char*& why, std::string_view model_override,
-                                  bool* wants_stream_usage)
+                                  std::string_view body, std::string_view head,
+                                  const HeadFacts& f, std::string& out,
+                                  std::string& body_scratch, const char*& why,
+                                  std::string_view model_override, bool* wants_stream_usage)
     {
-        // `mode` is the resolved per-request translation, not up.dialect: they are
-        // equal whenever this is called (a byte-forward skips this function), but the
-        // caller passes it so the request path never re-derives it from the venue.
-        // Before translating, so one rewrite serves every dialect: the Anthropic
-        // and Bedrock translators both read the model out of the body, and Bedrock
-        // then puts it in the request path.
+        // One rewrite before translating serves every dialect: the translators read the
+        // model out of the body, and Bedrock then puts it in the path.
         std::string rewritten;
         if (!model_override.empty())
         {
@@ -739,26 +528,32 @@ namespace llmbridge::detail
             if (rewritten.empty()) { why = "translate"; return false; }
             body = rewritten;
         }
-        std::string start_line_store;
-        std::string_view start_line, target;
-        if (!xlate_req(mode, body, up.base_path, up.query, start_line_store,
-                       start_line, target, wants_stream_usage, body_scratch))
+        std::string target;
+        if (!xlate_req(mode, body, wants_stream_usage, body_scratch, target))
         { why = "translate"; return false; }
         const std::string_view tbody = body_scratch;
 
-        // Headers only: a request line scanned as a header could carry a credential.
-        if (const size_t eol = client_hdrs.find("\r\n"); eol != std::string_view::npos)
-            client_hdrs.remove_prefix(eol + 2);
-        std::string auth_hdrs;
+        out.clear();
+        const size_t need = tbody.size() + up.base_path.size() + target.size() + up.query.size() +
+                            up.host_hdr.size() + 512;
+        if (out.capacity() < need) out.reserve(need + need / 8);
+        // The venue's query, not the client's: Azure's api-version rides here.
+        out.append("POST ").append(up.base_path).append(target);
+        if (!up.query.empty()) out.append("?").append(up.query);
+        out.append(" HTTP/1.1\r\nHost: ").append(up.host_hdr).append("\r\n");
         if (mode == UpstreamDialect::Bedrock)
         {
-            if (!sign_bedrock(up, client_hdrs, strip, target, tbody, auth_hdrs, why))
-                return false;
+            // Signed over exactly the target written above, between "POST " and " HTTP/1.1".
+            const std::string_view signed_target(out.data() + 5, out.find(" HTTP/1.1") - 5);
+            const std::string path(signed_target);
+            if (!sign_bedrock(up, f.authorization.in(head), path, tbody, out, why))
+            { out.clear(); return false; }
         }
-        else if (!auth_headers_for(mode, client_hdrs, strip, auth_hdrs))
-        { why = "credential"; return false; }
-
-        build_http_request(start_line, tbody, up.host_hdr, auth_hdrs, out);
+        else if (const char* bad = append_auth(mode, head, f, out))
+        { why = bad; out.clear(); return false; }
+        out.append("Content-Type: application/json\r\nConnection: keep-alive\r\n");
+        net::http::append_content_length(out, tbody.size());
+        out.append("\r\n").append(tbody);
         return true;
     }
 

@@ -31,16 +31,29 @@ namespace llmbridge
         Cohere,
     };
 
-    /// What the caller speaks, from the request target. The caller reveals it by the
-    /// endpoint it calls. An unknown target is OpenAI, the historical assumption, so a
-    /// path this does not recognise behaves exactly as it did before dialects existed.
-    [[nodiscard]] inline Dialect client_dialect_from_target(std::string_view target) noexcept
+    namespace detail
     {
-        constexpr auto kNpos = std::string_view::npos;
-        if (target.find("/chat/completions") != kNpos) return Dialect::OpenAI;
-        if (target.find("/messages") != kNpos) return Dialect::Anthropic;
-        if (target.find("generateContent") != kNpos) return Dialect::Gemini; // :[stream]generateContent
-        if (target.find("/v2/chat") != kNpos) return Dialect::Cohere;
+        constexpr bool ends_with(std::string_view s, std::string_view tail) noexcept
+        {
+            return s.size() >= tail.size() && s.substr(s.size() - tail.size()) == tail;
+        }
+    } // namespace detail
+
+    /// What the caller speaks, from its method and full request target: exact routes on
+    /// the path, the query stripped. Anything else is OpenAI, the historical assumption,
+    /// so an unknown endpoint behaves as it did before dialects existed.
+    [[nodiscard]] constexpr Dialect client_wire(std::string_view method, std::string_view target) noexcept
+    {
+        const std::string_view path = target.substr(0, target.find('?'));
+        if (detail::ends_with(path, "/chat/completions")) return Dialect::OpenAI; // the common case
+        // Anthropic's batches take GET and DELETE as well; everything else here is a POST.
+        if (path.find("/v1/messages/batches") != std::string_view::npos) return Dialect::Anthropic;
+        if (method != "POST") return Dialect::OpenAI;
+        if (detail::ends_with(path, "/v1/messages") || detail::ends_with(path, "/v1/messages/count_tokens"))
+            return Dialect::Anthropic;
+        if (detail::ends_with(path, ":generateContent") || detail::ends_with(path, ":streamGenerateContent"))
+            return Dialect::Gemini;
+        if (detail::ends_with(path, "/v2/chat")) return Dialect::Cohere;
         return Dialect::OpenAI;
     }
 

@@ -9,7 +9,9 @@
 
 #include <gtest/gtest.h>
 
-using llmbridge::client_dialect_from_target;
+#include <string>
+
+using llmbridge::client_wire;
 using llmbridge::Dialect;
 using llmbridge::resolve_translation;
 using llmbridge::UpstreamDialect;
@@ -18,14 +20,34 @@ using llmbridge::venue_body_dialect;
 
 TEST(Dialect, TargetNamesTheClientDialect)
 {
-    EXPECT_EQ(client_dialect_from_target("/v1/messages"), Dialect::Anthropic);
-    EXPECT_EQ(client_dialect_from_target("/v1/chat/completions"), Dialect::OpenAI);
-    EXPECT_EQ(client_dialect_from_target("/v1beta/models/gemini-2.5-flash:generateContent"),
+    EXPECT_EQ(client_wire("POST", "/v1/messages"), Dialect::Anthropic);
+    EXPECT_EQ(client_wire("POST", "/v1/messages/count_tokens"), Dialect::Anthropic);
+    EXPECT_EQ(client_wire("GET", "/v1/messages/batches/b1"), Dialect::Anthropic);
+    EXPECT_EQ(client_wire("POST", "/v1/chat/completions"), Dialect::OpenAI);
+    EXPECT_EQ(client_wire("POST", "/v1beta/models/gemini-2.5-flash:generateContent"),
               Dialect::Gemini);
-    EXPECT_EQ(client_dialect_from_target("/v2/chat"), Dialect::Cohere);
+    EXPECT_EQ(client_wire("POST", "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"),
+              Dialect::Gemini);
+    EXPECT_EQ(client_wire("POST", "/v2/chat"), Dialect::Cohere);
     // Unknown falls back to OpenAI: the historical assumption, so old behaviour holds.
-    EXPECT_EQ(client_dialect_from_target("/"), Dialect::OpenAI);
-    EXPECT_EQ(client_dialect_from_target("/healthz"), Dialect::OpenAI);
+    EXPECT_EQ(client_wire("POST", "/"), Dialect::OpenAI);
+    EXPECT_EQ(client_wire("GET", "/healthz"), Dialect::OpenAI);
+}
+
+// Exact routes on the path, not substrings of a truncated request line: an OpenAI
+// Assistants path that ends in /messages, a query that names one, and a route under a
+// long prefix are each classified by the path alone.
+TEST(Dialect, OnlyAnExactRouteNamesAnotherDialect)
+{
+    EXPECT_EQ(client_wire("POST", "/v1/threads/thread_abc/messages"), Dialect::OpenAI);
+    EXPECT_EQ(client_wire("GET", "/v1/threads/thread_abc/messages"), Dialect::OpenAI);
+    EXPECT_EQ(client_wire("POST", "/v1/chat/completions?next=/v1/messages"), Dialect::OpenAI);
+    EXPECT_EQ(client_wire("POST", "/v1/files/generateContent"), Dialect::OpenAI);
+    EXPECT_EQ(client_wire("POST", "/v2/chat/history"), Dialect::OpenAI);
+    EXPECT_EQ(client_wire("GET", "/v1/messages"), Dialect::OpenAI);
+    const std::string prefix(200, 'p');
+    EXPECT_EQ(client_wire("POST", "/" + prefix + "/v1/messages"), Dialect::Anthropic);
+    EXPECT_EQ(client_wire("POST", "/" + prefix + "/v1/chat/completions/messages"), Dialect::OpenAI);
 }
 
 TEST(Dialect, VenueModeCarriesABodyDialect)
