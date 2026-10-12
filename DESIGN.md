@@ -604,6 +604,42 @@ the client already has.
 Still not in the seam: the body itself, and anything derived from it beyond the model
 name and the opt-in prefix hash.
 
+### Naming the key for a venue (`Decision::credential_header`)
+
+A request may carry one provider key per `x-kottos-key-<domain>` header, so one route can
+list venues that take different keys. The policy names the header holding the key for
+the venue it picked, and a failover names the next venue's in
+`Retry::credential_header`. The value goes out as the venue's own key header, by its
+`VenueSpec` auth kind: `x-api-key` for Anthropic (with the client's `anthropic-version`,
+or 2023-06-01), `Authorization: Bearer` for OpenAI-compatible venues and Cohere,
+`x-goog-api-key` for Gemini, `api-key` for Azure. It is the only credential the venue
+receives: a byte-forward drops the client's `Authorization`, `x-api-key`,
+`x-goog-api-key` and `api-key`.
+
+The name is not known while the head is framed, so the framing walk records every family
+line a policy could name (`key_header_ok`) with its trimmed value, as offsets into the
+head, up to eight: a request reaches at most three venues, and there are six kinds. At
+dispatch, per attempt, `named_key` matches the policy's name against that table and
+reads nothing else. A translated request is still one walk of the head and a
+byte-forward two, framing and the rebuild, whether or not a key is named, and nothing is
+allocated. A strip-list entry for the named header does not hide it from that read: the
+family never leaves anyway.
+
+A named key never falls back to `Authorization`, which may hold another provider's key.
+The request gets a 400 with fixed text, before any upstream is contacted, when the named
+header is absent or empty, appears more than once in any case, or holds a control or
+8-bit byte or more than 8 KiB; when the name is outside the family; when the head carries
+more than eight nameable family lines, since a repeat could hide past the table; and
+when the venue is Bedrock, which signs with a key pair and has no header for a bearer
+key. A failover that names no header after a decision that named one gives up, and the
+client sees the failure; one that names a header the client never sent gets the 400.
+
+The family itself never leaves. Every header whose name starts with `x-kottos-key-`, in
+any case, is dropped from every byte-forwarded request, with or without a policy: at
+dispatch, in the head of a body sent as it arrives, and in a stale connection's retry.
+The strip list matches exact names, and a client picks the suffix. A translated request
+is rebuilt from a whitelist and never carried one, and a sink cannot capture one.
+
 ### Dropping headers before they leave (`upstream.strip_headers`)
 
 A policy decides; it cannot rewrite. So the companion to the seam is a list of header
@@ -615,7 +651,8 @@ Empty by default, which keeps passthrough a single memcpy. It exists because
 a byte-forward carried the client's bytes verbatim, headers included, which is
 the "echo" this repo's own rule forbids: a header meant for this gateway, or an internal
 routing header, reached a third-party provider. Translating modes were never affected;
-they rebuild from a whitelist already.
+they rebuild from a whitelist already. The key family is dropped whatever the list says
+(above).
 
 ## Logging
 
