@@ -10970,3 +10970,64 @@ TEST_P(ProxyAzure, NoCredentialIsNamedAsMissing)
     EXPECT_NE(r.find(llmbridge::refuse::kNoCredential), std::string::npos) << r;
     EXPECT_EQ(_backend.requests_seen(), 0);
 }
+
+// ── The venue table: paths, streaming and finish reasons ─────────────────────────
+
+class ProxyVenueTable : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+// Gemini names the model in the path, which was always `models/gemini`: no such model
+// exists, so every request through the dialect failed.
+TEST_P(ProxyVenueTable, AGeminiRequestNamesItsModelInThePath)
+{
+    _backend.set_response(http_ok(gemini_resp_body("ok")));
+    start(0, true, UpstreamDialect::Gemini, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]})")));
+    ASSERT_EQ(c.recv_status(), 200);
+    EXPECT_EQ(_backend.last_request().rfind("POST /v1beta/models/gemini-2.5-flash:generateContent HTTP/1.1\r\n", 0), 0u)
+        << _backend.last_request();
+}
+
+// A translated stream needs a venue that streams. Gemini and Cohere answered a
+// stream:true request with one JSON body, which an OpenAI SDK reads as an empty stream.
+TEST_P(ProxyVenueTable, GeminiAndCohereRefuseAStreamedRequest)
+{
+    for (const UpstreamDialect venue : {UpstreamDialect::Gemini, UpstreamDialect::Cohere})
+    {
+        TestBackend backend;
+        backend.set_response(http_ok(provider_resp_body(venue, "ok")));
+        backend.start();
+        Gateway gw(0, "127.0.0.1", backend.port(), 0, venue, GetParam());
+        std::thread loop([&] { gw.run(); });
+        Client c;
+        ASSERT_TRUE(c.connect(gw.bound_port()));
+        ASSERT_TRUE(c.send(make_request(
+            R"({"model":"m","stream": true ,"messages":[{"role":"user","content":"hi"}]})")));
+        EXPECT_EQ(c.recv_status(), 400) << mode_name(venue);
+        // The same request without stream is served.
+        Client d;
+        ASSERT_TRUE(d.connect(gw.bound_port()));
+        ASSERT_TRUE(d.send(make_request(R"({"model":"m","messages":[{"role":"user","content":"hi"}]})")));
+        EXPECT_EQ(d.recv_status(), 200) << mode_name(venue);
+        gw.request_stop();
+        loop.join();
+        EXPECT_EQ(backend.requests_seen(), 1) << mode_name(venue);
+        backend.stop();
+    }
+}
+
+// A finish reason that is the venue's own failure is not a completion: Cohere's ERROR
+// read as "stop", a successful empty answer.
+TEST_P(ProxyVenueTable, ACohereErrorFinishIsABadGateway)
+{
+    _backend.set_response(http_ok(R"({"id":"c","finish_reason":"ERROR","message":{"content":[]}})"));
+    start(0, true, UpstreamDialect::Cohere, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    EXPECT_EQ(c.recv_status(), 502);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyVenueTable,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));

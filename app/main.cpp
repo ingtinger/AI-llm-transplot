@@ -62,12 +62,7 @@ namespace
     /// so the OpenAI fallthrough is reached by "openai" only.
     llmbridge::UpstreamDialect dialect_from(const std::string& s)
     {
-        return s == "anthropic" ? llmbridge::UpstreamDialect::Anthropic
-               : s == "gemini"  ? llmbridge::UpstreamDialect::Gemini
-               : s == "cohere"  ? llmbridge::UpstreamDialect::Cohere
-               : s == "bedrock" ? llmbridge::UpstreamDialect::Bedrock
-               : s == "azure"   ? llmbridge::UpstreamDialect::Azure
-                                : llmbridge::UpstreamDialect::OpenAI;
+        return llmbridge::provider::venue_named(s).value_or(llmbridge::UpstreamDialect::OpenAI);
     }
 
     // Atomic so a handler never sees a half-cleared pointer; cleared before the

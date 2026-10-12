@@ -7,6 +7,7 @@
 
 #include "options.hpp"
 
+#include "provider/dialect.hpp"
 #include "provider/json.hpp"
 
 #include <algorithm>
@@ -22,8 +23,6 @@ namespace llmbridge::app
     {
         namespace json = llmbridge::provider::json;
 
-        constexpr std::string_view kDialects[] = {"openai", "anthropic", "gemini",
-                                                  "cohere", "bedrock",   "azure"};
         constexpr std::string_view kBackends[] = {"auto", "epoll", "uring"};
         constexpr std::string_view kLevels[] = {"trace", "debug", "info", "warn", "error", "off"};
         constexpr double kYear = 31536000; // a bigger timeout is a unit typo, not a policy
@@ -39,7 +38,7 @@ namespace llmbridge::app
             {"--upstream", "upstream.url", "URL", "IP:PORT, HOST:PORT or http(s)://HOST[:PORT][/BASE]",
              K::Text, 0, 0, {}, &S::upstream},
             {"--upstream-dialect", "upstream.dialect", "NAME", "what the venue speaks", K::Choice, 0, 0,
-             kDialects, &S::dialect},
+             provider::venue_names(), &S::dialect},
             {"", "upstream.strip_headers", "", "header names dropped from every upstream request",
              K::List, 0, 0, {}, &S::strip_headers},
             {"--upstream-timeout", "timeouts.upstream_s", "SECONDS",

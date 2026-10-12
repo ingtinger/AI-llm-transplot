@@ -62,7 +62,8 @@ namespace llmbridge::detail
         stream_warn_if_encoded(client, h);
         // Only a request that needs translating gets a translator.
         client->req.f.sse_translating =
-            client->req.f.translate_body && client->req.f.effective_dialect == UpstreamDialect::Anthropic;
+            client->req.f.translate_body &&
+            provider::spec(client->req.f.effective_dialect).wire == provider::Wire::Anthropic;
         if (client->req.f.sse_translating) client->sse_xlate.reset(-1, client->req.f.wants_usage);
         // Chosen once, before either head is built, and remembered.
         client->req.f.stream_chunked_out = stream_reusable_out(client);
