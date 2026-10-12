@@ -207,6 +207,9 @@ jobs:
       - name: Fuzz the config file parser (60s, seeded)
         run: ./build-fuzz/bin/fuzz_config -max_total_time=60 -max_len=8192 -print_final_stats=1
              -artifact_prefix=fuzz-artifacts/ fuzz/corpus/config
+      - name: Fuzz a body forwarded as it arrives against it held (60s, seeded)
+        run: ./build-fuzz/bin/fuzz_body_stream -max_total_time=60 -max_len=8192 -print_final_stats=1
+             -artifact_prefix=fuzz-artifacts/ fuzz/corpus/body
       - name: Fuzz the SSE translator (60s, seeded)
         # -max_len bounds input: fuzz_sse translates each input twice (whole +
         # chunked) to assert fragmentation-invariance, so keep units modest.

@@ -7,6 +7,7 @@ add_library(gateway STATIC
         src/metrics.cpp
         src/engine.cpp
         src/resolve.cpp
+        src/core/body.cpp
         src/core/client.cpp
         src/core/pool.cpp
         src/core/sink.cpp

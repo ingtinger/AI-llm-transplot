@@ -275,40 +275,68 @@ namespace
     // Allocations per request on the loop thread, averaged after a warm-up that
     // lets every reused buffer reach its steady-state capacity.
     double allocs_per_request(IoBackend io, UpstreamDialect dialect, std::string upstream_reply,
-                              const std::string& request)
+                              const std::string& request, int warm = 20, int measured = 50,
+                              size_t retain = 0)
     {
-        constexpr int kWarm = 20, kMeasured = 50;
         Upstream up(std::move(upstream_reply));
         Gateway gw(0, "127.0.0.1", up.port(), 0, dialect, io);
+        if (retain) gw.set_retain_bytes(retain);
         std::thread loop([&] { t_counted = true; gw.run(); });
         double per = -1;
         {
             Client c(gw.bound_port());
-            for (int i = 0; i < kWarm; ++i) EXPECT_EQ(c.roundtrip(request), 200);
+            for (int i = 0; i < warm; ++i) EXPECT_EQ(c.roundtrip(request), 200);
             const uint64_t before = g_allocs.load();
-            for (int i = 0; i < kMeasured; ++i) EXPECT_EQ(c.roundtrip(request), 200);
-            per = static_cast<double>(g_allocs.load() - before) / kMeasured;
+            for (int i = 0; i < measured; ++i) EXPECT_EQ(c.roundtrip(request), 200);
+            per = static_cast<double>(g_allocs.load() - before) / measured;
         }
         gw.request_stop();
         loop.join();
+        if (retain) gw.set_retain_bytes(size_t{4} << 20);
         return per;
+    }
+
+    // A chat transcript of about `bytes`: short turns of prose with the escapes real text
+    // carries, dense enough that its document outgrows the default 4 MiB of kept arena.
+    std::string large_chat(size_t bytes)
+    {
+        static constexpr std::string_view kWords[] = {"the", "request", "returns", R"(\n)", "if (x) {",
+                                                      R"(\"ok\";)", "}", R"(\t)", "context", "model"};
+        std::string b = R"({"model":"m","max_tokens":64,"messages":[)";
+        uint32_t seed = 7;
+        for (int i = 0; b.size() + 500 < bytes; ++i)
+        {
+            b += std::string(i ? "," : "") + R"({"role":")" + (i % 2 ? "assistant" : "user") + R"(","content":")";
+            for (size_t n = 0; n < 200;)
+            {
+                seed = seed * 1103515245u + 12345u;
+                const std::string_view w = kWords[(seed >> 16) % std::size(kWords)];
+                b += w;
+                b += ' ';
+                n += w.size() + 1;
+            }
+            b += R"("})";
+        }
+        return b + R"(,{"role":"user","content":"go"}]})";
     }
 
     struct Ceiling
     {
-        double passthrough, translated, stream_20, per_delta;
+        double passthrough, translated, stream_20, per_delta, large_translated;
     };
 
     // Measured 2026-10-10 at v0.74.0 (GCC 13 Release and ASan Debug agree), after the
     // response translators began writing into kept buffers and the stream translator
     // was held by value: 12 -> 3, 7 -> 3, every one of them on the request side.
     // v0.78.0 writes the Anthropic request front to back, without a prefix string:
-    // 3 -> 2 on both translated rows.
+    // 3 -> 2 on both translated rows. v0.88.0 writes requests and relayed heads straight
+    // into kept buffers: every row 0. v0.90.0 adds the 10 MB row: 0 with 16 MiB kept,
+    // 5 at the default 4.
     // Lower these when a change removes allocations; never raise them without a
     // reason in the commit message. io_uring's per-delta figure can read 0.02, not 0:
     // its 4 KiB receive buffers split the stream at different points.
-    constexpr Ceiling kEpoll{0, 0, 0, 0.03};
-    constexpr Ceiling kUring{0, 0, 0, 0.03};
+    constexpr Ceiling kEpoll{0, 0, 0, 0.03, 0};
+    constexpr Ceiling kUring{0, 0, 0, 0.03, 0};
 
     class AllocCeiling : public ::testing::TestWithParam<IoBackend>
     {
@@ -347,6 +375,18 @@ namespace
                     n20, per_delta);
         EXPECT_LE(n20, ceiling().stream_20);
         EXPECT_LE(per_delta, ceiling().per_delta);
+    }
+
+    // With --retain-mb at the body cap, a 10 MB translated request allocates nothing
+    // once the worker's buffers are warm; the default (4) lets them go each time.
+    TEST_P(AllocCeiling, LargeTranslatedRequestWithBuffersKept)
+    {
+        const std::string req = post(large_chat(size_t{10} << 20));
+        const double n = allocs_per_request(GetParam(), UpstreamDialect::Anthropic,
+                                            reply("application/json", kAnthropicReply), req, 3, 4,
+                                            size_t{16} << 20);
+        std::printf("10 MB translated, retain 16: %.2f allocations per request\n", n);
+        EXPECT_LE(n, ceiling().large_translated);
     }
 
     INSTANTIATE_TEST_SUITE_P(Backends, AllocCeiling, ::testing::Values(IoBackend::Epoll, IoBackend::Uring),

@@ -668,3 +668,46 @@ checks regressed; it does not prove it checks anything in particular. The
 mutation harness breaks each invariant on purpose and reports whether any test
 notices. It has found guards that were decoration, and test gaps in code that
 looked covered.
+
+## 12. Request bodies forwarded as they arrive
+
+A request is framed when its last byte is in `c->rbuf`, so without this section a
+10 MB upload reaches the venue only after the client finished sending it: one full
+upload time added to the request. `gateway/src/core/body.cpp` sends such a body on
+as it arrives instead, when nothing about it needs the whole body:
+
+- the head is complete, the body is at least 16 KiB and not yet all here, and it is
+  not content-encoded;
+- no policy is installed (a policy reads the body before it routes);
+- the plan is a byte-forward: a translation reads the whole body;
+- an OpenAI client's body streams only with `--stream-openai-body on`, the default.
+  Off, it is held to its last byte exactly as before.
+
+`try_frame` opens the request at the head (`open_request`: t0, the sequence number,
+the sink's capture) and dispatches it with the body so far. `dispatch` writes the
+head and that prefix to the upstream; `body_sent` counts what went. Each later read
+calls `pump_body`, which appends the new bytes to the upstream's `out` and sends.
+The body stays in `rbuf` (`body_in_rbuf`) until the first response byte, so a stale
+pooled connection's retry rebuilds the head and resends every byte sent so far.
+
+**Checked before it goes.** An OpenAI client's JSON body (`Content-Type` JSON) is
+fed to `provider::BodyScan` before any byte is forwarded: RFC 8259 syntax, nesting,
+and the top-level and `stream_options` keys that a held body would have been
+refused for (repeated, escaped, too many). `safe()` holds back a key whose closing
+quote has not arrived, so a repeated `"model"` never leaves, even when it is split
+across reads or sits in the last one. On a refusal the gateway stops sending, sets
+`SO_LINGER` 0 on the upstream and closes it: the venue sees a reset and a body
+short of its `Content-Length`, which it never runs, and the connection is never
+pooled. The client gets the 400 a held body would have got. Other clients' bodies
+are not scanned; their translators would refuse a bad one, and here none runs.
+
+**A response before the last byte.** A venue may answer early (an error, usually).
+`end_body_stream` stops forwarding, marks the upstream not poolable, drops the copy
+in `rbuf` and counts the rest of the body as `discard`: those bytes are read and
+thrown away as they arrive, so the client connection stays in step for its next
+request. A reply that closes the connection waits for that drain
+(`close_on_drain`).
+
+**Stamps.** t0 is the head's framing, so the rest of the upload is not request-path
+time: it lands in the upstream wait, where the venue is reading it. t3 is restamped
+as each part goes.

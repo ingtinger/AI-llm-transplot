@@ -48,6 +48,8 @@ namespace llmbridge::detail
     /// provider. A literal: nothing from the body is echoed.
     inline constexpr const char* kAmbiguousKeysMessage =
         "request body repeats a top-level key or escapes one";
+    /// The 400 for a forwarded body that turned out not to be JSON.
+    inline constexpr const char* kNotJsonMessage = "request body is not valid JSON";
     /// `status` and `body` with Content-Length, keeping the upstream headers that
     /// net::http::relayed() allows; `own_body`: the upstream's body, with its type.
     void append_relayed_reply(std::string& out, int status, std::string_view upstream_head,

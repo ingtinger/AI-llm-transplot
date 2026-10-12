@@ -36,6 +36,7 @@ namespace llmbridge
     struct ClientConn;
     struct UpstreamConn;
     class UpstreamPool;
+    struct HeadFacts;
     template <class T> class Registry;
 }
 
@@ -74,11 +75,20 @@ namespace llmbridge::detail
         // The request side (core/client.cpp).
         void on_client_bytes(ClientConn* c) noexcept; // frame if idle, then bound what is buffered
         void try_frame(ClientConn* c) noexcept;       // stamps t0, frames one request, dispatches it
+        void open_request(ClientConn* c, const net::http::Message& m, const HeadFacts& f,
+                          int64_t t0) noexcept;        // its sequence number and arrival facts
         void dispatch(ClientConn* client) noexcept;   // translate or rebuild, acquire, send
         void gate_client_reads(ClientConn* c) noexcept; // the pipelining cap pauses, never closes
         void client_gone(ClientConn* c) noexcept;       // EOF or a socket error on a client
         void send_continue(ClientConn* c) noexcept;     // the interim 100, staged like any reply
         void respond(ClientConn* client) noexcept;      // send what is owed; finish if it all went
+        // A body forwarded as it arrives (core/body.cpp).
+        [[nodiscard]] bool body_streams(const ClientConn* c, const net::http::Message& m) const noexcept;
+        void pump_body(ClientConn* c) noexcept;       // scan, then stage what is safe upstream
+        void refuse_body(ClientConn* c) noexcept;     // reset the upstream, answer the 400
+        void end_body_stream(ClientConn* c, UpstreamConn* u) noexcept; // a response byte arrived
+        void drop_discard(ClientConn* c) noexcept;    // bytes of a request that is over
+        [[nodiscard]] std::string_view body_so_far(const ClientConn* c) const noexcept;
         void finish(ClientConn* client) noexcept;       // a staged reply is on the wire
         void abort_pair(ClientConn* client) noexcept;
         void fail_request(ClientConn* client, int code, const char* why) noexcept; // failover, else reply
@@ -205,6 +215,9 @@ namespace llmbridge::detail
         int64_t _upstream_idle_ns; // 0 = no idle timeout
         TlsConfig _tls;            // both legs; each flag inits its own context
         bool _timing_headers = false;
+        /// Forward an OpenAI client's body as it arrives, each chunk scanned first.
+        bool _stream_openai_body = true;
+        size_t _stream_body_min = 16 * 1024; ///< a body under this arrives too fast to matter
         Policy* const _policy = nullptr; ///< `const`: swapping it under the loop would race
         bool _wants_prefix_hash = false; ///< Policy::wants_prefix_hash(), read once
         RequestSink* _sink = nullptr;

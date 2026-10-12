@@ -62,5 +62,8 @@ namespace llmbridge
         uint64_t warm_reuses = 0; // new upstream connections given a retired buffer
         /// Requests whose ciphertext buffer had to grow.
         uint64_t tls_out_grows = 0;
+        /// Bodies forwarded as they arrived, and those refused part way (BodyScan).
+        uint64_t streamed_bodies = 0;
+        uint64_t streamed_body_refusals = 0;
     };
 } // namespace llmbridge

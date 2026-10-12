@@ -57,7 +57,10 @@ namespace llmbridge::detail
 
     void Engine::on_client_bytes(ClientConn* c) noexcept
     {
-        if (c->req.f.phase == Phase::Idle && !c->rbuf.empty()) try_frame(c);
+        if (c->req.discard) drop_discard(c);
+        if (c->doomed) return;
+        if (c->req.f.body_streaming) pump_body(c);
+        else if (c->req.f.phase == Phase::Idle && !c->rbuf.empty()) try_frame(c);
         if (!c->doomed) gate_client_reads(c);
     }
 
@@ -110,25 +113,32 @@ namespace llmbridge::detail
                 c->rbuf.reserve(m.total_len);
                 // No body byte yet: the client is waiting on us, not the network.
                 if (c->rbuf.size() <= m.header_len && facts.expect == 2) send_continue(c);
+                // A body that needs no rewrite goes upstream as it arrives.
+                if (body_streams(c, m))
+                {
+                    c->client_frame_want = 0;
+                    open_request(c, m, facts, t0);
+                    if (_sink) sink_capture(c);
+                    c->upstream_slot = 0;
+                    c->req.f.body_streaming = c->req.f.body_in_rbuf = true;
+                    // An OpenAI client's JSON is checked as it passes; a file upload is not JSON.
+                    c->req.f.body_scanned = json_media_type(facts.content_type.in(c->rbuf)) &&
+                                            client_dialect_of(c->rbuf) == Dialect::OpenAI;
+                    if (c->req.f.body_scanned)
+                    {
+                        if (!c->req.scan) c->req.scan = std::make_unique<provider::BodyScan>();
+                        c->req.scan->reset();
+                    }
+                    ++_stats.streamed_bodies;
+                    return dispatch(c);
+                }
             }
             return;
         }
         c->client_frame_want = 0;
-        // The one per-request reset, before any reply: even a 400 carries its own
-        // sequence number and none of the previous request's state.
-        c->req.begin(g_seq.fetch_add(1, std::memory_order_relaxed));
-        c->upstream_slot = -1;
-        c->req.f.ts_req_recvd = t0;
+        open_request(c, m, facts, t0);
         if (st == net::http::FrameStatus::Error) return error_respond(c, 400, "request framing");
         if (!net::http::request_line_ok(c->rbuf)) return error_respond(c, 400, "request line");
-
-        c->msg = m;
-        c->req.f.head = facts;
-        c->req.f.client_upload_ns = span_since(c->ts_first_byte, t0);
-        c->req.f.client_conn_reused = c->ever_framed;
-        c->req.f.client_conn_setup_ns = c->req.f.client_conn_reused ? 0 : span_since(c->ts_accepted, t0);
-        // A pipelining client's next request is already here, so its arrival begins now.
-        c->ts_first_byte = c->rbuf.size() > m.total_len ? t0 : 0;
         // Nothing here inflates, and every reader downstream assumes JSON.
         if (c->msg.encoded) return error_respond(c, 415, "compressed request body");
         if (_sink) sink_capture(c);
@@ -158,6 +168,23 @@ namespace llmbridge::detail
         dispatch(c);
     }
 
+    void Engine::open_request(ClientConn* c, const net::http::Message& m, const HeadFacts& f,
+                              int64_t t0) noexcept
+    {
+        // The one per-request reset, before any reply: even a 400 carries its own
+        // sequence number and none of the previous request's state.
+        c->req.begin(g_seq.fetch_add(1, std::memory_order_relaxed));
+        c->upstream_slot = -1;
+        c->req.f.ts_req_recvd = t0;
+        c->msg = m;
+        c->req.f.head = f;
+        c->req.f.client_upload_ns = span_since(c->ts_first_byte, t0);
+        c->req.f.client_conn_reused = c->ever_framed;
+        c->req.f.client_conn_setup_ns = c->req.f.client_conn_reused ? 0 : span_since(c->ts_accepted, t0);
+        // A pipelining client's next request is already here, so its arrival begins now.
+        c->ts_first_byte = c->rbuf.size() > m.total_len ? t0 : 0;
+    }
+
     void Engine::dispatch(ClientConn* c) noexcept
     {
         // Resolved per attempt: a failover may land on a venue of another dialect. The
@@ -171,7 +198,7 @@ namespace llmbridge::detail
         }
         // Built before an upstream is acquired, so a bad body cannot leak a pooled one.
         note_build(c->msg.total_len);
-        const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
+        const std::string_view body = body_so_far(c);
         if (c->req.f.translate_body)
         {
             const std::string_view head(c->rbuf.data(), c->msg.header_len);
@@ -201,9 +228,20 @@ namespace llmbridge::detail
                 rewritten = _xlate;
                 c->req.f.asked_tier.set(had); // `had` points into rbuf, reused before the sink
             }
-            if (const char* bad = build_forward(std::string_view(c->rbuf.data(), c->msg.total_len),
+            // A streamed body goes as far as it is known good, under the length declared.
+            std::string_view fwd = rewritten.empty() ? body : rewritten;
+            if (c->req.f.body_streaming)
+            {
+                if (c->req.f.body_scanned &&
+                    c->req.scan->feed(body, body.size() == c->msg.body_len) == provider::BodyScan::Verdict::Refused)
+                    return refuse_body(c);
+                fwd = body.substr(0, c->req.f.body_scanned ? c->req.scan->safe() : body.size());
+                c->req.f.body_sent = static_cast<uint32_t>(fwd.size());
+            }
+            if (const char* bad = build_forward(std::string_view(c->rbuf.data(), c->msg.header_len),
                                                 c->msg.header_len, c->req.f.head, _strip_headers,
-                                                up.host_hdr, up.base_path, rewritten, _rebuild))
+                                                up.host_hdr, up.base_path, fwd, _rebuild,
+                                                rewritten.empty() ? c->msg.body_len : rewritten.size()))
                 return error_respond(c, 400, bad);
         }
 
@@ -234,7 +272,7 @@ namespace llmbridge::detail
             c->rbuf.assign(c->req.saved, c->msg.total_len, extra);
             c->req.saved.resize(c->msg.total_len);
         }
-        else c->rbuf.erase(0, c->msg.total_len);
+        else if (!c->req.f.body_in_rbuf) c->rbuf.erase(0, c->msg.total_len);
         pair(c, u);
         c->ever_framed = true;            // past the setup deadline for good
         c->ts_client_activity = now_ns(); // and the idle clock restarts here
@@ -289,7 +327,8 @@ namespace llmbridge::detail
         c->req.f.phase = Phase::Idle;
         const bool close_now = c->close_after_resp || !c->msg.keep_alive;
         c->msg = net::http::Message{};
-        if (close_now) return _ops->close(*c);
+        if (close_now && c->req.discard) c->req.close_on_drain = true; // after the body it still sends
+        else if (close_now) return _ops->close(*c);
         on_client_bytes(c); // a pipelined next request is framed from rbuf, with no read
     }
 

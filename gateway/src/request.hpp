@@ -72,6 +72,8 @@ namespace llmbridge::detail
     /// The client's dialect from the request line of `head`: client_wire on its method
     /// and full target.
     [[nodiscard]] Dialect client_dialect_of(std::string_view head) noexcept;
+    /// application/json or a +json type, whatever its parameters and case.
+    [[nodiscard]] bool json_media_type(std::string_view content_type) noexcept;
     /// Everything a policy or the sink reads from the body; the gateway calls this
     /// once per request.
     [[nodiscard]] provider::TopLevelFacts body_facts(std::string_view head,
@@ -83,13 +85,13 @@ namespace llmbridge::detail
                      std::string_view extra); // appended: `out` is a stage, capacity kept
     void build_http_request(std::string_view start_line, std::string_view body,
                             std::string_view host, std::string_view extra, std::string& into);
-    /// The byte-forwarded request into `into`, capacity kept: a pooled connection's
-    /// buffer, so a request a little larger than the last does not fault in a new
-    /// copy. Null, or why to refuse it, with `into` empty.
+    /// The byte-forwarded request into `into`, capacity kept: `msg`'s head, then `body`,
+    /// all or the first part of one `declared` bytes long. Null, or why to refuse it,
+    /// with `into` empty.
     const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
                               const std::vector<std::string>& strip, std::string_view host_hdr,
-                              std::string_view base_path, std::string_view body_override,
-                              std::string& into);
+                              std::string_view base_path, std::string_view body,
+                              std::string& into, size_t declared);
     /// build_forward over a message whose facts are read here; false refuses it.
     bool request_without(std::string_view msg, size_t header_len,
                          const std::vector<std::string>& strip,
