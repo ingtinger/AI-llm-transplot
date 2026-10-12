@@ -12,6 +12,7 @@
 #include "core/io.hpp"
 #include "core/limits.hpp"
 #include "core/registry.hpp"
+#include "net/socket_util.hpp"
 #include "stream.hpp"
 
 namespace llmbridge::detail
@@ -122,8 +123,12 @@ namespace llmbridge::detail
         if (_upstream_idle_ns <= 0 || c->req.f.ts_progress == 0 ||
             now - c->req.f.ts_progress <= _upstream_idle_ns)
             return;
-        // Neither leg moved. With bytes still owed to the client it is the client that
-        // stopped reading, and a paused upstream is waiting on it.
+        // Neither leg moved. A body still arriving that the venue has all of: the client
+        // stopped sending, and the venue is reset, never retried or failed over. Bytes
+        // still owed to the client: it stopped reading, and a paused upstream waits on it.
+        if (UpstreamConn* u = c->up; c->req.f.body_streaming && u && upstream_request_sent(u) &&
+                                     net::unacked_bytes(u->fd) == 0)
+            return body_timeout(c, _stats.client_idle_timeouts, "client stalled mid-body");
         const bool stalled = owes_client(c);
         ++(stalled ? _stats.client_idle_timeouts : _stats.upstream_timeouts);
         LB_WARN(ReqId{c->req.f.req_seq},

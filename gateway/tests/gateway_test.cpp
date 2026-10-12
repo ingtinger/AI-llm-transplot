@@ -324,6 +324,8 @@ namespace
         /// Request bytes read over all connections, so far.
         size_t bytes_seen() const { return _bytes_seen.load(); }
         int accepted() const { return _accepted.load(); }
+        /// Connections the gateway ended with a reset (SO_LINGER 0) rather than a FIN.
+        int resets() const { return _resets.load(); }
         /// On the first connection, after its first reply, read what arrives of the next
         /// request once, then close: a pooled connection the provider dropped mid-body.
         void set_drop_first_mid_second(bool b) { _drop_mid_second = b; }
@@ -447,6 +449,7 @@ namespace
                     ssize_t n = ::read(c, tmp, _pace_bytes ? std::min(_pace_bytes, sizeof(tmp)) : sizeof(tmp));
                     if (n <= 0)
                     {
+                        if (n < 0 && errno == ECONNRESET) ++_resets;
                         if (!buf.empty())
                         {
                             std::lock_guard<std::mutex> lk(_mu);
@@ -591,6 +594,7 @@ namespace
         int _rcvbuf = 0;
         std::atomic<int> _requests_seen{0};
         std::atomic<size_t> _bytes_seen{0};
+        std::atomic<int> _resets{0};
         bool _drop_mid_second = false;
         std::vector<std::string> _incomplete;
         std::string _last_request;
@@ -12603,6 +12607,92 @@ TEST_P(ProxyBodyStream, PastTheCapABodyIsHeldAndStillServed)
     EXPECT_EQ(_gw->stats().streamed_bodies, 2u);
     EXPECT_EQ(_gw->stats().streamed_body_capped, 1u);
     EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// A client that stopped part way through its body was charged to the venue: neither leg
+// moved, so the idle sweep counted an upstream timeout and answered 504. The venue had all
+// that came, so it is a client stall: a 408, and the venue is reset with part of the body.
+// It rode a pooled connection inside the stale-retry window, and is never resent.
+TEST_P(ProxyBodyStream, AClientThatStopsMidBodyIsAClientStall)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), 300'000'000);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(c.recv_status(), 200); // the venue's connection is pooled now
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    ASSERT_TRUE(c.send(h.first));
+    const std::string r = c.recv_response(3000);
+    EXPECT_EQ(Client::status_of(r), 408) << r;
+    EXPECT_NE(r.find("did not arrive in time"), std::string::npos) << r;
+    EXPECT_TRUE(c.wait_closed());
+    EXPECT_TRUE(wait_for([&] { return _backend.incomplete_requests().size() == 1; })) << "the venue was kept";
+    shutdown();
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.client_idle_timeouts, 1u);
+    EXPECT_EQ(st.upstream_timeouts, 0u);
+    EXPECT_EQ(st.upstream_retries, 0u);
+    EXPECT_EQ(st.upstream_failovers, 0u);
+    EXPECT_EQ(st.upstream_reused, 1u) << "the stalled body rode the pooled connection";
+    EXPECT_EQ(st.upstream_conns_opened, 1u) << "it was resent on a fresh one";
+    EXPECT_EQ(_backend.requests_seen(), 1) << "the venue got the stalled body whole";
+    EXPECT_EQ(_backend.resets(), 1) << "the venue was not reset";
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_LT(cut[0].size() - (cut[0].find("\r\n\r\n") + 4), h.body());
+}
+
+// A client that leaves mid-body leaves the venue a body that will never be finished: it is
+// reset, as for every such body, rather than sent a FIN.
+TEST_P(ProxyBodyStream, AClientThatLeavesMidBodyResetsTheVenue)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    c.close();
+    EXPECT_TRUE(wait_for([&] { return _backend.incomplete_requests().size() == 1; })) << "the venue was kept";
+    shutdown();
+    EXPECT_EQ(_backend.resets(), 1);
+    EXPECT_EQ(_backend.requests_seen(), 0);
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 1u);
+}
+
+// A venue that stopped reading while the client kept sending: every part the client sent
+// restarted the idle clock, so the timeout waited for the client to finish. Staged is not
+// sent: the venue's timeout fires while the body is still arriving, as the venue's.
+TEST_P(ProxyBodyStream, AVenueThatStopsReadingMidBodyIsTheVenuesTimeout)
+{
+    static std::atomic<bool> never; // the venue reads nothing for the test's length
+    never = false;
+    _backend.set_response(http_ok("{}"));
+    _backend.set_small_rcvbuf(4096);
+    _backend.hold_reads(&never, 4096, 0);
+    _upstream_sndbuf = 4096;
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), 400'000'000);
+    const Halves h = openai_halves(R"(,"pad":")" + std::string(1 << 20, 'q') + R"("})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    const int64_t t0 = llmbridge::now_ns();
+    std::string r;
+    for (size_t off = 0; r.empty() && off < h.rest.size() && llmbridge::now_ns() - t0 < 4'000'000'000; off += 4096)
+    {
+        ASSERT_TRUE(c.send(h.rest.substr(off, 4096)));
+        r = c.recv_response(50);
+    }
+    const int64_t took = llmbridge::now_ns() - t0;
+    EXPECT_EQ(Client::status_of(r), 504) << r;
+    EXPECT_LT(took, 2'000'000'000) << "the client's parts kept the venue's timeout away";
+    shutdown();
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.upstream_timeouts, 1u);
+    EXPECT_EQ(st.client_idle_timeouts, 0u);
+    EXPECT_EQ(_backend.requests_seen(), 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyBodyStream,

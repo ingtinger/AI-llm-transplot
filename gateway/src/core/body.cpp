@@ -46,6 +46,36 @@ namespace llmbridge::detail
         --_bodies_streaming;
     }
 
+    // The venue holds a body short of its Content-Length, which it never runs.
+    void Engine::reset_venue(UpstreamConn* u) noexcept
+    {
+        u->peer_eof = true;
+        if (u->fd < 0) return;
+        u->reset_on_close = true;
+        net::set_reset_on_close(u->fd);
+    }
+
+    void Engine::cut_body(ClientConn* c) noexcept
+    {
+        stop_body(c);
+        if (UpstreamConn* u = unpair(c))
+        {
+            reset_venue(u);
+            _ops->close(*u);
+        }
+    }
+
+    // The reply closes the connection, so the rest of the body is never waited for.
+    void Engine::body_timeout(ClientConn* c, uint64_t& counter, const char* why) noexcept
+    {
+        ++counter;
+        LB_WARN(ReqId{c->req.f.req_seq}, " TIMEOUT ", why, " ", *c, " body_in=",
+                static_cast<uint64_t>(body_so_far(c).size()), " of ", static_cast<uint64_t>(c->msg.body_len),
+                " after_ns=", now_ns() - c->req.f.ts_req_recvd);
+        cut_body(c);
+        error_respond(c, 408, why, kSlowBodyMessage);
+    }
+
     std::string_view Engine::body_so_far(const ClientConn* c) const noexcept
     {
         const size_t end = std::min(c->rbuf.size(), c->msg.total_len);
@@ -84,8 +114,7 @@ namespace llmbridge::detail
         {
             u->out.stage().append(body.substr(c->req.f.body_sent, safe - c->req.f.body_sent));
             c->req.f.body_sent = static_cast<uint32_t>(safe);
-            c->req.f.ts_progress = t;
-            // Unconnected, the connect's completion sends it.
+            // Unconnected, the connect's completion sends it; staged is not progress, sent is.
             if (u->connected && !send_upstream(u)) return;
         }
         if (after_t3) c->req.f.body_work_ns += now_ns() - t;
@@ -99,13 +128,7 @@ namespace llmbridge::detail
         const char* why = c->req.scan->why();
         LB_WARN(ReqId{c->req.f.req_seq}, " streamed body refused (", why, ") after ",
                 static_cast<uint64_t>(c->req.f.body_sent), " bytes went upstream; resetting it");
-        stop_body(c);
-        if (UpstreamConn* u = unpair(c))
-        {
-            u->peer_eof = true; // never pooled
-            if (u->fd >= 0) net::set_reset_on_close(u->fd);
-            _ops->close(*u);
-        }
+        cut_body(c);
         end_body_stream(c, nullptr);
         const bool keys = std::string_view(why).find("key") != std::string_view::npos;
         error_respond(c, 400, why, keys ? kAmbiguousKeysMessage : kNotJsonMessage);

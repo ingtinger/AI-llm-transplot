@@ -355,6 +355,7 @@ namespace llmbridge::detail
 
     ConnBase* Engine::forget(ClientConn* c) noexcept
     {
+        if (c->req.f.body_streaming && c->up) reset_venue(c->up);
         stop_body(c);
         UpstreamConn* u = unpair(c); // the other leg never keeps a pointer to a freed one
         _clients->remove(c);
@@ -409,8 +410,8 @@ namespace llmbridge::detail
             return;
         }
         // We're replying to the client ourselves, so drop any in-flight upstream.
-        stop_body(client);
-        if (UpstreamConn* u = unpair(client)) _ops->close(*u);
+        if (client->req.f.body_streaming) cut_body(client);
+        else if (UpstreamConn* u = unpair(client)) _ops->close(*u);
         append_error(client->out.stage(), code, detail);
         client->req.f.phase = Phase::Replying;
         client->close_after_resp = true; // closes once the reply flushes

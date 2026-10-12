@@ -240,11 +240,13 @@ namespace llmbridge::detail
 #endif
     }
 
-    // Every send that moved a client's bytes, on both backends: t3 once the first send is
-    // in, and ts_body_sent each time all that is staged is, last at a streamed body's end.
+    // Every send that moved a client's bytes, on both backends: progress for the idle
+    // sweep, t3 once the first send is in, and ts_body_sent each time all that is staged
+    // is, last at a streamed body's end.
     void Engine::note_sent(UpstreamConn* u, int64_t now) noexcept
     {
         ReqState& f = u->client->req.f;
+        f.ts_progress = now;
         if (!f.ts_up_sent && u->sent_bytes >= f.first_send_end) f.ts_up_sent = now;
         if (upstream_request_sent(u)) f.ts_body_sent = now;
     }

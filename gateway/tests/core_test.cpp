@@ -15,10 +15,16 @@
 #include "core/registry.hpp"
 #include "engine.hpp"
 #include "gateway/gateway.hpp"
+#include "net/socket_util.hpp"
 
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <memory>
 #include <string>
@@ -94,6 +100,7 @@ namespace llmbridge
         const Stats& stats() const { return g.stats(); }
         size_t pooled() const { return g.pooled_upstream_count(); }
         size_t bodies_streaming() const { return e._bodies_streaming; }
+        void sweep(ClientConn* c, int64_t now) { e.sweep_client(c, now, /*busy=*/true); }
     };
 } // namespace llmbridge
 
@@ -742,5 +749,100 @@ namespace
         EXPECT_NE(stream_part(t, t.client(), 100), nullptr) << "the freed slot";
         EXPECT_EQ(t.stats().streamed_bodies, 2u);
         EXPECT_EQ(t.stats().streamed_body_capped, 1u);
+    }
+
+    // The idle sweep found neither leg moving mid-body. The venue had every byte that came,
+    // so the client stopped sending: a client stall, a 408, the venue reset. The stalled
+    // body rode a pooled connection inside the stale-retry window and is not resent.
+    TEST_F(Core, ABodyTheClientStoppedSendingIsAClientStall)
+    {
+        t.release(t.upstream(), /*keep_alive=*/true);
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        ASSERT_TRUE(u->from_pool);
+        ASSERT_TRUE(u->out.idle()) << "the venue has all that came";
+        io.calls.clear();
+        io.next_send = Sent::Queued; // the reply stays to be read
+        t.sweep(c, c->req.f.ts_progress + Gateway::kDefaultUpstreamIdleNs + 1);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"close upstream", "send client"}));
+        EXPECT_EQ(c->out.bytes().rfind("HTTP/1.1 408 Request Timeout\r\n", 0), 0u) << c->out.bytes();
+        EXPECT_TRUE(u->doomed);
+        EXPECT_TRUE(u->reset_on_close) << "the venue is reset, not sent a FIN";
+        EXPECT_EQ(t.bodies_streaming(), 0u);
+        EXPECT_EQ(t.stats().client_idle_timeouts, 1u);
+        EXPECT_EQ(t.stats().upstream_timeouts, 0u);
+        EXPECT_EQ(t.stats().upstream_retries, 0u);
+    }
+
+    // The same sweep with request bytes the venue has not taken: it stopped reading, so it
+    // is the venue's timeout, a 504, and the venue is reset all the same.
+    TEST_F(Core, ABodyTheVenueStoppedTakingIsTheVenuesTimeout)
+    {
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        u->connected = u->wire_ready = true; // connected, and the head never taken
+        ASSERT_FALSE(u->out.idle());
+        io.next_send = Sent::Queued;
+        t.sweep(c, c->req.f.ts_progress + Gateway::kDefaultUpstreamIdleNs + 1);
+        EXPECT_EQ(c->out.bytes().rfind("HTTP/1.1 504 Gateway Timeout\r\n", 0), 0u) << c->out.bytes();
+        EXPECT_TRUE(u->doomed);
+        EXPECT_TRUE(u->reset_on_close);
+        EXPECT_EQ(t.stats().upstream_timeouts, 1u);
+        EXPECT_EQ(t.stats().client_idle_timeouts, 0u);
+    }
+
+    // Staging a part is not the venue's progress; sending it is.
+    TEST_F(Core, OnlyASendThatMovesBytesIsProgress)
+    {
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        const int64_t before = c->req.f.ts_progress;
+        c->rbuf.append(kBody.substr(100, 1000));
+        t.bytes(c); // still connecting: staged only
+        EXPECT_EQ(c->req.f.ts_progress, before);
+        u->connected = u->wire_ready = true;
+        c->rbuf.append(kBody.substr(1100, 1000));
+        t.bytes(c); // sent
+        EXPECT_GT(c->req.f.ts_progress, before);
+    }
+
+    // A venue that stopped reading can have every byte we sent in our kernel, unacknowledged:
+    // nothing is left for us to send, and still the venue is the one that stopped.
+    TEST_F(Core, BytesTheKernelHoldsUnacknowledgedAreTheVenues)
+    {
+        const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+        int small = 4096;
+        ::setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t len = sizeof a;
+        ASSERT_EQ(::bind(lfd, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+        ::getsockname(lfd, reinterpret_cast<sockaddr*>(&a), &len);
+        ::listen(lfd, 1);
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+        const int venue = ::accept(lfd, nullptr, nullptr); // and never read
+        const std::string junk(1 << 16, 'j');
+        while (::send(fd, junk.data(), junk.size(), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}
+        ASSERT_GT(llmbridge::net::unacked_bytes(fd), 0u);
+
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        u->connected = u->wire_ready = true;
+        u->out.sent(u->out.wire().size()); // ours is empty: all of it is in the kernel
+        ::close(u->fd);
+        u->fd = fd; // closed, with a reset, at teardown
+        io.next_send = Sent::Queued;
+        t.sweep(c, c->req.f.ts_progress + Gateway::kDefaultUpstreamIdleNs + 1);
+        EXPECT_EQ(c->out.bytes().rfind("HTTP/1.1 504 Gateway Timeout\r\n", 0), 0u) << c->out.bytes();
+        EXPECT_EQ(t.stats().upstream_timeouts, 1u);
+        EXPECT_EQ(t.stats().client_idle_timeouts, 0u);
+        ::close(venue);
+        ::close(lfd);
     }
 } // namespace

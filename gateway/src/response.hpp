@@ -54,6 +54,8 @@ namespace llmbridge::detail
         "request body repeats a top-level key or escapes one";
     /// The 400 for a forwarded body that turned out not to be JSON.
     inline constexpr const char* kNotJsonMessage = "request body is not valid JSON";
+    /// The 408 for a streamed body that stopped arriving, or arrived too slowly.
+    inline constexpr const char* kSlowBodyMessage = "request body did not arrive in time";
     /// `status` and `body` with Content-Length, keeping the upstream headers that
     /// net::http::relayed() allows; `own_body`: the upstream's body, with its type.
     void append_relayed_reply(std::string& out, int status, std::string_view upstream_head,

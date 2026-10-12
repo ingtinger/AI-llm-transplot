@@ -86,6 +86,10 @@ namespace llmbridge::detail
         [[nodiscard]] bool body_streams(const ClientConn* c, const net::http::Message& m) noexcept;
         void pump_body(ClientConn* c) noexcept;       // scan, then stage what is safe upstream
         void stop_body(ClientConn* c) noexcept;       // no more of it goes up: its slot is free
+        void cut_body(ClientConn* c) noexcept;        // stop it and reset its venue
+        void reset_venue(UpstreamConn* u) noexcept;   // never pooled, and its close is a reset
+        /// The client gets a 408 and the venue a reset; `counter` says which limit it missed.
+        void body_timeout(ClientConn* c, uint64_t& counter, const char* why) noexcept;
         void refuse_body(ClientConn* c) noexcept;     // reset the upstream, answer the 400
         void end_body_stream(ClientConn* c, UpstreamConn* u) noexcept; // a response byte arrived
         void drop_discard(ClientConn* c) noexcept;    // bytes of a request that is over
@@ -138,7 +142,8 @@ namespace llmbridge::detail
         [[nodiscard]] bool upstream_request_sent(const UpstreamConn* u) const noexcept;
         /// What `u->out` holds now is the attempt's first send, which t3 waits for.
         void mark_first_send(UpstreamConn* u) noexcept;
-        /// `u` took bytes: t3 once the first send is in, ts_body_sent whenever all is.
+        /// `u` took bytes: the idle clock restarts, t3 once the first send is in, and
+        /// ts_body_sent whenever all is.
         void note_sent(UpstreamConn* u, int64_t now) noexcept;
         bool send_upstream(UpstreamConn* u) noexcept; // false: the write failed, `u` is lost
 

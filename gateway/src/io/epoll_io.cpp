@@ -397,10 +397,7 @@ namespace llmbridge::detail
     // Bytes went: the idle clock restarts, and t3 or a body's last byte may be in.
     void EpollIo::progressed(UpstreamConn* u, uint64_t sent_before) noexcept
     {
-        if (!u->client || u->sent_bytes == sent_before) return;
-        const int64_t now = now_ns();
-        u->client->req.f.ts_progress = now;
-        _e.note_sent(u, now);
+        if (u->client && u->sent_bytes != sent_before) _e.note_sent(u, now_ns());
     }
 
     void EpollIo::on_upstream_readable(UpstreamConn* u) noexcept
