@@ -40,13 +40,18 @@ namespace llmbridge::net::http
         Error     // malformed; refuse the message (see the fail-closed policy)
     };
 
-    /// The header fields a framer acts on; every other name is Other.
+    /// The header fields the gateway acts on; every other name is Other. Connection
+    /// through Upgrade are hop-by-hop (RFC 9110 7.6.1), never forwarded.
     enum class Field : uint8_t
     {
-        Other, ContentLength, TransferEncoding, ContentEncoding, ContentType, Connection,
-        RetryAfter, RequestsRemaining, InputTokensRemaining, OutputTokensRemaining,
-        TokensRemaining
+        Other, ContentLength, TransferEncoding, ContentEncoding, ContentType,
+        Connection, KeepAlive, ProxyConnection, Te, Trailer, Upgrade,
+        Host, Expect, AcceptEncoding, Authorization, XApiKey, ApiKey, XGoogApiKey,
+        AnthropicVersion, RetryAfter, RequestId, RequestsRemaining, InputTokensRemaining,
+        OutputTokensRemaining, TokensRemaining
     };
+
+    constexpr bool hop_by_hop(Field f) noexcept { return f >= Field::Connection && f <= Field::Upgrade; }
 
     /// One header line. `value` is everything after the colon, untrimmed.
     struct HeaderLine
@@ -159,30 +164,48 @@ namespace llmbridge::net::http
             return !(line[colon - 1] == ' ' || line[colon - 1] == '\t');
         }
 
-        struct FieldName
+        // The length, then the first letter, pick the one name a header can be; one
+        // compare decides it. Every line of every head comes through here.
+        inline Field classify(std::string_view n) noexcept
         {
-            std::string_view name;
-            Field field;
-        };
-        inline constexpr FieldName kFieldNames[] = {
-            {"connection", Field::Connection},
-            {"retry-after", Field::RetryAfter},
-            {"content-type", Field::ContentType},
-            {"content-length", Field::ContentLength},
-            {"content-encoding", Field::ContentEncoding},
-            {"transfer-encoding", Field::TransferEncoding},
-            {"x-ratelimit-remaining-tokens", Field::TokensRemaining},
-            {"x-ratelimit-remaining-requests", Field::RequestsRemaining},
-            {"anthropic-ratelimit-requests-remaining", Field::RequestsRemaining},
-            {"anthropic-ratelimit-input-tokens-remaining", Field::InputTokensRemaining},
-            {"anthropic-ratelimit-output-tokens-remaining", Field::OutputTokensRemaining},
-        };
-
-        inline Field classify(std::string_view name) noexcept
-        {
-            for (const FieldName& f : kFieldNames)
-                if (same_ci(name, f.name)) return f.field;
-            return Field::Other;
+            if (n.empty()) return Field::Other;
+            const auto is = [n](std::string_view lower, Field f) { return same_ci(n, lower) ? f : Field::Other; };
+            const char c = lc(n[0]);
+            switch (n.size())
+            {
+                case 2: return is("te", Field::Te);
+                case 4: return is("host", Field::Host);
+                case 6: return is("expect", Field::Expect);
+                case 7:
+                    return c == 'a' ? is("api-key", Field::ApiKey)
+                         : c == 't' ? is("trailer", Field::Trailer)
+                                    : is("upgrade", Field::Upgrade);
+                case 9: return is("x-api-key", Field::XApiKey);
+                case 10:
+                    return c == 'c' ? is("connection", Field::Connection)
+                         : c == 'k' ? is("keep-alive", Field::KeepAlive)
+                                    : is("request-id", Field::RequestId);
+                case 11: return is("retry-after", Field::RetryAfter);
+                case 12: return c == 'c' ? is("content-type", Field::ContentType) : is("x-request-id", Field::RequestId);
+                case 13: return is("authorization", Field::Authorization);
+                case 14:
+                    return c == 'c' ? is("content-length", Field::ContentLength)
+                                    : is("x-goog-api-key", Field::XGoogApiKey);
+                case 15: return is("accept-encoding", Field::AcceptEncoding);
+                case 16:
+                    return c == 'c' ? is("content-encoding", Field::ContentEncoding)
+                         : c == 'p' ? is("proxy-connection", Field::ProxyConnection)
+                                    : is("x-amzn-requestid", Field::RequestId);
+                case 17:
+                    return c == 'a' ? is("anthropic-version", Field::AnthropicVersion)
+                                    : is("transfer-encoding", Field::TransferEncoding);
+                case 28: return is("x-ratelimit-remaining-tokens", Field::TokensRemaining);
+                case 30: return is("x-ratelimit-remaining-requests", Field::RequestsRemaining);
+                case 38: return is("anthropic-ratelimit-requests-remaining", Field::RequestsRemaining);
+                case 42: return is("anthropic-ratelimit-input-tokens-remaining", Field::InputTokensRemaining);
+                case 43: return is("anthropic-ratelimit-output-tokens-remaining", Field::OutputTokensRemaining);
+                default: return Field::Other;
+            }
         }
     } // namespace detail
 
@@ -274,7 +297,10 @@ namespace llmbridge::net::http
     inline constexpr size_t kMaxBodyLen = 16 * 1024 * 1024;
 
     // Idempotent: re-run as bytes arrive; NeedMore until the full message is buffered.
-    inline FrameStatus parse_request(std::string_view buf, Message& out) noexcept
+    // `also(const HeaderLine&) -> bool` sees every header line of the one walk, once the
+    // head is buffered; false refuses the request.
+    template <class Also>
+    inline FrameStatus parse_request(std::string_view buf, Message& out, Also&& also) noexcept
     {
         const size_t hdr_end = buf.find("\r\n\r\n");
         if (hdr_end == std::string_view::npos)
@@ -305,7 +331,7 @@ namespace llmbridge::net::http
                     if (have_cl && n != out.body_len) return false; // RFC 9112 §6.3
                     out.body_len = n;
                     have_cl = true;
-                    return true;
+                    break;
                 }
                 case Field::TransferEncoding:
                     return false; // Content-Length framing only
@@ -313,15 +339,16 @@ namespace llmbridge::net::http
                 {
                     const std::string_view v = detail::ltrim(h.value);
                     out.encoded = !v.empty() && !detail::contains_ci(v, "identity");
-                    return true;
+                    break;
                 }
                 case Field::Connection:
                     close |= has_token(h.value, "close");
                     keep |= has_token(h.value, "keep-alive");
-                    return true;
+                    break;
                 default:
-                    return true;
+                    break;
             }
+            return also(h);
         });
         if (!ok || out.body_len > kMaxBodyLen) return FrameStatus::Error;
         if (close || keep) out.keep_alive = !close;
@@ -329,6 +356,11 @@ namespace llmbridge::net::http
         out.total_len = out.header_len + out.body_len;
         if (buf.size() < out.total_len) return FrameStatus::NeedMore;
         return FrameStatus::Complete;
+    }
+
+    inline FrameStatus parse_request(std::string_view buf, Message& out) noexcept
+    {
+        return parse_request(buf, out, [](const HeaderLine&) noexcept { return true; });
     }
 
     /// How a response body ends (RFC 9112 §6.3): not at all, after Content-Length

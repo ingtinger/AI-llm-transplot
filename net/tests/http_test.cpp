@@ -25,6 +25,7 @@
 //                 NeedMore and never a false Complete/Error.
 
 #include "net/http.hpp"
+#include "net/http_write.hpp"
 
 #include <gtest/gtest.h>
 
@@ -1119,4 +1120,77 @@ TEST(ResponseFramer, FramesLikeParseResponseAndParsesTheHeadOnce)
         EXPECT_EQ(f.message(p.wire).status, want.status) << p.name;
         EXPECT_EQ(f.head_parses(), parses_at_head + 1) << p.name;
     }
+}
+
+// ── The request walk's visitor, and the response-head writer ────────────────────
+
+TEST(WalkHeaders, NamesTheHopByHopAndCredentialFields)
+{
+    using llmbridge::net::http::Field;
+    using llmbridge::net::http::detail::classify;
+    for (const char* n : {"Connection", "KEEP-ALIVE", "proxy-connection", "TE", "Trailer", "upgrade"})
+        EXPECT_TRUE(llmbridge::net::http::hop_by_hop(classify(n))) << n;
+    for (const char* n : {"Transfer-Encoding", "Host", "Expect", "Authorization", "Te-x", "Upgrades"})
+        EXPECT_FALSE(llmbridge::net::http::hop_by_hop(classify(n))) << n;
+    EXPECT_EQ(classify("API-KEY"), Field::ApiKey);
+    EXPECT_EQ(classify("x-api-key"), Field::XApiKey);
+    EXPECT_EQ(classify("X-Goog-Api-Key"), Field::XGoogApiKey);
+    EXPECT_EQ(classify("Anthropic-Version"), Field::AnthropicVersion);
+    EXPECT_EQ(classify("x-amzn-RequestId"), Field::RequestId);
+    EXPECT_EQ(classify("api-keys"), Field::Other);
+}
+
+// The framing walk is the one walk: a caller's visitor sees every header line once,
+// after the framer's own reading of it, and can refuse the request.
+TEST(ParseRequest, TheVisitorSeesEveryHeaderLineOnce)
+{
+    using namespace llmbridge::net::http;
+    const std::string req = "POST /v1 HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n"
+                            "Connection: close\r\nX-A: 1\r\n\r\n{}";
+    std::vector<std::string> seen;
+    Message m;
+    ASSERT_EQ(parse_request(req, m, [&](const HeaderLine& h) {
+                  seen.emplace_back(h.name);
+                  return true;
+              }),
+              FrameStatus::Complete);
+    EXPECT_EQ(seen, (std::vector<std::string>{"Host", "Content-Length", "Connection", "X-A"}));
+    EXPECT_FALSE(m.keep_alive);
+    EXPECT_EQ(parse_request(req, m, [](const HeaderLine& h) { return h.field != Field::Host; }),
+              FrameStatus::Error);
+}
+
+TEST(HttpWrite, EveryStatusKeepsItsCodeAndAPhrase)
+{
+    using llmbridge::net::http::reason;
+    EXPECT_EQ(reason(200), "OK");
+    EXPECT_EQ(reason(422), "Unprocessable Content");
+    EXPECT_EQ(reason(413), "Content Too Large");
+    EXPECT_EQ(reason(418), "Client Error");
+    EXPECT_EQ(reason(599), "Server Error");
+    EXPECT_EQ(reason(299), "OK") << "a success is never called an error";
+    std::string out;
+    llmbridge::net::http::append_status_line(out, 409);
+    llmbridge::net::http::append_content_length(out, 1234567);
+    EXPECT_EQ(out, "HTTP/1.1 409 Conflict\r\nContent-Length: 1234567\r\n");
+}
+
+TEST(HttpWrite, ARelayKeepsTheAllowlistVerbatim)
+{
+    const std::string head = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\n"
+                             "Retry-After: 7\r\nretry-after-ms: 7000\r\nX-RateLimit-Reset-Tokens: 1s\r\n"
+                             "anthropic-ratelimit-tokens-remaining: 0\r\nRateLimit-Policy: 10;w=1\r\n"
+                             "x-request-id: r1\r\nrequest-id: r2\r\nx-amzn-requestid: r3\r\n"
+                             "Content-Encoding: gzip\r\nSet-Cookie: s=1\r\nConnection: keep-alive\r\n"
+                             "Content-Length: 9\r\nx-ratelimit-bad: \x01x";
+    std::string out;
+    EXPECT_FALSE(llmbridge::net::http::append_relayed(out, head, false));
+    EXPECT_EQ(out, "Retry-After: 7\r\nretry-after-ms: 7000\r\nX-RateLimit-Reset-Tokens: 1s\r\n"
+                   "anthropic-ratelimit-tokens-remaining: 0\r\nRateLimit-Policy: 10;w=1\r\n"
+                   "x-request-id: r1\r\nrequest-id: r2\r\nx-amzn-requestid: r3\r\n");
+    out.clear();
+    EXPECT_TRUE(llmbridge::net::http::append_relayed(out, head, true));
+    EXPECT_EQ(out.rfind("Content-Type: text/plain\r\nRetry-After: 7\r\n", 0), 0u) << out;
+    EXPECT_NE(out.find("Content-Encoding: gzip\r\n"), std::string::npos) << out;
+    EXPECT_EQ(out.find("Set-Cookie"), std::string::npos) << out;
 }
