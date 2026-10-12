@@ -12500,5 +12500,74 @@ TEST_P(ProxyBodyStream, OnAndOffReadTheSameFirstToken)
     }
 }
 
+// --stream-body off holds every client's body to its last byte, an Anthropic client's as
+// well as an OpenAI one's, and its record is a held body's: every field what the same
+// request gets sent whole, and the body fields t0, t3, 0 and false.
+TEST_P(ProxyBodyStream, StreamBodyOffHoldsEveryBodyWithAHeldBodysRecord)
+{
+    for (const bool anthropic : {false, true})
+    {
+        RecordingSink::Copy rec[2]; // sent whole, then in two parts
+        for (const bool parts : {false, true})
+        {
+            TestBackend backend;
+            backend.set_response(http_ok("{}"));
+            backend.start();
+            RecordingSink sink;
+            Gateway gw(0, "127.0.0.1", backend.port(), 0,
+                       anthropic ? UpstreamDialect::Anthropic : UpstreamDialect::OpenAI, GetParam());
+            gw.set_stream_body(false);
+            gw.set_request_sink(&sink, {});
+            std::thread loop([&] { gw.run(); });
+            std::string req = big_request(64, /*json=*/true);
+            if (anthropic) req.replace(0, req.find("\r\n"), "POST /v1/messages HTTP/1.1");
+            Client c;
+            bool sent = c.connect(gw.bound_port());
+            size_t early = 0;
+            if (sent && parts)
+            {
+                sent = c.send(req.substr(0, req.size() / 2));
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                early = backend.bytes_seen();
+                sent = sent && c.send(req.substr(req.size() / 2));
+            }
+            else if (sent) sent = c.send(req);
+            const int status = sent ? c.recv_status() : 0;
+            c.close();
+            gw.request_stop();
+            loop.join();
+            backend.stop();
+            ASSERT_EQ(status, 200) << "anthropic=" << anthropic << " parts=" << parts;
+            EXPECT_EQ(early, 0u) << "a byte left before the last, anthropic=" << anthropic;
+            EXPECT_EQ(gw.stats().streamed_bodies, 0u);
+            const auto recs = sink.records();
+            ASSERT_EQ(recs.size(), 1u);
+            rec[parts] = recs[0];
+        }
+        const llmbridge::RequestRecord& whole = rec[0].r;
+        const llmbridge::RequestRecord& off = rec[1].r;
+        EXPECT_FALSE(off.body_streamed);
+        EXPECT_EQ(off.ts_body_end, off.ts_req_recvd);
+        EXPECT_EQ(off.ts_body_sent, off.ts_up_sent);
+        EXPECT_EQ(off.body_work_ns, 0);
+        EXPECT_GE(off.client_upload_ns, 100'000'000) << "the upload is the client's";
+        EXPECT_GE(off.client_conn_setup_ns, off.client_upload_ns);
+        EXPECT_EQ(rec[1].model, rec[0].model);
+        EXPECT_EQ(off.status, whole.status);
+        EXPECT_EQ(off.request_bytes, whole.request_bytes);
+        EXPECT_EQ(off.upstream_index, whole.upstream_index);
+        EXPECT_EQ(off.attempts, whole.attempts);
+        EXPECT_EQ(off.client_conn_reused, whole.client_conn_reused);
+        EXPECT_EQ(off.from_pool, whole.from_pool);
+        EXPECT_EQ(off.streamed, whole.streamed);
+        EXPECT_EQ(off.translated, whole.translated);
+        EXPECT_EQ(off.error_reply, whole.error_reply);
+        EXPECT_EQ(off.tokens_in, whole.tokens_in);
+        EXPECT_EQ(off.backend, whole.backend);
+        EXPECT_EQ(whole.ts_body_end, whole.ts_req_recvd);
+        EXPECT_EQ(whole.ts_body_sent, whole.ts_up_sent);
+    }
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyBodyStream,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));

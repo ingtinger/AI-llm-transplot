@@ -42,7 +42,7 @@ namespace llmbridge::app
         int workers = 1;
         bool timing_headers = false;
         double duration_s = 0, warmup_s = 0, prefault_mb = 0, retain_mb = 4;
-        std::string stream_openai_body = "on";
+        std::string stream_body = "on", stream_openai_body = "on";
     };
 
     enum class Kind { Bool, Int, Number, Text, Choice, List };

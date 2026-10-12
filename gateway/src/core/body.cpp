@@ -24,7 +24,8 @@ namespace llmbridge::detail
     bool Engine::body_streams(const ClientConn* c, const net::http::Message& m) const noexcept
     {
         // A policy reads the body before it routes, so its requests wait for all of it.
-        if (_policy || m.body_len < _stream_body_min || m.encoded || c->rbuf.size() >= m.total_len)
+        if (!_stream_body || _policy || m.body_len < _stream_body_min || m.encoded ||
+            c->rbuf.size() >= m.total_len)
             return false;
         if (!net::http::request_line_ok(c->rbuf)) return false; // the framing path refuses it
         const Dialect client = client_dialect_of(std::string_view(c->rbuf.data(), m.header_len));

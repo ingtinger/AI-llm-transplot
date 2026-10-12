@@ -51,6 +51,7 @@ Flags override the file wherever they appear. In parentheses: the file key.
   --warmup SECONDS            leave the first seconds out of the histograms (runtime.warmup_s)
   --prefault-mb MB            prefault every request buffer to this size (runtime.prefault_mb)
   --retain-mb MB              JSON parse storage a worker keeps between bodies, up to the 16 MB body cap (runtime.retain_mb)
+  --stream-body MODE          forward a byte-forwarded body as it arrives; off holds every one to its last byte: on|off (runtime.stream_body)
   --stream-openai-body MODE   forward an OpenAI client's body as it arrives, each chunk checked first: on|off (runtime.stream_openai_body)
 File only:
   upstream.strip_headers      header names dropped from every upstream request
@@ -90,6 +91,7 @@ INSTANTIATE_TEST_SUITE_P(
         // A typo became auto.
         std::make_pair(Args{"--io", "urnig"}, "must be one of: auto epoll uring"),
         std::make_pair(Args{"--log-level", "verbose"}, "must be one of"),
+        std::make_pair(Args{"--stream-body", "no"}, "must be one of: on off"),
         // A flag missing its value was ignored, or swallowed the next flag.
         std::make_pair(Args{"--io", "urnig", "--upstream-timeout", "-5", "--workers"},
                        "must be one of"),
@@ -135,7 +137,8 @@ TEST(Cli, ValuesAndSwitchesLand)
     std::string err;
     ASSERT_EQ(parse({"--duration", "0.5", "--listen", "0", "--timing-headers", "--listen-tls",
                      "--tls-cert", "/c", "--tls-key", "/k", "--prefault-mb", "16",
-                     "--client-idle", "60", "--pool-idle", "45", "--connect-timeout", "2"},
+                     "--client-idle", "60", "--pool-idle", "45", "--connect-timeout", "2",
+                     "--stream-body", "off"},
                     s, err),
               Cli::Run)
         << err;
@@ -149,6 +152,7 @@ TEST(Cli, ValuesAndSwitchesLand)
     EXPECT_DOUBLE_EQ(s.client_idle_s, 60);
     EXPECT_DOUBLE_EQ(s.pool_idle_s, 45);
     EXPECT_DOUBLE_EQ(s.connect_s, 2);
+    EXPECT_EQ(s.stream_body, "off");
 }
 
 // The file is applied first wherever --config sits, so a flag always wins.

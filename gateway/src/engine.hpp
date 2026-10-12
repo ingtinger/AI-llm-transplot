@@ -221,7 +221,9 @@ namespace llmbridge::detail
         int64_t _upstream_idle_ns; // 0 = no idle timeout
         TlsConfig _tls;            // both legs; each flag inits its own context
         bool _timing_headers = false;
-        /// Forward an OpenAI client's body as it arrives, each chunk scanned first.
+        /// Forward a byte-forwarded body as it arrives, an OpenAI client's only with the
+        /// second, each chunk scanned first. Off, a body is held to its last byte.
+        bool _stream_body = true;
         bool _stream_openai_body = true;
         size_t _stream_body_min = 16 * 1024; ///< a body under this arrives too fast to matter
         Policy* const _policy = nullptr; ///< `const`: swapping it under the loop would race

@@ -110,6 +110,7 @@ namespace llmbridge
         void set_prefault_bytes(size_t n) noexcept;
         /// Forward an OpenAI client's body as it arrives, each chunk checked first (default on).
         void set_stream_openai_body(bool on) noexcept;
+        void set_stream_body(bool on) noexcept; // any client's; off holds every body (default on)
         /// Parse storage each worker keeps between bodies (default 4 MiB). Process-wide.
         void set_retain_bytes(size_t n) noexcept;
         /// Optional per-request sink (sink.hpp), non-owning. `capture` names up to

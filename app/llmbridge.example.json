@@ -64,7 +64,10 @@
     "_retain_mb": "Megabytes of JSON parse storage (the node arena and the parser's stacks, each) a worker keeps between translated bodies, 0 to 16. Past it a large body's storage is freed after the request, so the next one allocates afresh. Raise it to 16 when bodies of several megabytes are common: it costs up to twice this much resident memory per worker.",
     "retain_mb": 4,
 
-    "_stream_openai_body": "\"on\" (default) forwards an OpenAI client's byte-forwarded body to the venue as it arrives, each chunk checked first: a repeated or escaped top-level key, or a byte that is not JSON, stops it, resets the upstream and answers 400. \"off\" holds it until its last byte. Other clients' byte-forwarded bodies are always forwarded as they arrive; a translated body, a body under 16 KiB, and every body while a policy is installed are held.",
+    "_stream_body": "\"on\" (default) forwards a byte-forwarded body of 16 KiB or more to the venue as it arrives, so the venue does not wait for the whole upload. \"off\" holds every body until its last byte, for every client, exactly as before 0.90.0. A translated body, a body under 16 KiB, a compressed one, and every body while a policy is installed are always held.",
+    "stream_body": "on",
+
+    "_stream_openai_body": "\"on\" (default) forwards an OpenAI client's byte-forwarded body as it arrives too, each chunk checked first: a repeated or escaped top-level key, or a byte that is not JSON, stops it, resets the upstream and answers 400. \"off\" holds an OpenAI client's body until its last byte; other clients' bodies follow stream_body alone.",
     "stream_openai_body": "on",
 
     "_duration_s": "Self-stop after N seconds (fractions allowed; SIGINT/SIGTERM still stop it at once) and print the added-latency profile, for scripted benchmark runs. 0 runs until SIGINT/SIGTERM.",
