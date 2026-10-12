@@ -12,7 +12,7 @@ The lifecycle is written once, in `gateway/src/core/`, as methods of
 owns its loop and its syscalls and calls back into the shared methods as completions
 arrive. `Gateway` is a facade over the `Engine`. What still differs between the
 backends is how I/O is issued and how completion is discovered (sections 4 and 5),
-and one deliberate choice under a slow streaming client (6c).
+and the threshold at which a slow streaming client pauses its upstream (6c).
 
 ## 1. The cast
 
@@ -177,9 +177,9 @@ written once and runs on both.
 | `close` | `Engine::forget`, then `::close` | `Engine::forget`, then cancel; freed at `inflight == 0` |
 
 A send that completes at once is a return value (`Sent::Done`), never a callback, so
-no handler runs re-entered. `IoCaps::stream_backpressure` says whether the backend
-pauses a stream's upstream for a slow client (epoll) or bounds it by its buffer cap
-(io_uring). Nothing else of the lifecycle is written per backend: each loop reads or
+no handler runs re-entered. `IoCaps` says how the backend bounds a stream for a slow
+client: both pause its upstream, each at its own threshold, and io_uring keeps a cap
+as the ceiling (6c). Nothing else of the lifecycle is written per backend: each loop reads or
 learns of a completion and calls a shared handler.
 
 The request side is shared outright. Bytes a backend reads go to `on_client_bytes`:
@@ -314,7 +314,8 @@ translate Anthropic events to OpenAI chunks, write to the client.
                                 |
                      -> c->out.stage() -> stream_flush() -> IoOps::send
              epoll:  write now; Queued pauses the upstream
-             uring:  SEND (pins the front); past kStreamBufCap the stream is dropped
+             uring:  SEND (pins the front); past kStreamPauseAbove owed, pause;
+                     past kStreamBufCap the stream is dropped
                                 |
                                 v
                           client sees chunks
@@ -331,8 +332,8 @@ Three flags carry the state, and their meanings are precise:
   client sees a cut-off stream instead of a fabricated clean finish. So
   `stream_ended && close_after_resp` is the truncated case and
   `stream_ended && !close_after_resp` the clean one.
-- **`read_paused`** is written only by a backend's `set_read`: a stream's upstream on
-  epoll, and a client past the pipelining cap on either backend.
+- **`read_paused`** is written only by a backend's `set_read`: a stream's upstream,
+  and a client past the pipelining cap, on either backend.
 
 `stream_ended` also gates `finalize_stream`. Without it the gateway resumes
 reading from an upstream that will never speak again, and the client socket is
@@ -363,24 +364,36 @@ the one shared place: the abort paths bypass the finalize, and a truncated strea
 the one outcome a client cannot tell from a clean finish, so if it is not recorded
 on our side nobody can answer "did my stream complete?" afterwards.
 
-### 6c. The one place the backends deliberately differ
+### 6c. Back-pressure under a slow client
 
-Under a slow client, **epoll** pauses upstream `EPOLLIN` and applies
-back-pressure. **io_uring** instead bounds the unsent `out` with `kStreamBufCap` and
-drops the stream past the cap. One branch decides, in `stream_pump` and
-`stream_flush`: `IoCaps::stream_backpressure`. Know which you are reasoning about
-before quoting streaming behaviour to a customer.
+Both backends pause a stream's upstream for a slow client and resume it once the
+client has drained what the stream owes it (`owed()`: plaintext, and ciphertext on
+TLS). They differ in when, and `IoCaps` says which, read in `stream_pump` and
+`stream_flush`:
+
+| | pauses | ceiling |
+|---|---|---|
+| **epoll** | when a write is left short (`stream_pause_above` 0): the socket is full | none; a read is budgeted per event (`kMaxReadPerEvent`) |
+| **io_uring** | when more than `kStreamPauseAbove` (1 MiB) is owed: every send is queued while it is in flight, so queued alone means nothing | `kStreamBufCap` (8 MiB): bytes the kernel placed before the cancel still land, and past the cap the stream is dropped |
+
+An io_uring pause cancels the upstream's multishot recv; a resume re-arms it, or the
+cancel's completion does if the resume came first. A paused upstream is not polled,
+so a venue that resets meanwhile is noticed on resume. Before 0.87.0 io_uring did not
+pause streams: the cap was its only bound, and a slow client's stream past 8 MiB was
+dropped. The 32 MiB flood to a TLS client that never reads (`GatewayTls.
+ClientThatNeverReadsCannotGrowUsWithoutBound`) peaks at 55 MB of process RSS paused,
+69 MB when the cap dropped it; epoll's is 53 MB.
 
 Either way the idle deadline (`--upstream-timeout`) measures `ts_progress`, which both
 legs advance: a response byte read, a request byte sent, a byte the client took. A
-paused epoll upstream reads nothing while its client drains, and a finished io_uring
-stream reads nothing while its client catches up; neither is idle. When neither leg
+paused upstream reads nothing while its client drains, and a finished stream reads
+nothing while its client catches up; neither is idle. When neither leg
 moves and bytes are still owed to the client, the sweep logs `client stalled` and counts
 `client_idle_timeouts`, not `upstream_timeouts`.
 
 `read_paused` is written only by a backend's `set_read`, which both guard on the
-current value. A stream pauses its upstream only where `stream_backpressure` holds;
-io_uring uses `set_read` only for the pipelining cap on a client (3d).
+current value. A stream pauses its upstream only where `stream_backpressure` holds,
+and so does the release to the pool, which resumes reads first (8).
 
 ## 7. Connection lifetime, and why the two backends free differently
 

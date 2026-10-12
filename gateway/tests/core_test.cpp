@@ -37,8 +37,11 @@ namespace llmbridge
 
         void attach(detail::IoOps& io, bool backpressure)
         {
-            e.attach(&io, IoCaps{.stream_backpressure = backpressure});
+            // Without a pause the cap is the only bound, so it is set exactly then.
+            e.attach(&io, IoCaps{.stream_backpressure = backpressure,
+                                 .stream_cap = backpressure ? 0 : detail::kStreamBufCap});
         }
+        void attach(detail::IoOps& io, const IoCaps& caps) { e.attach(&io, caps); }
         ClientConn* client()
         {
             auto* c = new ClientConn();
@@ -541,6 +544,49 @@ namespace
         EXPECT_EQ(io.calls.back(), "resume upstream");
         EXPECT_TRUE(c->out.idle());
         EXPECT_FALSE(c->doomed);
+    }
+
+    // A backend whose sends are always queued while in flight (io_uring) pauses only
+    // once the stream owes more than its threshold, resumes when the client drains, and
+    // still drops a stream past the cap: bytes read before the pause keep landing.
+    TEST_F(Core, AQueuedSendPausesOnlyPastTheThresholdAndTheCapStaysACeiling)
+    {
+        FakeIo uring{t};
+        t.attach(uring, llmbridge::detail::IoCaps{.stream_backpressure = true,
+                                                  .stream_pause_above = 1000,
+                                                  .stream_cap = 4000});
+        uring.next_send = Sent::Queued;
+        ClientConn* c = t.client();
+        UpstreamConn* u = t.upstream();
+        t.dispatch(c, u);
+        streaming(c, u, llmbridge::net::http::Body::UntilClose);
+        u->rbuf.assign(600, 'x');
+        t.pump(u);
+        EXPECT_FALSE(uring.called("pause upstream")) << "a send in flight is not a slow client";
+        u->rbuf.assign(600, 'x');
+        t.pump(u);
+        EXPECT_TRUE(uring.called("pause upstream")) << "1200 bytes owed is past the threshold";
+        EXPECT_EQ(t.stats().stream_pauses, 1u);
+        u->read_paused = true; // what set_read records in a backend
+        u->rbuf.assign(2000, 'x');
+        t.pump(u);
+        EXPECT_EQ(t.stats().stream_pauses, 1u);
+        EXPECT_FALSE(c->doomed) << "3200 owed is under the cap";
+
+        uring.next_send = Sent::Done; // the client drained
+        t.flush(c);
+        EXPECT_EQ(uring.calls.back(), "resume upstream");
+        EXPECT_FALSE(c->doomed);
+
+        u->read_paused = false;
+        uring.next_send = Sent::Queued;
+        u->rbuf.assign(1200, 'x');
+        t.pump(u);
+        EXPECT_EQ(t.stats().stream_pauses, 2u) << "the next slow stretch pauses again";
+        u->read_paused = true;
+        u->rbuf.assign(3000, 'x'); // read before the pause took effect
+        t.pump(u);
+        EXPECT_TRUE(c->doomed) << "past the cap the stream is dropped, paused or not";
     }
 
     // Where reads cannot be paused, the stream's buffer is capped instead.

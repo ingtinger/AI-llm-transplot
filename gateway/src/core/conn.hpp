@@ -79,6 +79,15 @@ namespace llmbridge
 #endif
             return out;
         }
+        /// Bytes not yet on the wire: plaintext, and ciphertext on TLS.
+        [[nodiscard]] size_t owed() const noexcept
+        {
+#ifdef LLMBRIDGE_HAVE_TLS
+            return out.unsent() + tls_out.unsent();
+#else
+            return out.unsent();
+#endif
+        }
         [[nodiscard]] bool send_inflight() const noexcept
         {
 #ifdef LLMBRIDGE_HAVE_TLS

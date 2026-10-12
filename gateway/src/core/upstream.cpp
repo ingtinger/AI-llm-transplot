@@ -189,7 +189,7 @@ namespace llmbridge::detail
         }
         // A slow client may have paused this upstream's reads, and a pooled connection
         // must be readable or the next response is never seen. The pool's only door.
-        if (_stream_backpressure) _ops->set_read(*u, true);
+        if (_caps.stream_backpressure) _ops->set_read(*u, true);
     }
 
     // One decision and one log text per cause, on both backends.

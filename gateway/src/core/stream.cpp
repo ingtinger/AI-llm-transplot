@@ -96,11 +96,11 @@ namespace llmbridge::detail
         const StreamStep st = stream_step(client, u->rbuf, client->out.stage(), /*at_eof=*/false);
         // Truncate honestly: flush what was translated, with no fabricated [DONE].
         if (st == StreamStep::Corrupt || st == StreamStep::Failed) stream_truncate(client);
-        else if (!_stream_backpressure && client->out.unsent() > kStreamBufCap)
+        else if (_caps.stream_cap && client->owed() > _caps.stream_cap)
         {
-            // Without a pause, this cap is the only bound on a slow client's stream.
+            // The ceiling, paused or not: bytes already read still land after a pause.
             LB_WARN("CAP stream buffer exceeded, dropping the stream ", *client,
-                    " buffered=", client->out.unsent(), " limit=", static_cast<uint64_t>(kStreamBufCap),
+                    " buffered=", client->owed(), " limit=", static_cast<uint64_t>(_caps.stream_cap),
                     " (the client is slower than the provider)");
             return abort_pair(client);
         }
@@ -118,10 +118,10 @@ namespace llmbridge::detail
         if (client->sent_bytes != sent) client->req.f.ts_progress = now_ns();
         if (s == Sent::Failed) return abort_pair(client);
         UpstreamConn* u = client->up;
-        const bool pausable = _stream_backpressure && u && !u->doomed;
+        const bool pausable = _caps.stream_backpressure && u && !u->doomed;
         if (s == Sent::Queued)
         {
-            if (pausable && !u->read_paused)
+            if (pausable && !u->read_paused && client->owed() > _caps.stream_pause_above)
             {
                 _ops->set_read(*u, false);
                 ++_stats.stream_pauses;

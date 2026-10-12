@@ -305,7 +305,7 @@ namespace llmbridge::detail
     void Engine::attach(IoOps* io, const IoCaps& caps) noexcept
     {
         _ops = io;
-        _stream_backpressure = caps.stream_backpressure;
+        _caps = caps;
     }
 
     void Engine::note_build(size_t need) noexcept
