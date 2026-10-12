@@ -146,8 +146,8 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   scrubbed because it can outlive its request; transient buffers are not, because they
   are overwritten within microseconds and doing so would put a `memset` on the hot path.
 - **A slow client can hold memory.** Streaming output is bounded per connection (the
-  upstream read is paused on one backend, the buffer capped at 8 MiB on the other),
-  but that bound is per connection, not global.
+  upstream read is paused on both backends, past 1 MiB owed on io_uring, which also
+  caps the buffer at 8 MiB), but that bound is per connection, not global.
 - **No per-client quota or rate limit.** Connection setup is bounded (30 s to frame a
   first request) and an established client that goes quiet is closed after
   `--client-idle`, three days by default, so a descriptor cannot be held forever. That
