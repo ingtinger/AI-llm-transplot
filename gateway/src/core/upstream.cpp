@@ -270,12 +270,13 @@ namespace llmbridge::detail
         // The venue alone decides whether its connection stays open: a client's own
         // Connection header is never forwarded.
         const bool keep_alive = h.keep_alive;
+        const std::string_view up_head(u->rbuf.data(), h.header_len - 4);
         if (client->req.f.translate_body && h.status != 0 && h.status != 200)
         {
             // A provider failure keeps its status and message: a 429 or 529 translated
             // as a completion would fail and reach the client as a generic 502.
-            append_http_status(client->out.stage(), h.status, reason_for(h.status),
-                               provider::upstream_error_to_openai(body, "upstream_error"));
+            append_relayed_reply(client->out.stage(), h.status, up_head,
+                                 provider::upstream_error_to_openai(body, "upstream_error"), false);
             ++_stats.errors;
         }
         else if (client->req.f.translate_body)
@@ -307,8 +308,7 @@ namespace llmbridge::detail
             // A decoded chunked body is re-framed with Content-Length, keeping the
             // upstream's own status; anything else is relayed verbatim.
             if (h.body == net::http::Body::Chunked)
-                append_http_status(client->out.stage(), h.status ? h.status : 200,
-                                   reason_for(h.status ? h.status : 200), body);
+                append_relayed_reply(client->out.stage(), h.status ? h.status : 200, up_head, body, true);
             else client->out.stage().append(u->rbuf.data(), total_len);
             client->req.f.tok = scan_usage(body); // a byte-forward reports its counts too
         }

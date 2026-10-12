@@ -18,6 +18,7 @@
 // pathological regression can trip.
 
 #include "request.hpp"
+#include "response.hpp"
 
 #include <gtest/gtest.h>
 
@@ -185,6 +186,27 @@ TEST(AuthHeaders, TheBearerSchemeIsCaseInsensitive)
                                      std::string("Authorization: ") + auth + "\r\n", strip, out));
         EXPECT_EQ(out, "anthropic-version: 2023-06-01\r\n") << auth;
     }
+}
+
+// A policy may refuse with any 4xx or 5xx; one the table did not list became a 502.
+TEST(ErrorReply, AnyStatusKeepsItsOwnCode)
+{
+    for (const int code : {405, 409, 422, 451, 500, 501, 599})
+    {
+        std::string out;
+        llmbridge::detail::append_error(out, code, "why");
+        EXPECT_EQ(llmbridge::detail::status_of(out), code) << out;
+        EXPECT_EQ(out.find("Bad Gateway"), std::string::npos) << out;
+        EXPECT_NE(out.find(code < 500 ? "invalid_request_error" : "api_error"), std::string::npos) << out;
+        EXPECT_EQ(out.find("why") != std::string::npos, code < 500) << out;
+    }
+    std::string out;
+    llmbridge::detail::append_error(out, 422);
+    EXPECT_EQ(out.substr(0, out.find("\r\n")), "HTTP/1.1 422 Unprocessable Content");
+    out.clear();
+    llmbridge::detail::append_error(out, 502);
+    EXPECT_EQ(out.substr(0, out.find("\r\n")), "HTTP/1.1 502 Bad Gateway");
+    EXPECT_NE(out.find("upstream_error"), std::string::npos) << out;
 }
 
 #if defined(__has_feature)

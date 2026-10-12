@@ -10,95 +10,49 @@
 #include <string>
 
 #include "gateway/metrics.hpp" // wall_ns
+#include "net/http_write.hpp"
 #include "scan.hpp"
 
 namespace llmbridge::detail
 {
     namespace
     {
-        /// Reason phrase, error type and client-facing message for a status.
-        ///
-        /// Was three ternaries over 400 and 504 with everything else falling through
-        /// to 502. Fine while those were the only codes in the tree, wrong once a
-        /// policy could pick one: a 401 went out as "bad gateway: upstream failure",
-        /// blaming the provider for our own refusal.
-        ///
-        /// The message is generic per status and never names the rule that refused.
-        /// The client gets the status; the reason goes to the log.
+        /// Error type and client-facing message for a status. Generic per status, never
+        /// the rule that refused: the client gets the status, the reason goes to the log.
+        /// Any other 4xx or 5xx keeps its own code, typed by its class.
         struct ErrorShape
         {
-            const char* line;
+            int code;
             const char* type;
             const char* msg;
         };
+        constexpr ErrorShape kErrorShapes[] = {
+            {400, "invalid_request_error", "malformed request"},
+            {401, "authentication_error", "unauthorized"},
+            {402, "billing_error", "payment required"},
+            {403, "permission_error", "forbidden"},
+            {404, "invalid_request_error", "not found"},
+            {413, "invalid_request_error", "request too large"},
+            {415, "invalid_request_error", "compressed request body is not supported"},
+            {429, "rate_limit_error", "rate limit exceeded"},
+            {500, "api_error", "internal error"},
+            {502, "upstream_error", "bad gateway: upstream failure"},
+            {503, "service_error", "service unavailable"},
+            {504, "timeout_error", "upstream timed out"},
+        };
 
-        ErrorShape error_shape(int code)
+        ErrorShape error_shape(int code) noexcept
         {
-            switch (code)
-            {
-                case 400: return {"HTTP/1.1 400 Bad Request", "invalid_request_error", "malformed request"};
-                case 401: return {"HTTP/1.1 401 Unauthorized", "authentication_error", "unauthorized"};
-                case 402: return {"HTTP/1.1 402 Payment Required", "billing_error", "payment required"};
-                case 403: return {"HTTP/1.1 403 Forbidden", "permission_error", "forbidden"};
-                case 404: return {"HTTP/1.1 404 Not Found", "invalid_request_error", "not found"};
-                case 413: return {"HTTP/1.1 413 Content Too Large", "invalid_request_error", "request too large"};
-                case 415: return {"HTTP/1.1 415 Unsupported Media Type", "invalid_request_error", "compressed request body is not supported"};
-                case 429: return {"HTTP/1.1 429 Too Many Requests", "rate_limit_error", "rate limit exceeded"};
-                case 500: return {"HTTP/1.1 500 Internal Server Error", "api_error", "internal error"};
-                case 503: return {"HTTP/1.1 503 Service Unavailable", "service_error", "service unavailable"};
-                case 504: return {"HTTP/1.1 504 Gateway Timeout", "timeout_error", "upstream timed out"};
-                // Anything unlisted keeps the historical fallback, a policy's status
-                // included: the seam checks only that it is 400-599, so a code a
-                // policy refuses with belongs above or it goes out as a 502.
-                default: return {"HTTP/1.1 502 Bad Gateway", "upstream_error", "bad gateway: upstream failure"};
-            }
+            for (const ErrorShape& s : kErrorShapes)
+                if (s.code == code) return s;
+            if (code < 500) return {code, "invalid_request_error", "request refused"};
+            return {code, "api_error", "server error"};
         }
-
     } // namespace
 
-    // ── Timing headers (opt-in: --timing-headers) ───────────────────────
-    //
-    // Per-request timing headers. LATENCY.md §3 is normative; keep the two in
-    // step. Stamps are monotonic and use the t0..t6 scheme defined in
-    // gateway.hpp and LATENCY.md §2; only t0 is also emitted as wall time, and
-    // that one is anchored so it can never step backward.
-    //
-    //   t0 ──► t1 ──► t2 ──► t3 ───────────► t4 ──► t5 ──► t6
-    //   client  req    wire   handed to       provider  resp   fully
-    //   framed  built  ready  the kernel      received  built  flushed
-    //
-    //   x-llmbridge-t0            wall-clock epoch nanoseconds at t0. The one
-    //                             absolute value: what orders two requests
-    //                             against each other, which is why it is here
-    //                             at all. Strictly increasing within a process.
-    //   x-llmbridge-gateway-us    (t1-t0) + (t5-t4); Our compute, and nothing
-    //                             else: framing, translation, auth mapping,
-    //                             re-serialisation. It ends at t5 because the
-    //                             number travels inside the response and so
-    //                             cannot include the cost of sending itself.
-    //   x-llmbridge-connect-us    (t2-t1): the handshake alone, ~50-80 ms cold,
-    //                             exactly 0 on a pooled connection. Same span as
-    //                             the connect(TLS) histogram, same function.
-    //   x-llmbridge-upwrite-us    (t3-t2): the write() into the socket buffer.
-    //                             Split out of connect-us because folding them
-    //                             gave one name two meanings across the two
-    //                             reporting surfaces. t2 was already stamped for
-    //                             the histogram, so this cost a header line and
-    //                             no extra clock reads.
-    //   x-llmbridge-upstream-us   (t4-t3): the provider, network + inference.
-    //
-    // Why connect is split out instead of folded into gateway-us: measured
-    // against the live API, a cold connection put 56 ms of TCP+TLS setup inside
-    // the "gateway" figure while the same gateway needed 47-63 us once pooled.
-    // A customer reading 56 ms as our overhead would be right to walk away, and
-    // wrong about the software. One number cannot honestly carry both.
-    //
-    // Streaming cannot report t4 (headers precede the body), so it emits t0 and
-    // x-llmbridge-upstream-ttfb-us instead: time to the provider's first byte.
-    //
-    // Metadata only, by construction: durations and one timestamp. No prompt,
-    // no completion, no token text. "Prompt content is never logged" is a
-    // public commitment and this path must never be the thing that breaks it.
+    // The opt-in timing headers (--timing-headers). LATENCY.md section 3 is normative:
+    // what each one spans, why connect is apart from the gateway's compute, and why a
+    // stream reports ttfb instead of t4. Durations and one timestamp, never content.
     void append_timing_headers(std::string& out, int64_t t0, int64_t gateway_us,
                                int64_t connect_us, int64_t upwrite_us,
                                int64_t upstream_us, const char* upstream_key, uint64_t seq,
@@ -114,24 +68,15 @@ namespace llmbridge::detail
         add("x-llmbridge-t0", wall_ns(t0));
         add("x-llmbridge-seq", static_cast<int64_t>(seq));
         add("x-llmbridge-gateway-us", gateway_us);
-        // connect-us is now exactly the connect(TLS) histogram's span (t2-t1):
-        // handshake only, and therefore exactly 0 on a pooled connection. The
-        // upstream write it used to absorb has its own header below. One name,
-        // one meaning, on both surfaces -- see timing_split().
-        add("x-llmbridge-connect-us", connect_us);
+        add("x-llmbridge-connect-us", connect_us); // the connect(TLS) histogram's span
         add("x-llmbridge-upwrite-us", upwrite_us);
-        // Outside `added` on purpose: it is the client's own upload, measured from
-        // the first byte this gateway saw to the last. Not the time since the
-        // client pressed send, which needs two clocks that agree.
+        // The client's own upload, first byte to last; not part of `added`.
         add("x-llmbridge-client-upload-us", client_upload_us);
         add(upstream_key, upstream_us);
     }
 
-    // Token counts, non-streaming only. A stream cannot carry these: headers
-    // precede the body, and both the token totals and the chunk count are
-    // end-of-stream facts. They are not invented for streams. A streaming client
-    // that wants them sets `stream_options.include_usage` and reads the provider's
-    // own counts from the final chunk.
+    // Token counts, non-streaming only: a stream's counts are end-of-stream facts, and
+    // a streaming client reads them from the final chunk (`include_usage`).
     void append_usage_headers(std::string& out, const BodyUsage& u)
     {
         if (u.in >= 0)
@@ -148,92 +93,35 @@ namespace llmbridge::detail
         }
     }
 
-    // `detail` is shown to the client only for a 4xx, where the cause is the
-    // caller's own request and naming it is the difference between reading the
-    // README and filing a bug. A 5xx is ours or the provider's, and its reason
-    // stays in the log: a client has no use for our internals and an attacker
-    // has several.
-    //
-    // Every detail passed here is a literal in this tree or a policy message that
+    // `detail` is shown only for a 4xx, the caller's own mistake; a 5xx's reason stays
+    // in the log. Every detail is a literal in this tree or a policy message that
     // passed deny_message_ok, so nothing client-supplied is echoed back.
     void append_error(std::string& out, int code, const char* detail)
     {
-        const auto [line, type, msg] = error_shape(code);
+        const ErrorShape s = error_shape(code);
         std::string body;
-        provider::openai::write_error(body, (detail && code < 500) ? detail : msg, type);
+        provider::openai::write_error(body, (detail && code < 500) ? detail : s.msg, s.type);
         out.reserve(out.size() + body.size() + 128);
-        out.append(line);
-        out.append("\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
-        out.append(std::to_string(body.size()));
-        out.append("\r\n\r\n");
-        out.append(body);
-    }
-
-    // Same head with a timing block spliced in before the terminating CRLF.
-    // A stream cannot report total gateway time in a header (headers precede
-    // the body), so it reports what is known at this point: t0, the request-path
-    // cost, and time to the provider's first byte.
-    ///
-    /// Takes the base head, never assuming one.
-    void append_sse_head(std::string& out, std::string_view extra, std::string_view base)
-    {
-        out.append(base.substr(0, base.size() - 2)); // drop final CRLF
-        out.append(extra);
+        net::http::append_status_line(out, code);
+        out.append("Content-Type: application/json\r\nConnection: close\r\n");
+        net::http::append_content_length(out, body.size());
         out.append("\r\n");
-    }
-
-    // Build a response that preserves the upstream status code. Used to relay a
-    // provider's own failure (429 rate limit, 529 overloaded, 400 context
-    // length, 401 auth) to the client instead of flattening it to a gateway
-    // 502. The client needs the real code to decide whether to back off/retry.
-    void append_http_status(std::string& out, int status, std::string_view reason,
-                            std::string_view body)
-    {
-        out.append("HTTP/1.1 ");
-        out.append(std::to_string(status));
-        out.append(" ");
-        out.append(reason);
-        out.append("\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
-        out.append(std::to_string(body.size()));
-        out.append("\r\n\r\n");
         out.append(body);
     }
 
-    // A short reason phrase for the codes providers actually return.
-    //
-    // The default classifies, and must never call a success an error: this table
-    // held only failures, so a 200 took the `< 500` branch and every successful
-    // passthrough went out as "200 Client Error" from v0.27.0, when keeping the
-    // provider's status first brought a 2xx here.
-    const char* reason_for(int status)
+    // A provider's own failure (429, 529, a 400 for context length) keeps its status,
+    // so a client can decide to back off, and the headers that say how long.
+    void append_relayed_reply(std::string& out, int status, std::string_view upstream_head,
+                              std::string_view body, bool own_body)
     {
-        switch (status)
-        {
-            case 200: return "OK";
-            case 201: return "Created";
-            case 202: return "Accepted";
-            case 204: return "No Content";
-            case 206: return "Partial Content";
-            case 304: return "Not Modified";
-            case 400: return "Bad Request";
-            case 401: return "Unauthorized";
-            case 403: return "Forbidden";
-            case 404: return "Not Found";
-            case 408: return "Request Timeout";
-            case 413: return "Payload Too Large";
-            case 415: return "Unsupported Media Type";
-            case 429: return "Too Many Requests";
-            case 500: return "Internal Server Error";
-            case 502: return "Bad Gateway";
-            case 503: return "Service Unavailable";
-            case 504: return "Gateway Timeout";
-            case 529: return "Overloaded";
-            default:
-                if (status < 200) return "Informational";
-                if (status < 300) return "OK";
-                if (status < 400) return "Redirection";
-                return status < 500 ? "Client Error" : "Server Error";
-        }
+        net::http::append_status_line(out, status);
+        if (!own_body) out.append("Content-Type: application/json\r\n");
+        if (!net::http::append_relayed(out, upstream_head, own_body) && own_body)
+            out.append("Content-Type: application/json\r\n");
+        out.append("Connection: keep-alive\r\n");
+        net::http::append_content_length(out, body.size());
+        out.append("\r\n");
+        out.append(body);
     }
 
 } // namespace llmbridge::detail

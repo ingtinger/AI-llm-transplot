@@ -10733,7 +10733,118 @@ TEST_P(ProxyRoute, ThePoolCapCountsConnectionsNotVenues)
     c.stop();
 }
 
-// ── What a forwarded request drops ─────────────
+// ── What a relayed response keeps, and what a forwarded request drops ─────────────
+
+class ProxyRelay : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+  protected:
+    static std::string header_of(const std::string& r, std::string_view name)
+    {
+        const size_t end = r.find("\r\n\r\n");
+        return std::string(llmbridge::net::http::find_header(std::string_view(r).substr(0, end), name));
+    }
+};
+
+// A provider's 429 is relayed with its status, but the headers that say when to come
+// back were dropped: a translated error kept only Content-Type, Connection and
+// Content-Length. Retry-After, the rate-limit counts and the venue's request id cross
+// now, and nothing else does.
+TEST_P(ProxyRelay, ATranslatedProviderErrorKeepsItsRetryHeaders)
+{
+    _backend.set_response("HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
+                          "retry-after: 7\r\nanthropic-ratelimit-requests-remaining: 0\r\n"
+                          "anthropic-ratelimit-tokens-reset: 2026-10-11T00:00:00Z\r\n"
+                          "request-id: req_ABC123\r\nx-internal-route: pod-7\r\n"
+                          "Content-Length: 74\r\n\r\n"
+                          R"({"type":"error","error":{"type":"rate_limit_error","message":"slow down"}})");
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    const std::string r = c.recv_response();
+    ASSERT_EQ(Client::status_of(r), 429) << r;
+    EXPECT_EQ(header_of(r, "retry-after"), "7") << r;
+    EXPECT_EQ(header_of(r, "anthropic-ratelimit-requests-remaining"), "0") << r;
+    EXPECT_EQ(header_of(r, "anthropic-ratelimit-tokens-reset"), "2026-10-11T00:00:00Z") << r;
+    EXPECT_EQ(header_of(r, "request-id"), "req_ABC123") << r;
+    EXPECT_EQ(header_of(r, "x-internal-route"), "") << "only the allowlist crosses: " << r;
+    EXPECT_EQ(header_of(r, "content-type"), "application/json") << r;
+    EXPECT_NE(body_of(r).find("slow down"), std::string::npos) << r;
+}
+
+// The same for a byte-forwarded chunked reply, re-framed with Content-Length: it lost
+// every upstream header and was labelled application/json whatever it was.
+TEST_P(ProxyRelay, AChunkedPassthroughKeepsItsHeadersAndItsType)
+{
+    _backend.set_response("HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                          "Retry-After: 7\r\nx-ratelimit-remaining-requests: 0\r\n"
+                          "x-request-id: req_XYZ\r\nX-Internal-Route: pod-7\r\n"
+                          "Content-Length: 9\r\n\r\nslow down");
+    _backend.set_chunked_response(3);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response();
+    ASSERT_EQ(Client::status_of(r), 429) << r;
+    EXPECT_EQ(header_of(r, "Retry-After"), "7") << r;
+    EXPECT_EQ(header_of(r, "x-ratelimit-remaining-requests"), "0") << r;
+    EXPECT_EQ(header_of(r, "x-request-id"), "req_XYZ") << r;
+    EXPECT_EQ(header_of(r, "X-Internal-Route"), "") << r;
+    EXPECT_EQ(header_of(r, "Content-Type"), "text/plain; charset=utf-8") << r;
+    EXPECT_EQ(r.find("Transfer-Encoding"), std::string::npos) << r;
+    EXPECT_EQ(body_of(r), "slow down") << r;
+}
+
+// A stream's head is ours too, and it carries the venue's request id.
+TEST_P(ProxyRelay, AStreamHeadCarriesTheVenuesRequestId)
+{
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "x-request-id: req_STREAM\r\nX-Internal-Route: pod-7\r\n"
+                          "Transfer-Encoding: chunked\r\n\r\n"
+                          "1d\r\ndata: {\"x\":1}\n\ndata: [DONE]\n\n\r\n0\r\n\r\n");
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"m","stream":true})")));
+    const std::string r = c.recv_stream();
+    ASSERT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_EQ(header_of(r, "x-request-id"), "req_STREAM") << r;
+    EXPECT_EQ(header_of(r, "X-Internal-Route"), "") << r;
+    EXPECT_NE(r.find("data: [DONE]"), std::string::npos) << r;
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyRelay,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));
+
+// A policy may refuse with any 4xx or 5xx, but a code the error table did not list
+// went out as "502 Bad Gateway", with a 4xx's own message under it.
+TEST_P(ProxyPolicy, ADenyKeepsAnyStatusItNames)
+{
+    static constexpr int kStatuses[] = {405, 409, 422, 451, 500, 599};
+    class StatusPolicy final : public llmbridge::Policy
+    {
+      public:
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            const size_t i = _calls.fetch_add(1) % std::size(kStatuses);
+            return {.allow = false, .deny_status = kStatuses[i], .reason = "scripted refusal",
+                    .message = "no thanks"};
+        }
+
+      private:
+        std::atomic<size_t> _calls{0};
+    } pol;
+    const auto replies = refuse_each(pol, std::size(kStatuses));
+    ASSERT_EQ(replies.size(), std::size(kStatuses));
+    for (size_t i = 0; i < replies.size(); ++i)
+    {
+        EXPECT_EQ(Client::status_of(replies[i]), kStatuses[i]) << replies[i];
+        // A 4xx shows the policy's message; a 5xx never does.
+        EXPECT_EQ(replies[i].find("no thanks") != std::string::npos, kStatuses[i] < 500) << replies[i];
+    }
+    EXPECT_EQ(replies[2].substr(0, replies[2].find("\r\n")), "HTTP/1.1 422 Unprocessable Content");
+}
 
 class ProxyHop : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
 
