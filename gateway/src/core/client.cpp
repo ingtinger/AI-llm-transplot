@@ -164,6 +164,10 @@ namespace llmbridge::detail
             // would route to whatever model the prefix names.
             if (!c->req.f.model_override.set(d.model) || !c->req.f.tier_override.set(d.service_tier))
                 return error_respond(c, 500, "policy override longer than the gateway holds");
+            // A name outside the family would be echoed by a byte-forward: refused, never guessed.
+            if (!d.credential_header.empty() && !key_header_ok(d.credential_header))
+                return error_respond(c, 400, kWhyKeyUnusable, refuse::kKeyHeaderUnusable);
+            c->req.f.key_header.set(d.credential_header);
         }
         dispatch(c);
     }
@@ -199,6 +203,12 @@ namespace llmbridge::detail
             c->req.f.translate_body = plan.translate;
             c->req.f.effective_dialect = plan.venue;
         }
+        // A key the policy named is this venue's only credential, or nothing is sent.
+        NamedKey key;
+        if (!c->req.f.key_header.empty())
+            if (const Refusal r = named_key(std::string_view(c->rbuf.data(), c->msg.header_len), c->req.f.head,
+                                            c->req.f.key_header.view(), up.dialect, key))
+                return error_respond(c, 400, r.why, r.detail);
         // Built before an upstream is acquired, so a bad body cannot leak a pooled one.
         note_build(c->msg.total_len);
         const std::string_view body = body_so_far(c);
@@ -208,7 +218,7 @@ namespace llmbridge::detail
             const char* why = "";
             if (!build_translated_request(up, c->req.f.effective_dialect, body, head, c->req.f.head,
                                           _rebuild, _xlate, why, c->req.f.model_override.view(),
-                                          &c->req.f.wants_usage))
+                                          &c->req.f.wants_usage, key))
             {
                 // A credential is never echoed: it would land in a JSON body unescaped.
                 if (why[0] == 't') return error_respond(c, 400, "translate", translate_failure(body));
@@ -244,7 +254,7 @@ namespace llmbridge::detail
             if (const char* bad = build_forward(std::string_view(c->rbuf.data(), c->msg.header_len),
                                                 c->msg.header_len, c->req.f.head, _strip_headers,
                                                 up.host_hdr, up.base_path, fwd, _rebuild,
-                                                rewritten.empty() ? c->msg.body_len : rewritten.size()))
+                                                rewritten.empty() ? c->msg.body_len : rewritten.size(), key))
                 return error_respond(c, 400, bad);
         }
 

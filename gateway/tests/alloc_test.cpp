@@ -234,6 +234,28 @@ namespace
                std::to_string(body.size()) + "\r\n\r\n" + std::string(body);
     }
 
+    // The same request carrying a key in the family a policy names from.
+    std::string post_keyed(std::string_view body)
+    {
+        return "POST /v1/chat/completions HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer sk-test\r\n"
+               "x-kottos-key-alloc: sk-named\r\nContent-Type: application/json\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + std::string(body);
+    }
+
+    // Venue 0, naming `header` (empty: none), so a row can run the same policy both ways.
+    class KeyPolicy final : public llmbridge::Policy
+    {
+    public:
+        explicit KeyPolicy(std::string_view header) : _header(header) {}
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = 0, .credential_header = _header};
+        }
+
+    private:
+        std::string_view _header;
+    };
+
     std::string reply(std::string_view content_type, std::string_view body)
     {
         return "HTTP/1.1 200 OK\r\nContent-Type: " + std::string(content_type) +
@@ -276,10 +298,11 @@ namespace
     // lets every reused buffer reach its steady-state capacity.
     double allocs_per_request(IoBackend io, UpstreamDialect dialect, std::string upstream_reply,
                               const std::string& request, int warm = 20, int measured = 50,
-                              size_t retain = 0)
+                              size_t retain = 0, llmbridge::Policy* policy = nullptr)
     {
         Upstream up(std::move(upstream_reply));
-        Gateway gw(0, "127.0.0.1", up.port(), 0, dialect, io);
+        Gateway gw(0, "127.0.0.1", up.port(), 0, dialect, io, Gateway::kDefaultUpstreamIdleNs,
+                   llmbridge::TlsConfig{}, false, policy);
         if (retain) gw.set_retain_bytes(retain);
         std::thread loop([&] { t_counted = true; gw.run(); });
         double per = -1;
@@ -322,7 +345,8 @@ namespace
 
     struct Ceiling
     {
-        double passthrough, translated, stream_20, per_delta, large_translated;
+        double passthrough, translated, stream_20, per_delta, large_translated, named_passthrough,
+            named_translated;
     };
 
     // Measured 2026-10-10 at v0.74.0 (GCC 13 Release and ASan Debug agree), after the
@@ -331,12 +355,13 @@ namespace
     // v0.78.0 writes the Anthropic request front to back, without a prefix string:
     // 3 -> 2 on both translated rows. v0.88.0 writes requests and relayed heads straight
     // into kept buffers: every row 0. v0.90.0 adds the 10 MB row: 0 with 16 MiB kept,
-    // 5 at the default 4.
+    // 5 at the default 4. v0.93.0 adds a policy naming a key header, byte-forwarded and
+    // translated: 0, as with the policy naming none.
     // Lower these when a change removes allocations; never raise them without a
     // reason in the commit message. io_uring's per-delta figure can read 0.02, not 0:
     // its 4 KiB receive buffers split the stream at different points.
-    constexpr Ceiling kEpoll{0, 0, 0, 0.03, 0};
-    constexpr Ceiling kUring{0, 0, 0, 0.03, 0};
+    constexpr Ceiling kEpoll{0, 0, 0, 0.03, 0, 0, 0};
+    constexpr Ceiling kUring{0, 0, 0, 0.03, 0, 0, 0};
 
     class AllocCeiling : public ::testing::TestWithParam<IoBackend>
     {
@@ -387,6 +412,34 @@ namespace
                                             size_t{16} << 20);
         std::printf("10 MB translated, retain 16: %.2f allocations per request\n", n);
         EXPECT_LE(n, ceiling().large_translated);
+    }
+
+    // A named key costs nothing on top of the policy: the name, the spans the walk keeps
+    // and the venue's key line all sit in fixed storage or the request being built.
+    TEST_P(AllocCeiling, NamedKeyPassthrough)
+    {
+        KeyPolicy none(""), named("x-kottos-key-alloc");
+        const std::string req = post_keyed(kChat);
+        const double base = allocs_per_request(GetParam(), UpstreamDialect::OpenAI,
+                                               reply("application/json", kOpenAiReply), req, 20, 50, 0, &none);
+        const double n = allocs_per_request(GetParam(), UpstreamDialect::OpenAI,
+                                            reply("application/json", kOpenAiReply), req, 20, 50, 0, &named);
+        std::printf("named key, byte-forward: %.2f allocations per request (%.2f naming none)\n", n, base);
+        EXPECT_LE(n, base);
+        EXPECT_LE(n, ceiling().named_passthrough);
+    }
+
+    TEST_P(AllocCeiling, NamedKeyTranslated)
+    {
+        KeyPolicy none(""), named("x-kottos-key-alloc");
+        const std::string req = post_keyed(kChat);
+        const double base = allocs_per_request(GetParam(), UpstreamDialect::Anthropic,
+                                               reply("application/json", kAnthropicReply), req, 20, 50, 0, &none);
+        const double n = allocs_per_request(GetParam(), UpstreamDialect::Anthropic,
+                                            reply("application/json", kAnthropicReply), req, 20, 50, 0, &named);
+        std::printf("named key, translated: %.2f allocations per request (%.2f naming none)\n", n, base);
+        EXPECT_LE(n, base);
+        EXPECT_LE(n, ceiling().named_translated);
     }
 
     INSTANTIATE_TEST_SUITE_P(Backends, AllocCeiling, ::testing::Values(IoBackend::Epoll, IoBackend::Uring),

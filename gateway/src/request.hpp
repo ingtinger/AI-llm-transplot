@@ -77,6 +77,29 @@ namespace llmbridge::detail
         bool operator()(const net::http::HeaderLine& h) noexcept;
     };
 
+    /// A key a policy named, as its venue takes it: the line up to the key, and the key.
+    struct NamedKey
+    {
+        std::string_view line, value;
+        [[nodiscard]] bool empty() const noexcept { return line.empty(); }
+    };
+    /// A refused request: the reason logged, and the client's text (null for the generic).
+    struct Refusal
+    {
+        const char* why = nullptr;
+        const char* detail = nullptr;
+        explicit operator bool() const noexcept { return why != nullptr; }
+    };
+    inline constexpr const char* kWhyKeyMissing = "credential header missing";
+    inline constexpr const char* kWhyKeyRepeated = "credential header repeated";
+    inline constexpr const char* kWhyKeyUnusable = "credential header unusable";
+    inline constexpr const char* kWhyKeyTooMany = "too many credential headers";
+    /// The key in the family header `name` (key_header_ok) as `venue` takes it, from the
+    /// framing walk's facts alone. Refused for a venue that signs, past the walk's table,
+    /// repeated in any case, absent or empty, or unsafe; nothing else stands in.
+    [[nodiscard]] Refusal named_key(std::string_view head, const HeadFacts& f, std::string_view name,
+                                    UpstreamDialect venue, NamedKey& out) noexcept;
+
     /// The client's dialect from the request line of `head`: client_wire on its method
     /// and full target.
     [[nodiscard]] Dialect client_dialect_of(std::string_view head) noexcept;
@@ -95,29 +118,35 @@ namespace llmbridge::detail
                             std::string_view host, std::string_view extra, std::string& into);
     /// The byte-forwarded request into `into`, capacity kept: `msg`'s head, then `body`,
     /// all or the first part of one `declared` bytes long. Null, or why to refuse it,
-    /// with `into` empty.
+    /// with `into` empty. A named `key` replaces every credential header the client sent.
     const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
                               const std::vector<std::string>& strip, std::string_view host_hdr,
                               std::string_view base_path, std::string_view body,
-                              std::string& into, size_t declared);
-    /// build_forward over a message whose facts are read here; false refuses it.
+                              std::string& into, size_t declared, const NamedKey& key = {});
+    /// build_forward over a message whose facts are read here, with the key in family
+    /// header `key_header` sent as `venue` takes it; false refuses it, why in `refused`.
     bool request_without(std::string_view msg, size_t header_len,
                          const std::vector<std::string>& strip,
                          std::string_view host_hdr, std::string_view base_path,
-                         std::string_view body_override, std::string& into);
+                         std::string_view body_override, std::string& into,
+                         std::string_view key_header = {},
+                         UpstreamDialect venue = UpstreamDialect::OpenAI, Refusal* refused = nullptr);
     /// `out` receives the framed request and `body_scratch` the translated body; both
     /// keep their capacity. `head` is the client's, `f` its facts. On false, `why` is
-    /// "translate", "credential", "bedrock credential" or "no credential".
+    /// "translate", "credential", "bedrock credential" or "no credential". A named `key`
+    /// is the only credential sent.
     bool build_translated_request(const Upstream& up, UpstreamDialect mode,
                                   std::string_view body, std::string_view head,
                                   const HeadFacts& f, std::string& out,
                                   std::string& body_scratch, const char*& why,
                                   std::string_view model_override = {},
-                                  bool* wants_stream_usage = nullptr);
-    /// The credential lines a translated request carries, from one header block. A test
-    /// seam over the facts the framing walk reads.
+                                  bool* wants_stream_usage = nullptr, const NamedKey& key = {});
+    /// The credential lines a translated request carries, from one header block, the key
+    /// in family header `key_header` when one is named. A test seam over the facts the
+    /// framing walk reads.
     bool auth_headers_for(UpstreamDialect mode, std::string_view client_headers,
-                          const std::vector<std::string>& strip, std::string& out);
+                          const std::vector<std::string>& strip, std::string& out,
+                          std::string_view key_header = {}, Refusal* refused = nullptr);
     bool xlate_resp(UpstreamDialect mode, std::string_view body, std::string& out,
                     provider::openai::Usage& u);
     std::string host_header_for(const Upstream& u);
