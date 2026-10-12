@@ -8,6 +8,28 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.94.1]. 2026-10-12
+
+### Tests
+
+- `ProxyBodyStream.OnAndOffReadTheSameUpload` failed about one run in a hundred under a
+  loaded ThreadSanitizer build, on both backends. It compared the streamed run's upload
+  with the held run's, and held the wait before the first byte to a fixed 75 ms, but
+  both are the test client's: its paced sleeps wake late, so two runs upload for
+  different times. `send_slowly` now records when the client connected and when its
+  first and last parts went, and each run's gateway stamps are checked against its own
+  sends: the first byte and the last stamped after the client began the send that
+  carried each and soon after it ended, and the wait before the first byte no longer
+  than the client's own from its connect to its first send. The held record's
+  equivalences, the upload's floor and our part's bound are unchanged.
+- The provider's wait in that test and the first-token time in
+  `ProxyBodyStream.OnAndOffReadTheSameFirstToken` are bounded for the streamed body
+  only, by half of the run's own upload instead of a fixed 75 ms: counted from the
+  first byte instead of the last, either would hold the whole upload. For the held body
+  both are the mock venue reading a MiB at its own pace, which a loaded machine
+  stretched past 75 ms and once past the upload; its last byte is t3, as checked.
+
+
 ## [0.94.0]. 2026-10-12
 
 ### Security
@@ -65,8 +87,9 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   would stream was dispatched anyway: the venue was paired with a client freed at the
   end of the event batch (a use-after-free once the venue's connection was written to
   again), and the body took a `--stream-body-max` slot that was never given back.
-  `try_frame` now stops when the interim line closed the client. io_uring was not
-  affected: its send completes later, and the reset closes both legs.
+  `try_frame` now stops when the interim line closed the client. io_uring met it only
+  with its submission queue full, where the send tears the client down at once; its
+  send otherwise completes later, and the reset closes both legs.
 
 ### Added
 
