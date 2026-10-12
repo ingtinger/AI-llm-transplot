@@ -6085,6 +6085,271 @@ TEST_P(ProxyRoute, APolicyThatNeverTagsSeesZeroAtTheFailure)
     good.stop();
 }
 
+// ── Anthropic request options: fast mode and US-only inference ───────────────
+// Fast mode is a body field plus a beta header; US-only inference a body field alone.
+// The fields splice as service_tier does; the beta token goes only to a venue taking an
+// x-api-key, merged into the client's own anthropic-beta line, and a failover's venue
+// gets its own listing's options or none.
+namespace
+{
+    class AnthropicOptionsPolicy final : public llmbridge::Policy
+    {
+      public:
+        int first = 0;
+        std::string_view speed{"fast"}, geo{"us"}, beta{"fast-mode-2026-02-01"};
+        llmbridge::Retry retry{};
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            llmbridge::Decision d;
+            d.allow = true;
+            d.upstream_index = first;
+            d.speed = speed;
+            d.inference_geo = geo;
+            d.anthropic_beta = beta;
+            return d;
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            return f.attempt == 0 ? retry : llmbridge::Retry{};
+        }
+    };
+
+    std::string anthropic_request_with(const std::string& extra)
+    {
+        const std::string body = R"({"model":"claude-opus-5-5","max_tokens":8,"messages":[]})";
+        return "POST /v1/messages HTTP/1.1\r\nHost: x\r\n" + extra + "Content-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+
+    /// The request's head, lower-cased, so a header is found in any case.
+    std::string lower_head(const std::string& req)
+    {
+        std::string h = req.substr(0, req.find("\r\n\r\n") + 2);
+        for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return h;
+    }
+
+    size_t count_of(const std::string& hay, std::string_view needle)
+    {
+        size_t n = 0;
+        for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) ++n;
+        return n;
+    }
+} // namespace
+
+TEST_P(ProxyRoute, FastModeAndUsOnlyReachAnAnthropicVenue)
+{
+    NamedBackend b;
+    b.start("alpha");
+    AnthropicOptionsPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(anthropic_request_with("x-api-key: k\r\n")));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string up = b.last();
+    b.stop();
+    EXPECT_NE(up.find(R"("speed":"fast")"), std::string::npos) << up;
+    EXPECT_NE(up.find(R"("inference_geo":"us")"), std::string::npos) << up;
+    EXPECT_NE(up.find(R"("model":"claude-opus-5-5")"), std::string::npos) << up;
+    EXPECT_NE(up.find("\r\nanthropic-beta: fast-mode-2026-02-01\r\n"), std::string::npos) << up;
+    EXPECT_EQ(count_of(lower_head(up), "anthropic-beta:"), 1u) << up;
+}
+
+TEST_P(ProxyRoute, ATokenTheClientAlreadySentIsNotAddedTwice)
+{
+    NamedBackend b;
+    b.start("alpha");
+    AnthropicOptionsPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(anthropic_request_with("anthropic-beta: a-1, fast-mode-2026-02-01\r\nx-api-key: k\r\n")));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string up = b.last();
+    b.stop();
+    EXPECT_NE(up.find("anthropic-beta: a-1, fast-mode-2026-02-01\r\n"), std::string::npos) << up;
+    EXPECT_EQ(count_of(lower_head(up), "fast-mode-2026-02-01"), 1u) << up;
+    EXPECT_EQ(count_of(lower_head(up), "anthropic-beta:"), 1u) << up;
+}
+
+TEST_P(ProxyRoute, TheBetaTokenMergesWithTheClientsValueInOneLine)
+{
+    NamedBackend b;
+    b.start("alpha");
+    AnthropicOptionsPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(anthropic_request_with("Anthropic-Beta: prompt-caching-2024-07-31 \r\nx-api-key: k\r\n")));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string up = b.last();
+    b.stop();
+    EXPECT_NE(up.find("\r\nanthropic-beta: prompt-caching-2024-07-31,fast-mode-2026-02-01\r\n"), std::string::npos)
+        << up;
+    EXPECT_EQ(count_of(lower_head(up), "anthropic-beta:"), 1u) << up;
+}
+
+TEST_P(ProxyRoute, ANonAnthropicVenueGetsNoBetaLine)
+{
+    NamedBackend b;
+    b.start("alpha");
+    AnthropicOptionsPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"m","messages":[]})")));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string up = b.last();
+    b.stop();
+    EXPECT_EQ(lower_head(up).find("anthropic-beta"), std::string::npos) << up;
+}
+
+// A translated request carries no client header it was not built from: the token alone.
+TEST_P(ProxyRoute, ATranslatedRequestCarriesTheTokenAlone)
+{
+    NamedBackend b;
+    b.start("alpha");
+    AnthropicOptionsPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+    const std::string body = R"({"model":"claude-opus-5-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})";
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer k\r\n"
+                       "anthropic-beta: client-own-1\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    const std::string up = b.last();
+    b.stop();
+    ASSERT_NE(up.find("POST /v1/messages"), std::string::npos) << up;
+    EXPECT_NE(up.find("\r\nanthropic-beta: fast-mode-2026-02-01\r\n"), std::string::npos) << up;
+    EXPECT_EQ(up.find("client-own-1"), std::string::npos) << up;
+}
+
+TEST_P(ProxyRoute, AFailoverToAListingWithoutOptionsSendsNone)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const DeadPort dead;
+    AnthropicOptionsPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1};
+    start({{"127.0.0.1", dead.port(), false, "", UpstreamDialect::Anthropic, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(anthropic_request_with("x-api-key: k\r\n")));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string up = good.last();
+    good.stop();
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(up.find("\"speed\""), std::string::npos) << up;
+    EXPECT_EQ(up.find("\"inference_geo\""), std::string::npos) << up;
+    EXPECT_EQ(lower_head(up).find("anthropic-beta"), std::string::npos) << up;
+}
+
+TEST_P(ProxyRoute, AFailoverCarriesItsOwnListingsOptions)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const DeadPort dead;
+    AnthropicOptionsPolicy pol;
+    pol.speed = "standard";
+    pol.retry = {.retry = true, .upstream_index = 1, .speed = "fast", .inference_geo = "global",
+                 .anthropic_beta = "fast-mode-2026-02-01"};
+    start({{"127.0.0.1", dead.port(), false, "", UpstreamDialect::Anthropic, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(anthropic_request_with("x-api-key: k\r\n")));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string up = good.last();
+    good.stop();
+    EXPECT_NE(up.find(R"("speed":"fast")"), std::string::npos) << up;
+    EXPECT_NE(up.find(R"("inference_geo":"global")"), std::string::npos) << up;
+    EXPECT_EQ(up.find("standard"), std::string::npos) << up;
+    EXPECT_NE(up.find("\r\nanthropic-beta: fast-mode-2026-02-01\r\n"), std::string::npos) << up;
+}
+
+// Fail closed: a client beta value that cannot be re-emitted safely, or two of them,
+// is refused before any venue is contacted, never cleaned and forwarded.
+TEST_P(ProxyRoute, AnUnsafeClientBetaValueIsRefusedBeforeTheVenue)
+{
+    NamedBackend b;
+    b.start("alpha");
+    AnthropicOptionsPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+    for (const std::string& extra :
+         {std::string("anthropic-beta: a\rX-Smuggled: yes\r\n"), std::string("anthropic-beta: a\nX-Smuggled: yes\r\n"),
+          std::string("anthropic-beta: a\x80z\r\n"), std::string("anthropic-beta: a\x01z\r\n"),
+          std::string("anthropic-beta: a\r\nanthropic-beta: b\r\n")})
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_port));
+        ASSERT_TRUE(c.send(anthropic_request_with(extra + "x-api-key: k\r\n")));
+        EXPECT_EQ(Client::status_of(c.recv_response()), 400) << extra;
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(b.seen(), 0) << "a refused request reached the venue";
+    b.stop();
+}
+
+namespace
+{
+    /// One bad override per request, in order; the counter is the only state shared
+    /// with the loop thread.
+    class BadOptionPolicy final : public llmbridge::Policy
+    {
+      public:
+        static constexpr std::string_view kLongSpeed = "fffffffffffffffffffffffffffffffff"; // 33
+        static constexpr std::pair<std::string_view, std::string_view> kCases[] = {
+            {"fast", "a,b"}, {"fast", "a\r\nX: y"}, {"fast", "Fast-Mode"}, {kLongSpeed, "fast-mode-2026-02-01"}};
+        std::atomic<size_t> next{0};
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            const auto& [speed, beta] = kCases[next.fetch_add(1) % std::size(kCases)];
+            llmbridge::Decision d;
+            d.allow = true;
+            d.speed = speed;
+            d.anthropic_beta = beta;
+            return d;
+        }
+    };
+} // namespace
+
+TEST_P(ProxyRoute, AnUnusableBetaTokenOrOversizedOptionIsAServerError)
+{
+    NamedBackend b;
+    b.start("alpha");
+    BadOptionPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+    for (size_t i = 0; i < std::size(BadOptionPolicy::kCases); ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_port));
+        ASSERT_TRUE(c.send(anthropic_request_with("x-api-key: k\r\n")));
+        EXPECT_EQ(Client::status_of(c.recv_response()), 500) << i;
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(b.seen(), 0);
+    b.stop();
+}
+
 // ── RequestSink: the completion seam ─────────────────────────────────────────
 //
 // llmbridge measures and hands over; meaning is the sink's business. The claims:
@@ -14143,6 +14408,79 @@ TEST_P(ProxyHeadDecide, AnAnthropicModelMidBodyIsSpliced)
     EXPECT_EQ(_gw->stats().streamed_model_substituted, 1u);
     EXPECT_EQ(_gw->stats().streamed_body_redone, 0u);
     EXPECT_EQ(_backend.accepted(), 0);
+}
+
+// A beta token rewrites no body byte, so a head-decided body still streams, and the
+// head that goes ahead of it carries the token once, joined to the client's own list.
+TEST_P(ProxyHeadDecide, AStreamedBodyToAnAnthropicVenueCarriesTheBetaToken)
+{
+    _second.set_response(http_ok(anthropic_resp_body("ok")));
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .anthropic_beta = "fast-mode-2026-02-01"}};
+    start_with(pol, UpstreamDialect::Anthropic);
+    Halves h = anthropic_sdk_halves(
+        R"({"max_tokens":1024,"messages":[{"role":"user","content":")" + std::string(64 * 1024, 'p'),
+        R"("}],"model":"claude-sonnet-4-5","stream":true})");
+    h.first.insert(h.first.find("\r\n") + 2, "anthropic-beta: client-own-1\r\n");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _second.bytes_seen() > 16 * 1024; })) << "held to its last byte";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string up = _second.last_request();
+    EXPECT_NE(up.find("\r\nanthropic-beta: client-own-1,fast-mode-2026-02-01\r\n"), std::string::npos)
+        << up.substr(0, 400);
+    EXPECT_EQ(count_of(lower_head(up), "anthropic-beta:"), 1u) << up.substr(0, 400);
+    EXPECT_EQ(body_of(up), whole_body(h));
+    EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 0u);
+}
+
+// The same on the splice path: the head declares the grown length and still carries the token.
+TEST_P(ProxyHeadDecide, ASplicedBodyCarriesTheBetaToken)
+{
+    _second.set_response(http_ok(anthropic_resp_body("ok")));
+    HeadPolicy pol;
+    llmbridge::Decision d = auto_route(1, "claude-sonnet-4-5");
+    d.anthropic_beta = "fast-mode-2026-02-01";
+    pol.heads = {d};
+    start_with(pol, UpstreamDialect::Anthropic);
+    const Halves h = anthropic_sdk_halves(
+        R"({"max_tokens":1024,"messages":[{"role":"user","content":")" + std::string(64 * 1024, 'p'),
+        R"("}],"model":"auto","stream":true})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _second.bytes_seen() > 16 * 1024; })) << "held to its last byte";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string want = replaced(whole_body(h), R"("model":"auto")", R"("model":"claude-sonnet-4-5")");
+    const std::string up = _second.last_request();
+    EXPECT_NE(up.find("\r\nanthropic-beta: fast-mode-2026-02-01\r\n"), std::string::npos) << up.substr(0, 400);
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_TRUE(declares(up, want.size())) << up.substr(0, 300);
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 1u);
+}
+
+// speed rewrites the body, so it parks like a model override and goes whole with the field.
+TEST_P(ProxyHeadDecide, ASpeedOverrideParksTheBody)
+{
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 0, .speed = "fast"}};
+    pol.probe = [this] { return _backend.bytes_seen(); };
+    start_with(pol);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    expect_parked(_backend, pol, h, _proxy_port);
+    shutdown();
+    const std::string body = body_of(_backend.last_request());
+    EXPECT_EQ(body, "{\"speed\":\"fast\"," + whole_body(h).substr(1));
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+    EXPECT_EQ(_gw->stats().streamed_bodies, 0u);
 }
 
 // Never two models: another dialect's repeat is refused before it leaves, as an OpenAI

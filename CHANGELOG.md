@@ -8,6 +8,94 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.97.0]. 2026-10-12
+
+A policy can set two more Anthropic request options the way it sets `service_tier`:
+fast mode (`"speed": "fast"` plus the `anthropic-beta: fast-mode-2026-02-01` header) and
+US-only inference (`"inference_geo": "us"`). DESIGN.md "Body edits and top-level readers".
+
+### Added
+
+- **`Decision::speed` and `Decision::inference_geo`**, at most 32 bytes each, set as
+  top-level body keys, replaced when the client sent one and inserted when it did not.
+  Byte-forward only, as `service_tier` is: a translated request is built by the
+  translator and carries neither. Empty leaves the body alone. A longer value is a 500;
+  a quote, backslash or control byte in one is a 400, as for the tier.
+- **`Decision::anthropic_beta`**: one beta token, such as `fast-mode-2026-02-01`, sent as
+  an `anthropic-beta` header to a venue whose auth is `x-api-key` (Anthropic) and to no
+  other venue. It must pass the new `beta_token_ok` (1 to `kMaxBetaToken` = 64 bytes of
+  `[a-z0-9._-]`), public so a policy can `static_assert` its own; anything else is a 500
+  and reaches no venue. Empty adds nothing.
+  - On a byte-forward the client's own `anthropic-beta` value and the token go as one
+    line, `<client value>,<token>`, or the client's line unchanged when it already names
+    the token. The client's value must pass `header_value_safe`, and two client
+    `anthropic-beta` lines are refused: both are a 400 before any venue is contacted.
+    A stripped `anthropic-beta`, or one a `Connection` line names, is treated as absent.
+  - A translated request has never carried the client's `anthropic-beta` (it is rebuilt
+    from the credential lines alone), and still does not: it gets the token alone.
+  - Without a token the client's `anthropic-beta` is forwarded exactly as before.
+- **`Retry::speed`, `Retry::inference_geo` and `Retry::anthropic_beta`**: a failover
+  sends the new listing's values, never the failed one's; empty sends none. A retry
+  naming a value too long or a bad token is not taken, and the client gets the failure.
+- `Policy::confirm()` compares all three: a change in any of them redoes the request.
+- **`provider::Overrides` and `apply_overrides(body, Overrides, had_tier, out)`**: model,
+  service tier, speed and inference geo in one parse and one copy. Absent keys share
+  one insertion after the opening brace. The model-and-tier forms remain and call it.
+- `net::http::Field::AnthropicBeta`, at the end of the enum, so `classify` names the
+  header in the walk that already reads every line.
+
+### Changed
+
+- **Behaviour change: inserting a key beside an escaped top-level key is refused.** The
+  parser keeps keys as written, so `sp\u0065ed` was not found as `speed` (or
+  `service_tier` as itself), and the insert handed the provider two spellings of one
+  key. The route override is refused with a 400 instead. A body without an escaped
+  top-level key is unaffected.
+- A body decided on its head parks, as with a model or tier override, when `speed` or
+  `inference_geo` is set; the beta token alone is a head change and lets it stream,
+  through `forward_parts`, so the head that goes ahead of a streamed or spliced body
+  (0.96.0's model substitution) and its stale retry carry it too.
+- Walks per request are unchanged: one header walk at framing, which now also records
+  the first `anthropic-beta` span and a count of its lines; one copy walk in the
+  byte-forward rebuild, which drops the client's line in the same pass; and one parse
+  plus one copy of the body when any body override is set, none otherwise, as before.
+
+### Tests
+
+- `ApplyOverrides.*`: `speed` and `inference_geo` inserted when absent and replaced when
+  present; all four overrides in one call with the tier's previous value reported; a
+  key quoted inside a string left alone; a quote, backslash, CR, LF, 0x7F or another
+  control byte refused in either value; a non-string value already there refused; an
+  insert beside an escaped key refused; the model-and-tier form unchanged.
+- `ProxyRoute.*`, both backends: an Anthropic venue receiving `"speed":"fast"`,
+  `"inference_geo":"us"` and one `anthropic-beta: fast-mode-2026-02-01` line; the token
+  joined to the client's value in one line, and not added twice when already there; an
+  OpenAI venue getting no `anthropic-beta`; a translated request carrying the token and
+  not the client's value; a failover to a listing without options sending none of the
+  three, and one with its own options sending those and not the first listing's; a
+  client `anthropic-beta` holding a CR, an LF, an 8-bit byte or a control byte, or
+  sent twice, refused with a 400 and nothing reaching the venue; a bad token or a 33-byte
+  speed a 500 with nothing reaching the venue.
+- `ProxyHeadDecide.*`, both backends: a head-decided body to an Anthropic venue streams
+  with the token joined to the client's line, a spliced body carries it with the grown
+  length declared, and a `speed` override parks the body and sends it whole with the
+  field. Removing the token from `forward_parts` fails the first two.
+- `WalkHeaders.NamesTheHopByHopAndCredentialFields` names `anthropic-beta`.
+- Each behaviour fails its test when removed: the merged line, the venue check, the
+  failover reset of `speed` and of the token, the client value check, the repeat check,
+  the already-present check, the token check, and the escaped-key refusal.
+
+### Known gaps
+
+- `speed` and `inference_geo` reach a byte-forwarded body only. An OpenAI client of an
+  Anthropic venue gets the beta header without the field, which Anthropic serves at
+  standard speed. Carrying them through the translator is a follow-up.
+- The sink does not yet record the `usage.speed` and `usage.inference_geo` a venue
+  reports, so a fast-mode request cannot be told from a standard one after the fact.
+- Without a policy token the client's `anthropic-beta` is forwarded on a byte-forward as
+  it always was: the framing walk refuses a bare CR or LF, and 8-bit bytes pass.
+
+
 ## [0.95.0]. 2026-10-12
 
 A policy may now decide on the head of a large request body and let it go to the venue as

@@ -130,7 +130,7 @@ namespace llmbridge::detail
         /// credential the client sent is checked first, whether or not this venue reads
         /// it, so a malformed value cannot route around the check by picking another.
         const char* append_auth(UpstreamDialect mode, std::string_view head, const HeadFacts& f,
-                                const NamedKey& key, std::string& out)
+                                const NamedKey& key, std::string& out, std::string_view beta = {})
         {
             const std::string_view auth = f.authorization.in(head), x_api_key = f.x_api_key.in(head),
                                    api_key = f.api_key.in(head), goog = f.x_goog_api_key.in(head),
@@ -146,7 +146,10 @@ namespace llmbridge::detail
             {
                 out.append(key.line).append(key.value).append("\r\n");
                 if (provider::spec(mode).auth == Auth::XApiKey)
+                {
                     line("anthropic-version", version.empty() ? kAnthropicVersionDefault : version);
+                    line("anthropic-beta", beta);
+                }
                 return nullptr;
             }
             switch (provider::spec(mode).auth)
@@ -154,6 +157,7 @@ namespace llmbridge::detail
                 case Auth::XApiKey:
                     line("x-api-key", x_api_key.empty() ? bearer_token(auth) : x_api_key);
                     line("anthropic-version", version.empty() ? kAnthropicVersionDefault : version);
+                    line("anthropic-beta", beta);
                     return nullptr;
                 case Auth::GoogApiKey:
                     line("x-goog-api-key", goog.empty() ? bearer_token(auth) : goog);
@@ -256,6 +260,10 @@ namespace llmbridge::detail
             case Field::ApiKey: cred(f.api_key); break;
             case Field::XGoogApiKey: cred(f.x_goog_api_key); break;
             case Field::AnthropicVersion: cred(f.anthropic_version); break;
+            case Field::AnthropicBeta:
+                if (stripped(h.name, strip) || f.anthropic_betas == 2) break;
+                if (f.anthropic_betas++ == 0) f.anthropic_beta = span(rtrim_ows(net::http::detail::ltrim(h.value)));
+                break;
             case Field::ContentLength: f.content_length = true; break;
             case Field::ContentType:
                 if (f.content_type.empty()) f.content_type = span(h.value);
@@ -479,11 +487,27 @@ namespace llmbridge::detail
     const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
                               const std::vector<std::string>& strip, std::string_view host_hdr,
                               std::string_view base_path, std::string_view body,
-                              std::string& into, size_t declared, const NamedKey& key)
+                              std::string& into, size_t declared, const NamedKey& key,
+                              std::string_view beta)
     {
         using net::http::Field;
         into.clear();
         if (f.connections > HeadFacts::kConnections) return "too many Connection headers";
+        const auto listed = [&](std::string_view name) {
+            for (uint8_t i = 0; i < f.connections; ++i)
+                if (net::http::has_token(f.connection[i].in(msg), name)) return true;
+            return false;
+        };
+        // The client's own beta list, which the policy's token joins in one line. Read only
+        // with a token to add: without one the client's lines go as they came.
+        std::string_view client_beta;
+        if (!beta.empty() && !listed("anthropic-beta"))
+        {
+            if (f.anthropic_betas > 1) return "anthropic-beta repeated";
+            client_beta = f.anthropic_beta.in(msg);
+            if (!client_beta.empty() && !header_value_safe(client_beta)) return "anthropic-beta unusable";
+            if (net::http::has_token(client_beta, beta)) beta = {};
+        }
         const std::string_view head = msg.substr(0, header_len < 4 ? 0 : header_len - 4);
         const size_t eol = std::min(head.find("\r\n"), head.size());
         const std::string_view rl = head.substr(0, eol);
@@ -498,7 +522,7 @@ namespace llmbridge::detail
         const std::string_view version = rl.substr(sp2 + 1);
 
         const size_t need = header_len + host_hdr.size() + base_path.size() + body.size() +
-                            key.line.size() + key.value.size() + 64;
+                            key.line.size() + key.value.size() + beta.size() + 80;
         if (into.capacity() < need) into.reserve(need + need / 8);
         into.append(rl.substr(0, sp1 + 1)).append(base_path).append(target).append(" ");
         into.append(version == "HTTP/1.0" ? std::string_view("HTTP/1.1") : version).append("\r\n");
@@ -508,11 +532,12 @@ namespace llmbridge::detail
         if (f.content_length || declared) net::http::append_content_length(into, declared);
         // A named key is the one credential: every one the client sent goes.
         if (!key.empty()) into.append(key.line).append(key.value).append("\r\n");
-        const auto listed = [&](std::string_view name) {
-            for (uint8_t i = 0; i < f.connections; ++i)
-                if (net::http::has_token(f.connection[i].in(msg), name)) return true;
-            return false;
-        };
+        const bool merge = !beta.empty();
+        if (merge)
+        {
+            into.append("anthropic-beta: ").append(client_beta);
+            into.append(client_beta.empty() ? "" : ",").append(beta).append("\r\n");
+        }
         // Copied in runs: a flush happens only where a dropped line interrupts kept ones.
         size_t run = eol + 2;
         const bool ok = net::http::walk_headers(head, [&](const net::http::HeaderLine& h) noexcept {
@@ -522,6 +547,7 @@ namespace llmbridge::detail
                               stripped(h.name, strip) ||
                               (!key.empty() && (h.field == Field::Authorization || h.field == Field::XApiKey ||
                                                 h.field == Field::ApiKey || h.field == Field::XGoogApiKey)) ||
+                              (h.field == Field::AnthropicBeta && (merge || listed(h.name))) ||
                               (h.field == Field::Other &&
                                (net::http::detail::line_is(h.name, kKeyHeaderPrefix) || listed(h.name)));
             if (!drop) return true;
@@ -560,7 +586,8 @@ namespace llmbridge::detail
                          const std::vector<std::string>& strip,
                          std::string_view host_hdr, std::string_view base_path,
                          std::string_view body_override, std::string& into,
-                         std::string_view key_header, UpstreamDialect venue, Refusal* refused)
+                         std::string_view key_header, UpstreamDialect venue, Refusal* refused,
+                         std::string_view beta)
     {
         const auto fail = [&](Refusal r) {
             if (refused) *refused = r;
@@ -575,7 +602,7 @@ namespace llmbridge::detail
             if (const Refusal r = named_key(msg, f, key_header, venue, key)) return fail(r);
         const std::string_view body = body_override.empty() ? msg.substr(header_len) : body_override;
         if (const char* bad = build_forward(msg, header_len, f, strip, host_hdr, base_path, body, into,
-                                            body.size(), key))
+                                            body.size(), key, beta))
             return fail({bad, nullptr});
         return true;
     }
@@ -590,7 +617,7 @@ namespace llmbridge::detail
                                   const HeadFacts& f, std::string& out,
                                   std::string& body_scratch, const char*& why,
                                   std::string_view model_override, bool* wants_stream_usage,
-                                  const NamedKey& key)
+                                  const NamedKey& key, std::string_view beta)
     {
         why = "translate";
         out.clear();
@@ -608,7 +635,7 @@ namespace llmbridge::detail
         const std::string_view tbody = body_scratch;
 
         const size_t need = tbody.size() + up.base_path.size() + up.query.size() + up.host_hdr.size() +
-                            key.value.size() + 640;
+                            key.value.size() + beta.size() + 640;
         if (out.capacity() < need) out.reserve(need + need / 8);
         // The venue's path from the model it is asked for; its query, not the client's:
         // Azure's api-version rides there.
@@ -626,7 +653,7 @@ namespace llmbridge::detail
             if (!sign_bedrock(up, f.authorization.in(head), path, tbody, out, why))
             { out.clear(); return false; }
         }
-        else if (const char* bad = append_auth(mode, head, f, key, out))
+        else if (const char* bad = append_auth(mode, head, f, key, out, beta))
         { why = bad; out.clear(); return false; }
         out.append("Content-Type: application/json\r\nConnection: keep-alive\r\n");
         net::http::append_content_length(out, tbody.size());

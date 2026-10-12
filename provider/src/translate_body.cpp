@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "json_scan.hpp"
 #include "provider/json.hpp"
@@ -227,14 +228,13 @@ namespace llmbridge::provider
         return out;
     }
 
-    bool apply_overrides(std::string_view openai_body, std::string_view model,
-                         std::string_view service_tier, std::string_view* had_tier,
-                         std::string& out)
+    bool apply_overrides(std::string_view openai_body, const Overrides& o,
+                         std::string_view* had_tier, std::string& out)
     {
         if (had_tier) *had_tier = {};
         out.clear();
-        if (model.empty() && service_tier.empty()) { out.assign(openai_body); return true; }
-        for (const std::string_view v : {model, service_tier})
+        if (o.empty()) { out.assign(openai_body); return true; }
+        for (const std::string_view v : {o.model, o.service_tier, o.speed, o.inference_geo})
             for (const char ch : v)
             {
                 const auto u = static_cast<unsigned char>(ch);
@@ -249,53 +249,63 @@ namespace llmbridge::provider
             return sv.data() >= base && sv.data() + sv.size() <= base + openai_body.size();
         };
 
-        // Each edit as (offset, length-to-drop, text). Collected first, applied in
-        // ascending offset, so one pass over the body emits the result.
-        struct Edit { size_t at; size_t drop; std::string text; };
-        Edit edits[2];
+        // Each edit as (offset, length-to-drop, text), applied in ascending offset so one
+        // pass over the body emits the result. Absent keys share one insertion after `{`.
+        struct Edit { size_t at; size_t drop; std::string_view text; };
+        Edit edits[4];
         size_t n = 0;
+        std::string ins;
 
-        if (!model.empty())
+        if (!o.model.empty())
         {
             const json::Value* m = v.find("model");
             if (!m || !m->is_string() || !in_body(m->sv)) return false;
-            edits[n++] = {static_cast<size_t>(m->sv.data() - base), m->sv.size(),
-                          std::string(model)};
+            edits[n++] = {static_cast<size_t>(m->sv.data() - base), m->sv.size(), o.model};
         }
-        if (!service_tier.empty())
+        const std::pair<std::string_view, std::string_view> upserts[] = {
+            {"service_tier", o.service_tier}, {"speed", o.speed}, {"inference_geo", o.inference_geo}};
+        for (const auto& [key, value] : upserts)
         {
-            if (const json::Value* t = v.find("service_tier"))
+            if (value.empty()) continue;
+            if (const json::Value* t = v.find(key))
             {
                 if (!t->is_string() || !in_body(t->sv)) return false;
-                if (had_tier) *had_tier = t->sv;
-                edits[n++] = {static_cast<size_t>(t->sv.data() - base), t->sv.size(),
-                              std::string(service_tier)};
+                if (had_tier && key == "service_tier") *had_tier = t->sv;
+                edits[n++] = {static_cast<size_t>(t->sv.data() - base), t->sv.size(), value};
             }
             else
-            {
-                if (!in_body(v.sv) || v.sv.empty() || v.sv.front() != '{') return false;
-                const size_t open = static_cast<size_t>(v.sv.data() - base) + 1;
-                size_t probe = open;
-                while (probe < openai_body.size() &&
-                       (openai_body[probe] == ' ' || openai_body[probe] == '\t' ||
-                        openai_body[probe] == '\n' || openai_body[probe] == '\r'))
-                    ++probe;
-                const bool empty_object =
-                    probe < openai_body.size() && openai_body[probe] == '}';
-                std::string ins = "\"service_tier\":\"";
-                ins += service_tier;
-                ins += '"';
-                if (!empty_object) ins += ',';
-                edits[n++] = {open, 0, std::move(ins)};
-            }
+                ins.append(ins.empty() ? "\"" : ",\"").append(key).append("\":\"").append(value).append("\"");
         }
-        if (n == 2 && edits[0].at > edits[1].at) std::swap(edits[0], edits[1]);
+        size_t open = 0;
+        if (!ins.empty())
+        {
+            if (!in_body(v.sv) || v.sv.empty() || v.sv.front() != '{') return false;
+            // find() matches keys as written, so an escaped spelling of one would be
+            // missed and the insert would make the provider see it twice.
+            for (const json::Member& m : v.obj)
+                if (m.key.find('\\') != std::string_view::npos) return false;
+            open = static_cast<size_t>(v.sv.data() - base) + 1;
+            size_t probe = open;
+            while (probe < openai_body.size() &&
+                   (openai_body[probe] == ' ' || openai_body[probe] == '\t' ||
+                    openai_body[probe] == '\n' || openai_body[probe] == '\r'))
+                ++probe;
+            if (probe >= openai_body.size() || openai_body[probe] != '}') ins += ',';
+        }
+        for (size_t i = 1; i < n; ++i) // at most four: an insertion sort
+            for (size_t j = i; j > 0 && edits[j - 1].at > edits[j].at; --j) std::swap(edits[j - 1], edits[j]);
 
         {
-            const size_t need = openai_body.size() + model.size() + service_tier.size() + 24;
+            const size_t need = openai_body.size() + o.model.size() + ins.size() + 32 +
+                                o.service_tier.size() + o.speed.size() + o.inference_geo.size();
             if (out.capacity() < need) out.reserve(need + need / 8);
         }
         size_t cursor = 0;
+        if (!ins.empty())
+        {
+            out.append(openai_body.substr(0, open)).append(ins);
+            cursor = open;
+        }
         for (size_t i = 0; i < n; ++i)
         {
             out.append(openai_body.substr(cursor, edits[i].at - cursor));
@@ -304,6 +314,13 @@ namespace llmbridge::provider
         }
         out.append(openai_body.substr(cursor));
         return true;
+    }
+
+    bool apply_overrides(std::string_view openai_body, std::string_view model,
+                         std::string_view service_tier, std::string_view* had_tier,
+                         std::string& out)
+    {
+        return apply_overrides(openai_body, Overrides{model, service_tier, {}, {}}, had_tier, out);
     }
 
     std::string apply_overrides(std::string_view openai_body, std::string_view model,

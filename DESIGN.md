@@ -301,7 +301,8 @@ continuously fuzzed:
     `header_value_safe` first.
   - **One walk of a request head.** `parse_request` takes a visitor, and the gateway's
     (`HeadReader`) reads the credentials (`Authorization`, `x-api-key`, `api-key`,
-    `x-goog-api-key`, `anthropic-version`; the first of each, a stripped one unseen),
+    `x-goog-api-key`, `anthropic-version`, and `anthropic-beta` with a count of its
+    lines; the first of each, a stripped one unseen),
     up to eight `x-kottos-key-*` lines a policy could name, stripped or not ("Naming
     the key for a venue"), `Expect` and every `Connection` value in the framing walk,
     as offsets into the head. The translated request is written from them straight
@@ -405,6 +406,15 @@ fields faster than we adopt them. Only the value span moves.
 - **`upsert_string` can insert.** `rewrite_model` only replaces, because a request with
   no `model` is not one this gateway serves; `service_tier` is usually absent and the
   route deciding the tier has to be able to put it there.
+- **`apply_overrides` sets `model`, `service_tier`, `speed` and `inference_geo` in one
+  parse and one copy.** Absent keys go in together after the opening brace. A body with
+  an escaped top-level key is refused when a key is inserted, since `find` matches keys
+  as written and the venue would then see two spellings of one.
+- **A policy's `anthropic_beta` token is a header, not a body field.** It goes only to a
+  venue taking an `x-api-key`. A byte-forward joins it to the client's own
+  `anthropic-beta` value in one line, unless the client already sent it; a repeated or
+  unsafe client line is refused. A translated request never carried the client's
+  `anthropic-beta`, so it gets the token alone.
 - **`model_of` refuses an escaped value instead of unescaping it.** It is compared with
   configured names, an escape means it was never one of them, and unescaping would need
   an allocation on a path that has none.

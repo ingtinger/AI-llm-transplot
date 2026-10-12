@@ -356,7 +356,7 @@ namespace llmbridge::detail
         // A body still arriving goes on as it arrives to a venue that takes it as it is, a
         // substitution spliced if its model was tracked from the first byte, else it parks to
         // its last byte (GATEWAY-INTERNALS.md 12c, 12d).
-        else if (f.body_streaming && !(f.model_override.empty() && f.tier_override.empty() &&
+        else if (f.body_streaming && !(!f.rewrites_body() &&
                                        (f.subst_model.empty() || f.subst_tracked) &&
                                        venue_streams(client_dialect_of(client->rbuf), client->upstream_slot)))
         {
@@ -412,17 +412,20 @@ namespace llmbridge::detail
         }
         // The new venue's overrides, never the failed one's: its model name is wrong for
         // another venue. Copied now, since the views die once on_failure has returned.
-        if (!client->req.f.model_override.set(r.model) ||
-            !client->req.f.tier_override.set(r.service_tier) ||
+        ReqState& rf = client->req.f;
+        if (!rf.model_override.set(r.model) || !rf.tier_override.set(r.service_tier) ||
+            !rf.speed_override.set(r.speed) || !rf.geo_override.set(r.inference_geo) ||
+            (!r.anthropic_beta.empty() && !beta_token_ok(r.anthropic_beta)) ||
             !substitution_ok(r.substitute_model, r.substitute_for))
         {
-            LB_WARN(ReqId{client->req.f.req_seq}, " failover override unusable or longer than the gateway "
-                                                  "holds; giving up");
+            LB_WARN(ReqId{rf.req_seq}, " failover override unusable or longer than the gateway "
+                                       "holds; giving up");
             return {};
         }
-        if (!r.credential_header.empty()) client->req.f.key_header.set(r.credential_header);
-        client->req.f.subst_model.set(r.substitute_model);
-        client->req.f.subst_for.set(r.substitute_for);
+        rf.beta_override.set(r.anthropic_beta);
+        if (!r.credential_header.empty()) rf.key_header.set(r.credential_header);
+        rf.subst_model.set(r.substitute_model);
+        rf.subst_for.set(r.substitute_for);
         return r;
     }
 

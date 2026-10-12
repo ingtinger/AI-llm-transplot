@@ -100,6 +100,13 @@ namespace llmbridge::detail
     [[nodiscard]] Refusal named_key(std::string_view head, const HeadFacts& f, std::string_view name,
                                     UpstreamDialect venue, NamedKey& out) noexcept;
 
+    /// The policy's anthropic-beta token for `up`: only a venue taking an x-api-key gets one.
+    [[nodiscard]] inline std::string_view beta_for(const Upstream& up, const ReqState& f) noexcept
+    {
+        return provider::spec(up.dialect).auth == provider::Auth::XApiKey ? f.beta_override.view()
+                                                                          : std::string_view{};
+    }
+
     /// The client's dialect from the request line of `head`: client_wire on its method
     /// and full target.
     [[nodiscard]] Dialect client_dialect_of(std::string_view head) noexcept;
@@ -119,10 +126,12 @@ namespace llmbridge::detail
     /// The byte-forwarded request into `into`, capacity kept: `msg`'s head, then `body`,
     /// all or the first part of one `declared` bytes long. Null, or why to refuse it,
     /// with `into` empty. A named `key` replaces every credential header the client sent.
+    /// A `beta` token goes as one anthropic-beta line, after the client's own value.
     const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
                               const std::vector<std::string>& strip, std::string_view host_hdr,
                               std::string_view base_path, std::string_view body,
-                              std::string& into, size_t declared, const NamedKey& key = {});
+                              std::string& into, size_t declared, const NamedKey& key = {},
+                              std::string_view beta = {});
     /// A conditional model substitution spliced into a body forwarded as it arrives
     /// (GATEWAY-INTERNALS.md 12d). The head declares the client's length plus grow(): a
     /// value that is the sentinel goes as the replacement, then shrink() spaces; any other
@@ -162,17 +171,20 @@ namespace llmbridge::detail
                          std::string_view host_hdr, std::string_view base_path,
                          std::string_view body_override, std::string& into,
                          std::string_view key_header = {},
-                         UpstreamDialect venue = UpstreamDialect::OpenAI, Refusal* refused = nullptr);
+                         UpstreamDialect venue = UpstreamDialect::OpenAI, Refusal* refused = nullptr,
+                         std::string_view beta = {});
     /// `out` receives the framed request and `body_scratch` the translated body; both
     /// keep their capacity. `head` is the client's, `f` its facts. On false, `why` is
     /// "translate", "credential", "bedrock credential" or "no credential". A named `key`
-    /// is the only credential sent.
+    /// is the only credential sent. A `beta` token is the only anthropic-beta line, sent
+    /// to a venue taking an x-api-key: the client's own does not cross a translation.
     bool build_translated_request(const Upstream& up, UpstreamDialect mode,
                                   std::string_view body, std::string_view head,
                                   const HeadFacts& f, std::string& out,
                                   std::string& body_scratch, const char*& why,
                                   std::string_view model_override = {},
-                                  bool* wants_stream_usage = nullptr, const NamedKey& key = {});
+                                  bool* wants_stream_usage = nullptr, const NamedKey& key = {},
+                                  std::string_view beta = {});
     /// The credential lines a translated request carries, from one header block, the key
     /// in family header `key_header` when one is named. A test seam over the facts the
     /// framing walk reads.

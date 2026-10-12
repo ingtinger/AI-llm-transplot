@@ -202,12 +202,14 @@ namespace llmbridge::detail
     {
         const ReqState& f = c->req.f;
         const std::string_view head(c->rbuf.data(), c->msg.header_len);
+        const std::string_view beta = beta_for(up, f);
         if (!f.splice)
             return build_forward(head, c->msg.header_len, f.head, _strip_headers, up.host_hdr, up.base_path,
-                                 body_so_far(c).substr(0, f.body_sent), into, c->msg.body_len, key);
+                                 body_so_far(c).substr(0, f.body_sent), into, c->msg.body_len, key, beta);
         // The length is ours: the client's, and what the replacement adds (12d).
         if (const char* bad = build_forward(head, c->msg.header_len, f.head, _strip_headers, up.host_hdr,
-                                            up.base_path, {}, into, c->msg.body_len + splice_of(f).grow(), key))
+                                            up.base_path, {}, into, c->msg.body_len + splice_of(f).grow(), key,
+                                            beta))
             return bad;
         append_spliced(c, into, 0, f.body_sent);
         return nullptr;

@@ -175,8 +175,14 @@ namespace llmbridge::detail
                     " of ", static_cast<int64_t>(_upstreams.size()), "; using 0");
         // Copied: the views die when decide() returns. Refused rather than cut, which
         // would route to whatever model the prefix names.
-        if (!c->req.f.model_override.set(d.model) || !c->req.f.tier_override.set(d.service_tier))
+        ReqState& f = c->req.f;
+        if (!f.model_override.set(d.model) || !f.tier_override.set(d.service_tier) ||
+            !f.speed_override.set(d.speed) || !f.geo_override.set(d.inference_geo))
             return error_respond(c, 500, "policy override longer than the gateway holds"), false;
+        // Lands in a header line: a token or nothing, never a list or a guess.
+        if (!d.anthropic_beta.empty() && !beta_token_ok(d.anthropic_beta))
+            return error_respond(c, 500, "policy anthropic_beta unusable"), false;
+        f.beta_override.set(d.anthropic_beta);
         // Spliced into a stream unescaped, its length declared ahead: refused, never fixed up.
         if (!substitution_ok(d.substitute_model, d.substitute_for))
             return error_respond(c, 500, "policy model substitution unusable"), false;
@@ -185,8 +191,8 @@ namespace llmbridge::detail
         // A name outside the family would be echoed by a byte-forward: refused, never guessed.
         if (!d.credential_header.empty() && !key_header_ok(d.credential_header))
             return error_respond(c, 400, kWhyKeyUnusable, refuse::kKeyHeaderUnusable), false;
-        c->req.f.key_header.set(d.credential_header);
-        c->req.f.policy_tag = d.tag;
+        f.key_header.set(d.credential_header);
+        f.policy_tag = d.tag;
         return true;
     }
 
@@ -223,8 +229,7 @@ namespace llmbridge::detail
         }
         if (!apply_decision(c, d)) return;
         f.held = d.hold;
-        const bool as_is = f.model_override.empty() && f.tier_override.empty();
-        start_body(c, !d.hold && as_is && venue_streams(client_dialect_of(c->rbuf), c->upstream_slot));
+        start_body(c, !d.hold && !f.rewrites_body() && venue_streams(client_dialect_of(c->rbuf), c->upstream_slot));
     }
 
     // The decision in force, as confirm() is handed it: the venue serving now, never -1.
@@ -235,6 +240,9 @@ namespace llmbridge::detail
         d.upstream_index = c->upstream_slot;
         d.model = c->req.f.model_override.view();
         d.service_tier = c->req.f.tier_override.view();
+        d.speed = c->req.f.speed_override.view();
+        d.inference_geo = c->req.f.geo_override.view();
+        d.anthropic_beta = c->req.f.beta_override.view();
         d.reason = "";
         d.tag = c->req.f.policy_tag;
         d.credential_header = c->req.f.key_header.view();
@@ -277,7 +285,9 @@ namespace llmbridge::detail
         if (f.splice) now = whole.model_substituted ? f.subst_model.view() : std::string_view{};
         else if (f.body_parked) now = served(now, f.subst_model.view(), f.subst_for.view());
         const bool same = slot == c->upstream_slot && served(d.model, d.substitute_model, d.substitute_for) == now &&
-                          d.service_tier == f.tier_override.view() && d.credential_header == f.key_header.view();
+                          d.service_tier == f.tier_override.view() && d.speed == f.speed_override.view() &&
+                          d.inference_geo == f.geo_override.view() &&
+                          d.anthropic_beta == f.beta_override.view() && d.credential_header == f.key_header.view();
         f.policy_tag = d.tag; // a tag alone changing is still a keep
         if (same)
         {
@@ -354,7 +364,7 @@ namespace llmbridge::detail
             const char* why = "";
             if (!build_translated_request(up, c->req.f.effective_dialect, body, head, c->req.f.head,
                                           _rebuild, _xlate, why, c->req.f.model_override.view(),
-                                          &c->req.f.wants_usage, key))
+                                          &c->req.f.wants_usage, key, c->req.f.beta_override.view()))
             {
                 // A credential is never echoed: it would land in a JSON body unescaped.
                 if (why[0] == 't') return error_respond(c, 400, "translate", translate_failure(body));
@@ -368,11 +378,14 @@ namespace llmbridge::detail
             // Byte-forward still rebuilds: Host must name the venue. The model is
             // spliced, so every other byte the client sent survives.
             std::string_view rewritten;
-            if (!c->req.f.model_override.empty() || !c->req.f.tier_override.empty())
+            if (c->req.f.rewrites_body())
             {
+                const ReqState& f = c->req.f;
                 std::string_view had;
-                if (!provider::apply_overrides(body, c->req.f.model_override.view(),
-                                               c->req.f.tier_override.view(), &had, _xlate))
+                if (!provider::apply_overrides(body,
+                                               {f.model_override.view(), f.tier_override.view(),
+                                                f.speed_override.view(), f.geo_override.view()},
+                                               &had, _xlate))
                     return error_respond(c, 400, "cannot apply route overrides");
                 rewritten = _xlate;
                 c->req.f.asked_tier.set(had); // `had` points into rbuf, reused before the sink
@@ -395,7 +408,8 @@ namespace llmbridge::detail
                                                      c->msg.header_len, c->req.f.head, _strip_headers,
                                                      up.host_hdr, up.base_path, rewritten.empty() ? body : rewritten,
                                                      _rebuild, rewritten.empty() ? c->msg.body_len : rewritten.size(),
-                                                     key))
+                                                     key,
+                                                beta_for(up, c->req.f)))
                 return error_respond(c, 400, bad);
         }
 

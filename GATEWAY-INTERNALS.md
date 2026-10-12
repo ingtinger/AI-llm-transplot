@@ -140,9 +140,10 @@ framing, as soon as the parser answers, and before any reply, a 400 included, so
 nothing a request reports can belong to the one before it on the connection. It
 constructs a fresh `ReqState` in place rather than assigning one, which writes only
 the scalars and leaves the string buffers' bytes alone. Strings the request keeps
-are `FixedStr` copies, never views: the policy's `model` and `service_tier` are
-copied at the decision (a longer one is refused with a 500, never cut), and a
-failover takes `Retry`'s. So is `credential_header`, the family header holding the
+are `FixedStr` copies, never views: the policy's `model`, `service_tier`, `speed`,
+`inference_geo` and `anthropic_beta` are copied at the decision (a longer one, or a
+beta that fails `beta_token_ok`, is refused with a 500, never cut), and a failover
+takes `Retry`'s. So is `credential_header`, the family header holding the
 attempt's key, once `key_header_ok` passes it (a name outside the family is a 400);
 the key itself stays in the head, found through the spans `HeadFacts` recorded.
 
