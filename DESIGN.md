@@ -464,6 +464,31 @@ for the signing: selecting it without one fails at startup instead of sending un
 bytes. Azure is OpenAI's body with the deployment in the path, `api-version` in the
 query and the key in `api-key`; it is not a byte-forward, which would merge two queries.
 
+**The venue table** (`provider/dialect.hpp`, `provider/src/registry.cpp`). Every
+per-venue fact is one row of `VenueSpec`, indexed by `provider::Venue`, of which
+`UpstreamDialect` is an alias: its one name (flags, config and logs read it), its body
+wire, its credential scheme, whether a translated stream is served, whether a
+same-wire client byte-forwards, its request and response translators, its path built
+from the model (`target`), and its finish reasons. The gateway looks rows up instead
+of switching on the venue.
+
+- **Streaming** is a capability. Only Anthropic (its SSE translator), Azure (OpenAI's
+  own stream) and a byte-forward serve one; an OpenAI client asking a translated
+  Gemini, Cohere or Bedrock venue to stream is refused (400), where Gemini and Cohere
+  used to answer one JSON body that an SDK reads as an empty stream.
+- **The path names the model** where the venue wants it: Gemini
+  `/v1beta/models/{model}:generateContent` (it was always `models/gemini`), Bedrock
+  `/model/{model}/invoke`. The model is decoded from its JSON form and sent as one
+  percent-encoded segment; a policy's override names it there too. No model is a 400.
+- **The body is parsed once.** The gateway parses a translated request at dispatch and
+  hands the tree to the venue's translator; a model override travels in `RequestOut`
+  instead of being spliced in and parsed a second time.
+- **Finish reasons** come from each provider's documented list. One that is the venue's
+  own failure (Cohere `ERROR` and `TIMEOUT`, Gemini `MALFORMED_FUNCTION_CALL` and the
+  tool-call faults) maps to `Finish::Error`, which is no completion: the gateway answers
+  502. A refusal or a safety block is `content_filter`, including a Gemini prompt blocked
+  before any candidate (`promptFeedback.blockReason`).
+
 Sequencing: phase one is the resolution above, which makes a same-dialect caller
 byte-forward (this is what lets an Anthropic client reach an Anthropic venue) and refuses
 the unbuilt pairs. Phase two builds the Anthropic-in translators and splits Bedrock/Azure
