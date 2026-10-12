@@ -85,6 +85,9 @@ namespace llmbridge
         static constexpr uint8_t kKeyHeaders = 8;
         Span key_name[kKeyHeaders], key_value[kKeyHeaders];
         uint8_t key_headers = 0;
+        /// The first anthropic-beta value, trimmed, and how many lines named one, stopping at 2.
+        Span anthropic_beta;
+        uint8_t anthropic_betas = 0;
     };
 
     /// Everything a request owns that is trivially copyable. Never assigned field by
@@ -160,6 +163,9 @@ namespace llmbridge
         /// Copied from the policy's Decision, or from Retry on failover; never longer.
         FixedStr<255> model_override;
         FixedStr<32> tier_override;
+        FixedStr<32> speed_override;
+        FixedStr<32> geo_override;
+        FixedStr<kMaxBetaToken> beta_override; ///< added to anthropic-beta at an x-api-key venue
         FixedStr<kMaxKeyHeaderName> key_header; ///< the family header holding this attempt's key
         FixedStr<64> model;          ///< the client's, for the policy and the sink
         FixedStr<16> asked_tier;     ///< the client's own service_tier
@@ -190,6 +196,13 @@ namespace llmbridge
         bool body_parts = false;
         bool reply_kept = false; ///< our error reply keeps the connection; the rest is dropped
         ConfirmOutcome confirm_outcome = ConfirmOutcome::None;
+
+        /// A body override is in force, so the body is spliced and cannot go as it arrives.
+        [[nodiscard]] bool rewrites_body() const noexcept
+        {
+            return !(model_override.empty() && tier_override.empty() && speed_override.empty() &&
+                     geo_override.empty());
+        }
         /// A conditional model substitution (GATEWAY-INTERNALS.md 12d), the decision's or the
         /// retry's. `subst_tracked`: BodyScan has tracked the model from the first byte, so a
         /// streamed attempt can splice; `splice`: this attempt does; `model_substituted`: the

@@ -25,7 +25,23 @@ namespace llmbridge::provider
     std::string upsert_string(std::string_view openai_body, std::string_view key,
                               std::string_view value, std::string_view* had = nullptr);
 
-    /// Both of the route's overrides in one pass; either may be empty.
+    /// The route's body overrides. `model` replaces the client's and the others are set,
+    /// inserted when absent; empty leaves that key alone. Each must be plain JSON text:
+    /// no control byte, quote or backslash.
+    struct Overrides
+    {
+        std::string_view model{}, service_tier{}, speed{}, inference_geo{};
+        [[nodiscard]] bool empty() const noexcept
+        {
+            return model.empty() && service_tier.empty() && speed.empty() && inference_geo.empty();
+        }
+    };
+    /// Every override in one parse and one copy, into `out`, capacity kept; false on
+    /// refusal. `had_tier` gets the client's own `service_tier` when one is replaced.
+    bool apply_overrides(std::string_view openai_body, const Overrides& o,
+                         std::string_view* had_tier, std::string& out);
+
+    /// Model and service tier only, as before Overrides; either may be empty.
     std::string apply_overrides(std::string_view openai_body, std::string_view model,
                                 std::string_view service_tier,
                                 std::string_view* had_tier = nullptr);

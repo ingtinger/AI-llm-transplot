@@ -1136,6 +1136,8 @@ TEST(WalkHeaders, NamesTheHopByHopAndCredentialFields)
     EXPECT_EQ(classify("x-api-key"), Field::XApiKey);
     EXPECT_EQ(classify("X-Goog-Api-Key"), Field::XGoogApiKey);
     EXPECT_EQ(classify("Anthropic-Version"), Field::AnthropicVersion);
+    EXPECT_EQ(classify("Anthropic-Beta"), Field::AnthropicBeta);
+    EXPECT_EQ(classify("anthropic-betas"), Field::Other);
     EXPECT_EQ(classify("x-amzn-RequestId"), Field::RequestId);
     EXPECT_EQ(classify("api-keys"), Field::Other);
 }

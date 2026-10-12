@@ -99,6 +99,19 @@ namespace llmbridge
         return true;
     }
 
+    inline constexpr size_t kMaxBetaToken = 64;
+
+    /// The rule for Decision::anthropic_beta and Retry::anthropic_beta: 1 to kMaxBetaToken
+    /// bytes of [a-z0-9._-], such as `fast-mode-2026-02-01`. One token, never a list.
+    [[nodiscard]] constexpr bool beta_token_ok(std::string_view t) noexcept
+    {
+        if (t.empty() || t.size() > kMaxBetaToken) return false;
+        for (const char c : t)
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'))
+                return false;
+        return true;
+    }
+
     struct Decision
     {
         /// `= false` so `Decision d;` refuses too; `Decision{}` zeroes it either way.
@@ -131,6 +144,15 @@ namespace llmbridge
         /// A decision on the head only: allowed, but nothing goes upstream before the
         /// body's last byte. Ignored on a whole body and from confirm().
         bool hold = false;
+
+        /// Set the request's top-level `speed` and `inference_geo` (Anthropic's fast mode
+        /// and data residency), at most 32 bytes each, spliced as service_tier is: on a
+        /// byte-forward only. Empty leaves the body alone.
+        std::string_view speed{};
+        std::string_view inference_geo{};
+        /// A token, beta_token_ok, added to the request's `anthropic-beta` header when the
+        /// venue takes an x-api-key; any other venue gets none. Empty adds nothing.
+        std::string_view anthropic_beta{};
 
         /// A conditional model substitution, the one a head decision can make without the
         /// model: when the body's top-level `model` is the plain JSON string `substitute_for`
@@ -167,8 +189,11 @@ namespace llmbridge
         /// As Decision::credential_header, for the venue named here. Left empty after any
         /// attempt that named one, the decision or a retry, the request is not retried.
         std::string_view credential_header{};
-        /// As Decision's, for the new venue; empty substitutes nothing. On a body still
-        /// streaming it is spliced only when the head decision named one too (the gateway
+        /// As Decision's, for the venue named here; empty sends none of the failed one's.
+        std::string_view speed{};
+        std::string_view inference_geo{};
+        std::string_view anthropic_beta{};
+        /// On a body still streaming it is spliced only when the head decision named one too (the gateway
         /// then tracked the model from the first byte); else the body parks, as for `model`.
         std::string_view substitute_model{};
         std::string_view substitute_for{};
@@ -203,7 +228,7 @@ namespace llmbridge
         /// refusal (`allow` false, checked as decide()'s) resets a venue holding part of
         /// the body, short of its Content-Length, and the client gets its status and
         /// message. Any other allowed decision redoes the request: the venue is reset and
-        /// the whole body goes as a held one under the new venue, model, service_tier,
+        /// the whole body goes as a held one under the new venue, overrides,
         /// credential_header and tag. A change of tag alone is a keep, the tag updated, and so
         /// is a decision that sends the venue the same model the one in force does, as a
         /// substitution or an override (`whole.model_substituted` says the splice is done).

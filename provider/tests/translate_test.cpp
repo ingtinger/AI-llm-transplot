@@ -1639,6 +1639,91 @@ TEST(UpsertString, EveryAcceptedResultStillParses)
     }
 }
 
+// ── apply_overrides: every body override in one parse ──────────────────────────
+// Anthropic's fast mode and US-only inference are top-level fields like the tier, so
+// the route sets them the same way. All four ride one parse and one copy of the body.
+namespace
+{
+    std::string overrides(std::string_view body, llmbridge::provider::Overrides o,
+                          std::string_view* had = nullptr)
+    {
+        std::string out;
+        if (!llmbridge::provider::apply_overrides(body, o, had, out)) return {};
+        return out;
+    }
+} // namespace
+
+TEST(ApplyOverrides, InsertsSpeedAndInferenceGeoWhenAbsent)
+{
+    EXPECT_EQ(overrides(R"({"model":"m","max_tokens":8})", {.speed = "fast", .inference_geo = "us"}),
+              R"({"speed":"fast","inference_geo":"us","model":"m","max_tokens":8})");
+    EXPECT_EQ(overrides("{}", {.speed = "fast"}), R"({"speed":"fast"})");
+    EXPECT_EQ(overrides("{ }", {.speed = "fast", .inference_geo = "us"}),
+              R"({"speed":"fast","inference_geo":"us" })");
+}
+
+TEST(ApplyOverrides, ReplacesSpeedAndInferenceGeoWhenPresent)
+{
+    EXPECT_EQ(overrides(R"({"model":"m","speed":"standard","inference_geo":"global"})",
+                        {.speed = "fast", .inference_geo = "us"}),
+              R"({"model":"m","speed":"fast","inference_geo":"us"})");
+}
+
+TEST(ApplyOverrides, AllFourInOnePassWhetherPresentOrAbsent)
+{
+    std::string_view had;
+    const std::string out =
+        overrides(R"({"inference_geo":"global","model":"a","messages":[],"service_tier":"auto"})",
+                  {"b", "standard_only", "fast", "us"}, &had);
+    EXPECT_EQ(out, R"({"speed":"fast","inference_geo":"us","model":"b","messages":[],"service_tier":"standard_only"})");
+    EXPECT_EQ(had, "auto");
+    bool ok = false;
+    const auto v = llmbridge::provider::json::parse(out, ok);
+    ASSERT_TRUE(ok) << out;
+    EXPECT_EQ(v.find("speed")->sv, "fast");
+    EXPECT_EQ(v.find("inference_geo")->sv, "us");
+}
+
+TEST(ApplyOverrides, AKeyQuotedInsideAStringIsNotTheKey)
+{
+    const std::string out =
+        overrides(R"({"model":"m","messages":[{"content":"\"speed\":\"standard\""}]})", {.speed = "fast"});
+    EXPECT_EQ(out.find(R"({"speed":"fast",)"), 0u) << out;
+    EXPECT_NE(out.find(R"(\"speed\":\"standard\")"), std::string::npos) << out;
+}
+
+TEST(ApplyOverrides, RefusesBadBytesInEveryValue)
+{
+    const std::string_view body = R"({"model":"m"})";
+    for (const std::string& bad : {std::string("fa\"st"), std::string("fa\\st"), std::string("fa\x01st"),
+                                  std::string("fa\rst"), std::string("fa\nst"), std::string("fa\x7fst")})
+    {
+        EXPECT_TRUE(overrides(body, {.speed = bad}).empty()) << bad;
+        EXPECT_TRUE(overrides(body, {.inference_geo = bad}).empty()) << bad;
+    }
+}
+
+TEST(ApplyOverrides, RefusesANonStringValueAlreadyThere)
+{
+    EXPECT_TRUE(overrides(R"({"model":"m","speed":null})", {.speed = "fast"}).empty());
+    EXPECT_TRUE(overrides(R"({"model":"m","inference_geo":1})", {.inference_geo = "us"}).empty());
+}
+
+// The parser keeps keys as written, so `sp\u0065ed` is not found as `speed`; inserting
+// beside it would hand the provider two.
+TEST(ApplyOverrides, RefusesToInsertBesideAnEscapedKey)
+{
+    EXPECT_TRUE(overrides(R"({"model":"m","sp\u0065ed":"standard"})", {.speed = "fast"}).empty());
+}
+
+TEST(ApplyOverrides, TheTwoArgumentFormIsUnchanged)
+{
+    const std::string_view body = R"({"model":"m","service_tier":"flex"})";
+    EXPECT_EQ(llmbridge::provider::apply_overrides(body, "n", "priority"),
+              overrides(body, {.model = "n", .service_tier = "priority"}));
+    EXPECT_EQ(overrides(body, {}), body);
+}
+
 // ── openai::scan_usage and StreamUsage: key-anchored reads of venue bytes ──────
 namespace
 {

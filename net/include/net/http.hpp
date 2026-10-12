@@ -48,7 +48,7 @@ namespace llmbridge::net::http
         Connection, KeepAlive, ProxyConnection, Te, Trailer, Upgrade,
         Host, Expect, AcceptEncoding, Authorization, XApiKey, ApiKey, XGoogApiKey,
         AnthropicVersion, RetryAfter, RequestId, RequestsRemaining, InputTokensRemaining,
-        OutputTokensRemaining, TokensRemaining
+        OutputTokensRemaining, TokensRemaining, AnthropicBeta
     };
 
     constexpr bool hop_by_hop(Field f) noexcept { return f >= Field::Connection && f <= Field::Upgrade; }
@@ -190,6 +190,7 @@ namespace llmbridge::net::http
                 case 13: return is("authorization", Field::Authorization);
                 case 14:
                     return c == 'c' ? is("content-length", Field::ContentLength)
+                         : c == 'a' ? is("anthropic-beta", Field::AnthropicBeta)
                                     : is("x-goog-api-key", Field::XGoogApiKey);
                 case 15: return is("accept-encoding", Field::AcceptEncoding);
                 case 16:
