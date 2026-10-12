@@ -30,3 +30,7 @@ add_executable(nullrelay nullrelay.cpp)
 # baseline. Not a ctest; run by hand from a Release build.
 add_executable(protocol_micro protocol_micro.cpp)
 target_link_libraries(protocol_micro PRIVATE net provider)
+
+# bigbody: a large body sent at a set rate, timed to the venue's first byte and back.
+add_executable(bigbody bigbody.cpp)
+target_link_libraries(bigbody PRIVATE net)
