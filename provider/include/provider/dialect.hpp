@@ -1,0 +1,115 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+#pragma once
+
+// The venues in one table: each one's name, body dialect, credential scheme and
+// streaming, its translators, the path it is sent to and its finish reasons.
+
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+
+#include "provider/json.hpp"
+#include "provider/openai.hpp"
+
+namespace llmbridge::provider
+{
+    /// Where a request is sent. Bedrock and Azure carry transport quirks over a body
+    /// dialect: DESIGN.md "Dialect resolution".
+    enum class Venue
+    {
+        OpenAI,
+        Anthropic,
+        Gemini,
+        Cohere,
+        Bedrock,
+        Azure,
+    };
+
+    /// A body's wire format, apart from auth and URL layout.
+    enum class Wire : uint8_t { OpenAI, Anthropic, Gemini, Cohere };
+
+    /// How a venue takes the client's credential.
+    enum class Auth : uint8_t { Forward, XApiKey, GoogApiKey, Bearer, ApiKey, SigV4 };
+
+    /// What a request translator writes. `model`, when set, replaces the client's; it
+    /// is JSON string content with nothing to escape.
+    struct RequestOut
+    {
+        std::string& body;           ///< the venue's body, capacity kept
+        std::string_view raw{};      ///< the client's body as sent, for a venue that forwards it
+        std::string_view model{};
+        bool include_usage = false;  ///< `stream_options.include_usage`, as read
+    };
+
+    struct FinishRule
+    {
+        std::string_view from;
+        openai::Finish to;
+    };
+
+    struct VenueSpec
+    {
+        std::string_view name; ///< the one spelling: flags, config and logs
+        Wire wire;
+        Auth auth;
+        bool streams;      ///< a translated stream is served; else stream:true is refused
+        bool same_wire_forwards; ///< a client of the same wire is byte-forwarded
+        bool (*request)(const json::Value& in, RequestOut& out); ///< null: byte-forward
+        bool (*response)(std::string_view body, std::string& out, openai::Usage& u);
+        bool (*target)(std::string_view model, std::string& path); ///< appends; false: no model
+        std::span<const FinishRule> finish;
+        openai::Finish finish_default;
+    };
+
+    [[nodiscard]] const VenueSpec& spec(Venue v) noexcept;
+    [[nodiscard]] std::optional<Venue> venue_named(std::string_view name) noexcept;
+    /// Every venue's name, in Venue order.
+    [[nodiscard]] std::span<const std::string_view> venue_names() noexcept;
+
+    /// A venue's finish reason in OpenAI's terms, by its table.
+    [[nodiscard]] openai::Finish finish_of(const VenueSpec& s, std::string_view reason) noexcept;
+
+    /// Whether `s` can stand inside a JSON string unescaped: no quote, backslash or control.
+    [[nodiscard]] constexpr bool plain_json_text(std::string_view s) noexcept
+    {
+        for (const char ch : s)
+        {
+            const auto u = static_cast<unsigned char>(ch);
+            if (u < 0x20 || u == 0x7F || ch == '"' || ch == '\\') return false;
+        }
+        return true;
+    }
+
+    namespace detail
+    {
+        constexpr bool ends_with(std::string_view s, std::string_view tail) noexcept
+        {
+            return s.size() >= tail.size() && s.substr(s.size() - tail.size()) == tail;
+        }
+    } // namespace detail
+
+    /// What the caller speaks, from its method and full request target: exact routes on
+    /// the path, the query stripped. Anything else is OpenAI.
+    [[nodiscard]] constexpr Wire client_wire(std::string_view method, std::string_view target) noexcept
+    {
+        const std::string_view path = target.substr(0, target.find('?'));
+        if (detail::ends_with(path, "/chat/completions")) return Wire::OpenAI; // the common case
+        // Anthropic's batches take GET and DELETE as well; everything else here is a POST.
+        if (path.find("/v1/messages/batches") != std::string_view::npos) return Wire::Anthropic;
+        if (method != "POST") return Wire::OpenAI;
+        if (detail::ends_with(path, "/v1/messages") || detail::ends_with(path, "/v1/messages/count_tokens"))
+            return Wire::Anthropic;
+        if (detail::ends_with(path, ":generateContent") || detail::ends_with(path, ":streamGenerateContent"))
+            return Wire::Gemini;
+        if (detail::ends_with(path, "/v2/chat")) return Wire::Cohere;
+        return Wire::OpenAI;
+    }
+} // namespace llmbridge::provider

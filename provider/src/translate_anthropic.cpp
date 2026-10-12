@@ -18,8 +18,9 @@
 #include "content.hpp"
 #include "json_scan.hpp"
 #include "messages.hpp"
-#include "openai_common.hpp" // detail::now_secs / anthropic_finish_reason
+#include "openai_common.hpp" // detail::now_secs
 #include "provider/json.hpp"
+#include "venues.hpp"
 
 namespace llmbridge::provider
 {
@@ -380,28 +381,24 @@ namespace llmbridge::provider
         /// Written front to back into `out`, which keeps its capacity across agent
         /// turns. A request with no model, a parameter append_params refuses, or a
         /// message the walk refuses is refused whole.
-        bool messages_request(std::string_view openai_body, bool bedrock, std::string* model_out,
-                              bool* wants_stream_usage, std::string& out)
+        bool messages_request(const json::Value& v, bool bedrock, RequestOut& o)
         {
+            std::string& out = o.body;
             out.clear();
-            bool ok = false;
-            const json::Value v = json::parse(openai_body, ok);
-            if (!ok || !v.is_object()) return false;
-
-            if (wants_stream_usage)
+            if (!v.is_object()) return false;
             {
                 const json::Value* so = v.find("stream_options");
                 const json::Value* iu = so && so->is_object() ? so->find("include_usage") : nullptr;
-                *wants_stream_usage = iu && iu->type == json::Value::Type::Bool && iu->boolean;
+                o.include_usage = iu && iu->type == json::Value::Type::Bool && iu->boolean;
             }
 
             // A body carrying no `messages` array is not a chat request, and one with no
             // model names nothing to run. Refuse instead of guessing either.
             const json::Value* msgs = v.find("messages");
-            const std::string_view model = v.str_or("model");
+            const std::string_view model = o.model.empty() ? v.str_or("model") : o.model;
             if (!msgs || !msgs->is_array() || model.empty()) return false;
             {
-                const size_t need = openai_body.size() + 65536;
+                const size_t need = v.sv.size() + 65536;
                 if (out.capacity() < need) out.reserve(need + need / 8);
             }
             if (bedrock)
@@ -418,43 +415,66 @@ namespace llmbridge::provider
             // Anthropic requires max_tokens; default if the OpenAI request omitted it.
             out += ",\"max_tokens\":";
             out += detail::max_tokens_of(v, "1024");
-            ok = append_system(out, *msgs) && append_params(out, v);
+            bool ok = append_system(out, *msgs) && append_params(out, v);
             append_tools(out, v);
             out += ",\"messages\":[";
             AnthropicTurns turns{out};
             if (!ok || !detail::walk_messages(*msgs, turns)) { out.clear(); return false; }
             turns.close_results();
             out += "]}";
-            if (model_out) model_out->assign(model);
+            return true;
+        }
+
+        bool parsed_request(std::string_view openai_body, bool bedrock, std::string* model_out,
+                            bool* wants_stream_usage, std::string& out)
+        {
+            out.clear();
+            bool ok = false;
+            const json::Value v = json::parse(openai_body, ok);
+            if (!ok) return false;
+            RequestOut o{out};
+            if (!messages_request(v, bedrock, o)) return false;
+            if (wants_stream_usage) *wants_stream_usage = o.include_usage;
+            if (model_out) model_out->assign(v.str_or("model"));
             return true;
         }
     } // namespace
 
+    bool detail::anthropic_request(const json::Value& in, RequestOut& out)
+    {
+        return messages_request(in, false, out);
+    }
+
+    bool detail::bedrock_request(const json::Value& in, RequestOut& out)
+    {
+        return messages_request(in, true, out);
+    }
+
     bool openai_to_anthropic_request(std::string_view openai_body, std::string& out,
                                      bool* wants_stream_usage)
     {
-        return messages_request(openai_body, false, nullptr, wants_stream_usage, out);
+        return parsed_request(openai_body, false, nullptr, wants_stream_usage, out);
     }
 
     std::string openai_to_anthropic_request(std::string_view openai_body,
                                             bool* wants_stream_usage)
     {
         std::string out;
-        messages_request(openai_body, false, nullptr, wants_stream_usage, out);
+        parsed_request(openai_body, false, nullptr, wants_stream_usage, out);
         return out;
     }
 
     bool openai_to_bedrock_request(std::string_view openai_body, std::string& model_out,
                                    std::string& out)
     {
-        return messages_request(openai_body, true, &model_out, nullptr, out);
+        return parsed_request(openai_body, true, &model_out, nullptr, out);
     }
 
     std::string openai_to_bedrock_request(std::string_view openai_body,
                                           std::string& model_out)
     {
         std::string out;
-        messages_request(openai_body, true, &model_out, nullptr, out);
+        parsed_request(openai_body, true, &model_out, nullptr, out);
         return out;
     }
 
@@ -466,6 +486,8 @@ namespace llmbridge::provider
         bool ok = false;
         json::Value v = json::parse(anthropic_body, ok);
         if (!ok || !v.is_object()) return false;
+        const openai::Finish finish = finish_of(spec(Venue::Anthropic), v.str_or("stop_reason", "end_turn"));
+        if (finish == openai::Finish::Error) return false;
 
         if (const json::Value* m = v.find("usage"))
         {
@@ -507,7 +529,7 @@ namespace llmbridge::provider
             out += '"';
         }
         if (tools) append_tool_calls(out, *c);
-        e.end_choice(detail::anthropic_finish_reason(v.str_or("stop_reason", "end_turn")))
+        e.end_choice(openai::finish_name(finish))
             .close(&usage);
         return true;
     }

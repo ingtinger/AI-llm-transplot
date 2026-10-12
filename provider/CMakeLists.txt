@@ -5,6 +5,7 @@
 
 add_library(provider STATIC
         src/openai.cpp
+        src/registry.cpp
         src/translate_anthropic.cpp
         src/translate_body.cpp
         src/translate_cohere.cpp

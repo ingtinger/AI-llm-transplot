@@ -17,6 +17,7 @@
 #include "messages.hpp"
 #include "openai_common.hpp" // detail::now_secs / as_written
 #include "provider/json.hpp"
+#include "venues.hpp"
 
 namespace llmbridge::provider
 {
@@ -51,28 +52,37 @@ namespace llmbridge::provider
         };
     } // namespace
 
-    std::string openai_to_cohere_request(std::string_view openai_body)
+    bool detail::cohere_request(const json::Value& v, RequestOut& o)
     {
-        bool ok = false;
-        const json::Value v = json::parse(openai_body, ok);
-        if (!ok || !v.is_object()) return {};
+        std::string& out = o.body;
+        out.clear();
+        if (!v.is_object()) return false;
         // No `messages` array is not a chat request, and no model names nothing to run.
         const json::Value* msgs = v.find("messages");
-        const std::string_view model = v.str_or("model");
-        if (!msgs || !msgs->is_array() || model.empty() || detail::declares_tools(v)) return {};
+        const std::string_view model = o.model.empty() ? v.str_or("model") : o.model;
+        if (!msgs || !msgs->is_array() || model.empty() || declares_tools(v)) return false;
 
-        std::string out;
-        out.reserve(openai_body.size() + 256);
+        if (out.capacity() < v.sv.size() + 256) out.reserve(v.sv.size() + 256);
         out = "{\"model\":";
         json::append_raw_string(out, model);
         out += ",\"messages\":[";
         CohereTurns turns{out};
-        if (!detail::walk_messages(*msgs, turns)) return {};
+        if (!walk_messages(*msgs, turns)) { out.clear(); return false; }
         out += ']';
-        if (std::string_view mt = detail::max_tokens_of(v); !mt.empty()) { out += ",\"max_tokens\":"; out += mt; }
+        if (std::string_view mt = max_tokens_of(v); !mt.empty()) { out += ",\"max_tokens\":"; out += mt; }
         if (std::string_view t = v.num_or("temperature"); !t.empty()) { out += ",\"temperature\":"; out += t; }
         if (std::string_view p = v.num_or("top_p"); !p.empty()) { out += ",\"p\":"; out += p; } // Cohere: top_p is "p"
         out += "}";
+        return true;
+    }
+
+    std::string openai_to_cohere_request(std::string_view openai_body)
+    {
+        bool ok = false;
+        const json::Value v = json::parse(openai_body, ok);
+        std::string out;
+        RequestOut o{out};
+        if (!ok || !detail::cohere_request(v, o)) return {};
         return out;
     }
 
@@ -85,9 +95,8 @@ namespace llmbridge::provider
         json::Value v = json::parse(cohere_body, ok);
         if (!ok || !v.is_object()) return false;
 
-        // Cohere finish_reason -> OpenAI finish_reason.
-        const std::string_view fr = v.str_or("finish_reason", "COMPLETE");
-        const char* finish = fr == "MAX_TOKENS" ? "length" : fr == "TOOL_CALL" ? "tool_calls" : "stop";
+        const openai::Finish finish = finish_of(spec(Venue::Cohere), v.str_or("finish_reason", "COMPLETE"));
+        if (finish == openai::Finish::Error) return false;
 
         if (const json::Value* u = v.find("usage"))
             if (const json::Value* t = u->find("tokens"))
@@ -109,7 +118,7 @@ namespace llmbridge::provider
                 for (const auto& blk : c->arr)
                     if (blk.str_or("type") == "text") out += blk.str_or("text");
         out += '"';
-        e.end_choice(finish).close(&usage);
+        e.end_choice(openai::finish_name(finish)).close(&usage);
         return true;
     }
 

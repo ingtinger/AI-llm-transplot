@@ -623,6 +623,12 @@ namespace llmbridge::provider::json
                 ok = false; v.obj = commit_members(mark); return v;
             }
         };
+        /// Documents parsed on this thread, so a test can assert a body is parsed once.
+        inline uint64_t& parse_count() noexcept
+        {
+            thread_local uint64_t n = 0;
+            return n;
+        }
     } // namespace detail
 
     /// Parse one JSON document: a single value with nothing but whitespace after
@@ -633,6 +639,7 @@ namespace llmbridge::provider::json
     {
         // The arena is handed to the root even when the parse fails, because a failed
         // parse still returns whatever it built and those nodes live in here.
+        ++detail::parse_count();
         detail::Arena* arena = detail::take_arena(text.size());
         detail::Scratch& sc = detail::scratch();
         const bool reentrant = sc.busy;

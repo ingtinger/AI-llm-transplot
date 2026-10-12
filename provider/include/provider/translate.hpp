@@ -7,8 +7,9 @@
 
 #pragma once
 
-// OpenAI chat-completion bodies to and from Anthropic, Bedrock, Gemini and Cohere. Edits
-// are splices of top-level keys, never re-serialisations: DESIGN.md "Translation model".
+// OpenAI chat-completion bodies to and from Anthropic, Bedrock, Gemini and Cohere, as
+// string facades over the venue table (provider/dialect.hpp), kept as they are for
+// embedders. Edits are splices of top-level keys: DESIGN.md "Translation model".
 
 #include <string>
 #include <string_view>
