@@ -54,7 +54,7 @@ namespace llmbridge::provider
         }
     } // namespace
 
-    void BodyScan::reset() noexcept
+    void BodyScan::reset(bool all_keys, bool track_model) noexcept
     {
         _top.clear();
         _options.clear();
@@ -65,6 +65,10 @@ namespace llmbridge::provider
         _st = St::Value;
         _lit = _hex = 0;
         _key = _tracked = _options_next = false;
+        _all_keys = all_keys;
+        _track_model = track_model;
+        _model_next = _model_open = _model_seen = false;
+        _model_at = _model_end = SIZE_MAX;
         _why = nullptr;
         _verdict = Verdict::More;
     }
@@ -89,9 +93,16 @@ namespace llmbridge::provider
         return _st == St::End ? (_verdict = Verdict::Done) : refuse("body ends inside a value");
     }
 
-    // After a value of any kind: what its container expects next.
-    bool BodyScan::value_done() noexcept
+    // After a value of any kind, ending before `end`: what its container expects next.
+    bool BodyScan::value_done(size_t end) noexcept
     {
+        if (_model_open && _depth == 1)
+        {
+            // The tracked model closed: its bytes may go, or something else in their place.
+            _model_open = false;
+            _model_end = end;
+            _hold = SIZE_MAX;
+        }
         if (_depth == 0) _st = St::End;
         else _st = (_kinds >> (_depth - 1)) & 1 ? St::ObjNext : St::ArrNext;
         return true;
@@ -106,6 +117,13 @@ namespace llmbridge::provider
         const std::string_view k = body.substr(_str, end - _str);
         std::vector<Span>& set = _depth == 1 ? _top : _options;
         if (k.find('\\') != std::string_view::npos) { _why = "escaped top-level key"; return false; }
+        if (_depth == 1 && k == "model")
+        {
+            if (_model_seen) { _why = "repeated top-level key"; return false; }
+            _model_seen = true;
+            _model_next = _track_model;
+        }
+        if (!_all_keys) return true;
         if (set.size() == kMaxKeys) { _why = "too many top-level keys"; return false; }
         for (const Span& s : set)
             if (s.len == k.size() && std::memcmp(body.data() + s.at, k.data(), k.size()) == 0)
@@ -142,7 +160,7 @@ namespace llmbridge::provider
                 const char d = b[i++];
                 if (d == '\\') { _st = St::StrEsc; return true; }
                 if (d != '"') { _why = "control byte in a string"; return false; }
-                if (!_key) return value_done();
+                if (!_key) return value_done(i);
                 _st = St::Colon;
                 return key_done(b, i - 1);
             }
@@ -161,7 +179,7 @@ namespace llmbridge::provider
                 const std::string_view lit = kLits[_lit >> 3];
                 if (c != lit[_lit & 7]) return false;
                 ++i;
-                if ((++_lit & 7) == lit.size()) return value_done();
+                if ((++_lit & 7) == lit.size()) return value_done(i);
                 return true;
             }
             case St::NumSign:
@@ -177,7 +195,7 @@ namespace llmbridge::provider
                 }
                 if (c == '.') { ++i; _st = St::NumDot; return true; }
                 if (c == 'e' || c == 'E') { ++i; _st = St::NumE; return true; }
-                return value_done(); // `c` is reread by the container
+                return value_done(i); // `c` is reread by the container
             case St::NumDot:
                 ++i;
                 _st = St::NumFrac;
@@ -185,7 +203,7 @@ namespace llmbridge::provider
             case St::NumFrac:
                 if (digit(c)) { ++i; return true; }
                 if (c == 'e' || c == 'E') { ++i; _st = St::NumE; return true; }
-                return value_done();
+                return value_done(i);
             case St::NumE:
                 ++i;
                 if (c == '+' || c == '-') { _st = St::NumESign; return true; }
@@ -197,7 +215,7 @@ namespace llmbridge::provider
                 return digit(c);
             case St::NumExp:
                 if (digit(c)) { ++i; return true; }
-                return value_done();
+                return value_done(i);
             default:
                 break;
         }
@@ -234,6 +252,13 @@ namespace llmbridge::provider
                 // A value starts. `stream_options`' keys are checked when it is an object.
                 const bool options = _options_next;
                 _options_next = false;
+                if (_model_next)
+                {
+                    // Held from its first byte until it closes (value_done).
+                    _model_next = false;
+                    _model_open = true;
+                    _model_at = _hold = i - 1;
+                }
                 if (c == '"') { _key = false; _st = St::Str; return true; }
                 if (c == '{' || c == '[')
                 {
@@ -263,6 +288,6 @@ namespace llmbridge::provider
         // A container closed.
         --_depth;
         if (_depth < _options_depth) _options_depth = 0;
-        return value_done();
+        return value_done(i);
     }
 } // namespace llmbridge::provider

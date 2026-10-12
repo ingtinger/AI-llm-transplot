@@ -536,6 +536,26 @@ namespace llmbridge::detail
         return nullptr;
     }
 
+    bool ModelSplice::matches(std::string_view body, size_t at, size_t end) const noexcept
+    {
+        return end != SIZE_MAX && end - at == sentinel.size() + 2 && end <= body.size() && body[at] == '"' &&
+               body.compare(at + 1, sentinel.size(), sentinel) == 0 && body[end - 1] == '"';
+    }
+
+    void ModelSplice::append(std::string& out, std::string_view body, size_t from, size_t to, size_t body_len,
+                             size_t at, size_t end) const
+    {
+        const bool hit = matches(body, at, end);
+        if (hit && from <= at && at < to)
+        {
+            out.append(body.substr(from, at - from)).append(1, '"').append(replacement).append(1, '"');
+            out.append(shrink(), ' '); // whitespace after a value is JSON's
+            from = end;
+        }
+        if (from < to) out.append(body.substr(from, to - from));
+        if (to == body_len && !hit) out.append(grow(), ' '); // and after the root
+    }
+
     bool request_without(std::string_view msg, size_t header_len,
                          const std::vector<std::string>& strip,
                          std::string_view host_hdr, std::string_view base_path,

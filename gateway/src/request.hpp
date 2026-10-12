@@ -123,6 +123,38 @@ namespace llmbridge::detail
                               const std::vector<std::string>& strip, std::string_view host_hdr,
                               std::string_view base_path, std::string_view body,
                               std::string& into, size_t declared, const NamedKey& key = {});
+    /// A conditional model substitution spliced into a body forwarded as it arrives
+    /// (GATEWAY-INTERNALS.md 12d). The head declares the client's length plus grow(): a
+    /// value that is the sentinel goes as the replacement, then shrink() spaces; any other
+    /// value goes as sent, and grow() spaces follow the body's last byte. Either way the
+    /// venue gets exactly the declared length, and valid JSON when the client's was.
+    struct ModelSplice
+    {
+        std::string_view sentinel, replacement; ///< both substitute_ok: no escaping needed
+
+        [[nodiscard]] size_t grow() const noexcept
+        {
+            return replacement.size() > sentinel.size() ? replacement.size() - sentinel.size() : 0;
+        }
+        [[nodiscard]] size_t shrink() const noexcept
+        {
+            return sentinel.size() > replacement.size() ? sentinel.size() - replacement.size() : 0;
+        }
+        /// The value at [at, end) of `body` is the sentinel, raw: `"` sentinel `"`.
+        [[nodiscard]] bool matches(std::string_view body, size_t at, size_t end) const noexcept;
+        /// Appends the venue's bytes for body[from, to), of a body `body_len` long whose
+        /// model value is [at, end) (BodyScan::model_at and model_end; end SIZE_MAX while
+        /// open or absent). Neither `from` nor `to` may fall inside the value.
+        void append(std::string& out, std::string_view body, size_t from, size_t to, size_t body_len, size_t at,
+                    size_t end) const;
+    };
+    /// A Decision's or a Retry's substitution: none, or both halves substitute_ok.
+    [[nodiscard]] inline bool substitution_ok(std::string_view model, std::string_view for_model) noexcept
+    {
+        return (model.empty() && for_model.empty()) ||
+               (substitute_ok(model, kMaxSubstituteModel) && substitute_ok(for_model, kMaxSubstituteFor));
+    }
+
     /// build_forward over a message whose facts are read here, with the key in family
     /// header `key_header` sent as `venue` takes it; false refuses it, why in `refused`.
     bool request_without(std::string_view msg, size_t header_len,

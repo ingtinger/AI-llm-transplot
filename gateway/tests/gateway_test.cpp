@@ -13003,6 +13003,7 @@ namespace
         size_t body_bytes = 0;
         int64_t at = 0;          ///< when it was called
         size_t venue_bytes = 0;  ///< what `probe` read then
+        bool substituted = false; ///< RequestFacts::model_substituted
     };
 
     /// The decision confirm() was handed as the one in force.
@@ -13011,6 +13012,7 @@ namespace
         int upstream_index = -1;
         std::string model, credential_header;
         uint64_t tag = 0;
+        std::string substitute_model, substitute_for;
     };
 
     /// Opts in to deciding on the head unless `opt_in` is cleared, records every call, and
@@ -13035,7 +13037,8 @@ namespace
                 std::lock_guard<std::mutex> lk(_mu);
                 _confirms.push_back(seen(f));
                 _early.push_back({early.upstream_index, std::string(early.model),
-                                  std::string(early.credential_header), early.tag});
+                                  std::string(early.credential_header), early.tag,
+                                  std::string(early.substitute_model), std::string(early.substitute_for)});
             }
             in_confirm.store(true);
             for (int i = 0; gate && !gate->load() && i < 1000; ++i)
@@ -13074,7 +13077,7 @@ namespace
         SeenFacts seen(const llmbridge::RequestFacts& f) const
         {
             return {f.body_whole, std::string(f.model), f.stream, f.include_usage, f.prefix_hash,
-                    f.body_bytes, llmbridge::now_ns(), probe ? probe() : 0};
+                    f.body_bytes, llmbridge::now_ns(), probe ? probe() : 0, f.model_substituted};
         }
         mutable std::mutex _mu;
         std::vector<SeenFacts> _decides, _confirms;
@@ -13888,6 +13891,542 @@ TEST_P(ProxyHeadDecide, ARedoIsTimedAsAFreshAttempt)
     ASSERT_EQ(pol.confirms().size(), 1u);
     EXPECT_GE(pol.confirms()[0].at, r.ts_req_recvd);
     EXPECT_LE(pol.confirms()[0].at, r.ts_req_built);
+}
+
+// ── A model substitution spliced into a streamed body (GATEWAY-INTERNALS.md 12d) ──
+
+namespace
+{
+    /// kottos' head decision for an "auto" route: substitute `to` for "auto" at venue `venue`.
+    llmbridge::Decision auto_route(int venue = 0, const char* to = "gpt-4o-mini", const char* sentinel = "auto")
+    {
+        return llmbridge::Decision{.allow = true, .upstream_index = venue, .substitute_model = to,
+                                   .substitute_for = sentinel};
+    }
+    /// As the openai-python SDK serializes a streamed chat completion: messages first, the
+    /// model after them, then `stream` and `stream_options`. `model` is raw JSON.
+    Halves openai_sdk_halves(const std::string& model = R"("auto")")
+    {
+        return split_request(R"({"messages":[{"role":"user","content":")" + std::string(64 * 1024, 'p'),
+                             R"("}])" + (model.empty() ? std::string() : R"(,"model":)" + model) +
+                                 R"(,"stream":true,"stream_options":{"include_usage":true}})");
+    }
+    /// As the anthropic-python SDK serializes one: max_tokens, messages, the model, then the rest.
+    Halves anthropic_sdk_halves(const std::string& part, const std::string& rest)
+    {
+        return {"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nx-api-key: k\r\n"
+                "anthropic-version: 2023-06-01\r\nContent-Length: " +
+                    std::to_string(part.size() + rest.size()) + "\r\n\r\n" + part,
+                rest};
+    }
+    std::string replaced(std::string body, const std::string& was, const std::string& now)
+    {
+        const size_t at = body.find(was);
+        return at == std::string::npos ? std::string("<missing>") : body.replace(at, was.size(), now);
+    }
+    bool declares(const std::string& up, size_t n)
+    {
+        return up.find("\r\nContent-Length: " + std::to_string(n) + "\r\n") != std::string::npos;
+    }
+    bool parses(const std::string& body)
+    {
+        bool ok = false;
+        (void)llmbridge::provider::json::parse(body, ok);
+        return ok;
+    }
+    std::string post_json(const std::string& body)
+    {
+        return "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+} // namespace
+
+// The openai-python shape names its model last, so a head decision cannot know it. Under a
+// substitution the body still streams: the venue gets it with "auto" replaced, under a
+// Content-Length that counts the replacement, and the confirm keeps it with no redo.
+TEST_P(ProxyHeadDecide, AnAutoModelSentLastIsSplicedIntoTheStream)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    const Halves h = openai_sdk_halves();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; })) << "held to its last byte";
+    EXPECT_TRUE(pol.confirms().empty());
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string want = replaced(whole_body(h), R"("model":"auto")", R"("model":"gpt-4o-mini")");
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_TRUE(declares(up, want.size())) << up.substr(0, 300);
+    EXPECT_EQ(_backend.requests_seen(), 1);
+    EXPECT_EQ(_backend.resets(), 0);
+    EXPECT_EQ(_second.accepted(), 0);
+    ASSERT_EQ(pol.decides().size(), 1u);
+    EXPECT_EQ(pol.decides()[0].model, "");
+    const auto w = pol.confirms();
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_EQ(w[0].model, "auto") << "the client's own";
+    EXPECT_TRUE(w[0].substituted);
+    EXPECT_TRUE(w[0].stream);
+    EXPECT_TRUE(w[0].include_usage);
+    ASSERT_EQ(pol.earlies().size(), 1u);
+    EXPECT_EQ(pol.earlies()[0].substitute_model, "gpt-4o-mini");
+    EXPECT_EQ(pol.earlies()[0].substitute_for, "auto");
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.streamed_bodies, 1u);
+    EXPECT_EQ(st.streamed_body_parked, 0u);
+    EXPECT_EQ(st.streamed_body_redone, 0u);
+    EXPECT_EQ(st.streamed_model_substituted, 1u);
+    EXPECT_EQ(st.streamed_model_padded, 0u);
+    EXPECT_EQ(st.errors, 0u);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.confirm_outcome, llmbridge::ConfirmOutcome::Kept);
+    EXPECT_TRUE(recs[0].r.model_substituted);
+    EXPECT_TRUE(recs[0].r.body_streamed);
+    EXPECT_EQ(recs[0].model, "auto");
+}
+
+namespace
+{
+    /// A body whose model is not the sentinel streams as sent, then the replacement's extra
+    /// length in spaces after its last byte: `model` is raw JSON, or empty for none.
+    void expect_padded(const std::function<void()>& shutdown, TestBackend& venue, HeadPolicy& pol, uint16_t port,
+                       const std::string& model, const std::string& seen_model)
+    {
+        const Halves h = openai_sdk_halves(model);
+        Client c;
+        ASSERT_TRUE(c.connect(port));
+        ASSERT_TRUE(c.send(h.first));
+        EXPECT_TRUE(wait_for([&] { return venue.bytes_seen() > 16 * 1024; })) << "held to its last byte";
+        ASSERT_TRUE(c.send(h.rest));
+        ASSERT_EQ(c.recv_status(), 200);
+        c.close();
+        shutdown();
+        const std::string want = whole_body(h) + std::string(7, ' ');
+        const std::string up = venue.last_request();
+        EXPECT_EQ(body_of(up), want);
+        EXPECT_TRUE(declares(up, want.size())) << up.substr(0, 300);
+        EXPECT_TRUE(parses(body_of(up))) << "trailing whitespace is JSON";
+        ASSERT_EQ(pol.confirms().size(), 1u);
+        EXPECT_EQ(pol.confirms()[0].model, seen_model);
+        EXPECT_FALSE(pol.confirms()[0].substituted);
+    }
+} // namespace
+
+TEST_P(ProxyHeadDecide, ARealModelGoesAsSentPaddedToTheDeclaredLength)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    expect_padded([this] { shutdown(); }, _backend, pol, _proxy_port, R"("gpt-4o")", "gpt-4o");
+    EXPECT_EQ(_gw->stats().streamed_model_padded, 1u);
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 0u);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 0u);
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_FALSE(sink.records()[0].r.model_substituted);
+}
+
+// Matched byte for byte: a model as long as the sentinel, or the sentinel in another case,
+// is another model.
+TEST_P(ProxyHeadDecide, AModelAsLongAsTheSentinelIsNotMistakenForIt)
+{
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    expect_padded([this] { shutdown(); }, _backend, pol, _proxy_port, R"("AUTO")", "AUTO");
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 0u);
+}
+
+TEST_P(ProxyHeadDecide, ABodyWithoutAModelIsPadded)
+{
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    expect_padded([this] { shutdown(); }, _backend, pol, _proxy_port, "", "");
+    EXPECT_EQ(_gw->stats().streamed_model_padded, 1u);
+}
+
+// The sentinel is matched raw: an escaped spelling of it, which a venue would read as the
+// same name, is not a plain string, so it goes as sent and confirm() sees no model and
+// no substitution. A policy that routes on it redoes the request, as before.
+TEST_P(ProxyHeadDecide, AnEscapedSentinelGoesAsSent)
+{
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    expect_padded([this] { shutdown(); }, _backend, pol, _proxy_port, R"("\u0061uto")", "");
+}
+
+TEST_P(ProxyHeadDecide, ANonStringModelGoesAsSent)
+{
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    expect_padded([this] { shutdown(); }, _backend, pol, _proxy_port, R"({"name":"auto"})", "");
+}
+
+// A replacement shorter than the sentinel declares the client's length: the value goes
+// replaced, then spaces, and a body with another model goes exactly as sent.
+TEST_P(ProxyHeadDecide, AReplacementShorterThanTheSentinelIsPaddedAfterIt)
+{
+    HeadPolicy pol;
+    pol.heads = {auto_route(0, "o3", "auto-router")};
+    start_with(pol);
+    const std::vector<std::string> models = {"auto-router", "gpt-4o"};
+    std::vector<std::string> wants;
+    for (const std::string& model : models)
+    {
+        const Halves h = openai_sdk_halves("\"" + model + "\"");
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(h.first));
+        const size_t was = _backend.bytes_seen();
+        EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > was + 16 * 1024; }));
+        ASSERT_TRUE(c.send(h.rest));
+        ASSERT_EQ(c.recv_status(), 200);
+        c.close();
+        wants.push_back(model == "gpt-4o" ? whole_body(h)
+                                          : replaced(whole_body(h), R"("model":"auto-router")",
+                                                     R"("model":"o3")" + std::string(9, ' ')));
+    }
+    shutdown();
+    const std::string all = _backend.all_requests();
+    for (const std::string& want : wants)
+    {
+        const size_t at = all.find(want);
+        ASSERT_NE(at, std::string::npos) << "a body the venue did not get";
+        const std::string up = all.substr(0, at);
+        EXPECT_TRUE(declares(up.substr(up.rfind("POST ")), want.size()));
+        EXPECT_TRUE(parses(want));
+    }
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 1u);
+    EXPECT_EQ(_gw->stats().streamed_model_padded, 0u) << "nothing to pad";
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 0u);
+}
+
+// The anthropic-python shape names its model mid-body, after the messages. Another
+// dialect's body is scanned under a substitution too, only so its model can be spliced.
+TEST_P(ProxyHeadDecide, AnAnthropicModelMidBodyIsSpliced)
+{
+    _second.set_response(http_ok(anthropic_resp_body("ok")));
+    HeadPolicy pol;
+    pol.heads = {auto_route(1, "claude-sonnet-4-5")};
+    start_with(pol, UpstreamDialect::Anthropic);
+    const Halves h = anthropic_sdk_halves(
+        R"({"max_tokens":1024,"messages":[{"role":"user","content":")" + std::string(64 * 1024, 'p'),
+        R"("}],"model":"auto","system":"be brief","stream":true})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _second.bytes_seen() > 16 * 1024; })) << "held to its last byte";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string want = replaced(whole_body(h), R"("model":"auto")", R"("model":"claude-sonnet-4-5")");
+    const std::string up = _second.last_request();
+    EXPECT_EQ(up.rfind("POST /v1/messages HTTP/1.1\r\n", 0), 0u);
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_TRUE(declares(up, want.size())) << up.substr(0, 300);
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_TRUE(pol.confirms()[0].substituted);
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 0u);
+    EXPECT_EQ(_backend.accepted(), 0);
+}
+
+// Never two models: another dialect's repeat is refused before it leaves, as an OpenAI
+// client's always was, and the venue is reset short of the body.
+TEST_P(ProxyHeadDecide, ARepeatedModelUnderASubstitutionIsRefused)
+{
+    _second.set_response(http_ok(anthropic_resp_body("ok")));
+    HeadPolicy pol;
+    pol.heads = {auto_route(1, "claude-sonnet-4-5")};
+    start_with(pol, UpstreamDialect::Anthropic);
+    const Halves h = anthropic_sdk_halves(
+        R"({"model":"auto","max_tokens":1024,"messages":[{"role":"user","content":")" +
+            std::string(64 * 1024, 'p'),
+        R"("}],"model":"evil","pad":")" + std::string(32 * 1024, 'q') + "\"}");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _second.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest.substr(0, h.rest.size() - 2))); // not its last byte
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 400) << r;
+    EXPECT_NE(r.find("repeats a top-level key"), std::string::npos) << r;
+    EXPECT_TRUE(wait_for([&] { return _second.resets() == 1; }));
+    c.close();
+    shutdown();
+    EXPECT_EQ(_second.requests_seen(), 0);
+    const auto cut = _second.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut[0].find("evil"), std::string::npos) << "the repeat went upstream";
+    EXPECT_NE(cut[0].find(R"("model":"claude-sonnet-4-5")"), std::string::npos);
+    EXPECT_TRUE(pol.confirms().empty());
+    EXPECT_EQ(_gw->stats().streamed_body_refusals, 1u);
+}
+
+// A failover while the body streams resends it from its first byte under the retry's own
+// substitution, the new venue's model.
+TEST_P(ProxyHeadDecide, AFailoverMidUploadSplicesTheRetrysSubstitution)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    pol.retry = {.retry = true, .upstream_index = 1, .substitute_model = "gpt-4.1", .substitute_for = "auto"};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port());
+    const Halves h = openai_sdk_halves();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _second.bytes_seen() > 16 * 1024; })) << "the failover held the body";
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    c.close();
+    shutdown();
+    const std::string want = replaced(whole_body(h), R"("model":"auto")", R"("model":"gpt-4.1")");
+    const std::string up = _second.last_request();
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_TRUE(declares(up, want.size())) << up.substr(0, 300);
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 0u);
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 1u);
+    ASSERT_EQ(pol.earlies().size(), 1u);
+    EXPECT_EQ(pol.earlies()[0].upstream_index, 1);
+    EXPECT_EQ(pol.earlies()[0].substitute_model, "gpt-4.1");
+}
+
+// A retry that substitutes where the head decision did not: the model was not tracked from
+// the first byte, so the body parks, then goes rewritten whole.
+TEST_P(ProxyHeadDecide, AFailoverThatFirstNamesASubstitutionParks)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.retry = {.retry = true, .upstream_index = 1, .substitute_model = "gpt-4.1", .substitute_for = "auto"};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port());
+    const Halves h = openai_sdk_halves();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(_second.bytes_seen(), 0u) << "a byte left before the body was complete";
+    ASSERT_TRUE(c.send(h.rest));
+    EXPECT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string want = replaced(whole_body(h), R"("model":"auto")", R"("model":"gpt-4.1")");
+    EXPECT_EQ(body_of(_second.last_request()), want);
+    EXPECT_TRUE(declares(_second.last_request(), want.size()));
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+}
+
+// A pooled venue that dropped the connection as the body began: the retry rebuilds what
+// went, the replacement spliced in again, under the same declared length.
+TEST_P(ProxyHeadDecide, AStaleRetryReappliesTheSplice)
+{
+    _backend.set_drop_first_mid_second(true);
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "")));
+    ASSERT_EQ(c.recv_status(), 200);
+    const Halves h = split_request(R"({"model":"auto","messages":[{"role":"user","content":")" +
+                                       std::string(64 * 1024, 'p'),
+                                   R"("}],"stream":true})");
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.accepted() == 2; })) << "no retry on a fresh connection";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_retries, 1u);
+    const std::string want = replaced(whole_body(h), R"("model":"auto")", R"("model":"gpt-4o-mini")");
+    EXPECT_EQ(body_of(_backend.last_request()), want);
+    EXPECT_TRUE(declares(_backend.last_request(), want.size()));
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_TRUE(declares(cut[0], want.size()));
+    EXPECT_EQ(cut[0].find(R"("model":"auto")"), std::string::npos) << "the first attempt sent the sentinel";
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 1u);
+}
+
+// confirm() may still change its mind: the spliced venue is reset short of its length and
+// the whole body goes to the new one rewritten as a held body.
+TEST_P(ProxyHeadDecide, AConfirmThatChangesItsMindRedoesASplicedBody)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    pol.whole = llmbridge::Decision{.allow = true, .upstream_index = 1, .model = "other-model"};
+    start_with(pol);
+    const Halves h = openai_sdk_halves();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_NE(r.find("second"), std::string::npos) << r;
+    EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; })) << "the first venue was not reset";
+    c.close();
+    shutdown();
+    const std::string want = replaced(whole_body(h), R"("model":"auto")", R"("model":"other-model")");
+    EXPECT_EQ(body_of(_second.last_request()), want);
+    EXPECT_TRUE(declares(_second.last_request(), want.size()));
+    EXPECT_EQ(_backend.requests_seen(), 0);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 1u);
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 0u);
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_EQ(sink.records()[0].r.confirm_outcome, llmbridge::ConfirmOutcome::Redone);
+    EXPECT_FALSE(sink.records()[0].r.model_substituted);
+}
+
+// A confirm that names the substituted model outright sends the venue what it already has:
+// a keep, not a redo.
+TEST_P(ProxyHeadDecide, AConfirmNamingTheSubstitutedModelKeeps)
+{
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    pol.whole = llmbridge::Decision{.allow = true, .upstream_index = 0, .model = "gpt-4o-mini"};
+    start_with(pol);
+    const Halves h = openai_sdk_halves();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    EXPECT_EQ(body_of(_backend.last_request()),
+              replaced(whole_body(h), R"("model":"auto")", R"("model":"gpt-4o-mini")"));
+    EXPECT_EQ(_backend.resets(), 0);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 0u);
+    EXPECT_EQ(_second.accepted(), 0);
+}
+
+// A body not sent as JSON is not scanned, so nothing is spliced into it: confirm() is told
+// so, and keeping the substitution redoes the request, the whole body rewritten.
+TEST_P(ProxyHeadDecide, AnUnscannedBodyUnderASubstitutionIsRedoneWhole)
+{
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    const Halves h = split_request(R"({"model":"auto","messages":[{"role":"user","content":")" +
+                                       std::string(64 * 1024, 'p'),
+                                   R"("}]})", /*json=*/false);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_EQ(pol.confirms()[0].model, "auto");
+    EXPECT_FALSE(pol.confirms()[0].substituted);
+    const std::string want = replaced(whole_body(h), R"("model":"auto")", R"("model":"gpt-4o-mini")");
+    EXPECT_EQ(body_of(_backend.last_request()), want);
+    EXPECT_TRUE(declares(_backend.last_request(), want.size()));
+    EXPECT_EQ(_backend.requests_seen(), 1);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 1u);
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 0u);
+}
+
+// A body decided whole, held or parked, knows its model: the substitution is an override,
+// applied in the one rewrite a held body gets, and nothing is padded.
+TEST_P(ProxyHeadDecide, AHeldBodyUnderASubstitutionIsRewrittenWhole)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    const std::string mine = R"({"model":"auto","messages":[{"role":"user","content":"hi"}]})";
+    const std::string theirs = R"({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]})";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(post_json(mine)));
+    ASSERT_EQ(c.recv_status(), 200);
+    ASSERT_TRUE(c.send(post_json(theirs)));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.all_requests().find(R"("model":"auto")"), std::string::npos);
+    EXPECT_NE(_backend.all_requests().find(replaced(mine, R"("model":"auto")", R"("model":"gpt-4o-mini")")),
+              std::string::npos);
+    EXPECT_EQ(body_of(_backend.last_request()), theirs);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_TRUE(recs[0].r.model_substituted);
+    EXPECT_FALSE(recs[1].r.model_substituted);
+    EXPECT_EQ(_gw->stats().streamed_model_substituted + _gw->stats().streamed_model_padded, 0u);
+}
+
+TEST_P(ProxyHeadDecide, AHoldUnderASubstitutionParksAndRewritesWhole)
+{
+    HeadPolicy pol;
+    llmbridge::Decision d = auto_route();
+    d.hold = true;
+    pol.heads = {d};
+    pol.probe = [this] { return _backend.bytes_seen(); };
+    start_with(pol);
+    const Halves h = openai_sdk_halves();
+    expect_parked(_backend, pol, h, _proxy_port);
+    shutdown();
+    const std::string want = replaced(whole_body(h), R"("model":"auto")", R"("model":"gpt-4o-mini")");
+    EXPECT_EQ(body_of(_backend.last_request()), want);
+    EXPECT_TRUE(declares(_backend.last_request(), want.size()));
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+}
+
+// Either half is written into JSON unescaped and sized ahead of the stream: one the gateway
+// cannot use is a 500, as an override too long is, on the head and on a whole body alike.
+TEST_P(ProxyHeadDecide, AnUnusableSubstitutionIsA500)
+{
+    const std::string too_long(llmbridge::kMaxSubstituteModel + 1, 'm');
+    const std::string sentinel_too_long(llmbridge::kMaxSubstituteFor + 1, 'a');
+    HeadPolicy pol;
+    pol.heads = {auto_route(0, too_long.c_str()), auto_route(0, "a\"b"), auto_route(0, "a\\b"),
+                 auto_route(0, "gpt-4o", ""), auto_route(0, "gpt-4o", sentinel_too_long.c_str()),
+                 auto_route(0, "gpt\x01")};
+    start_with(pol);
+    for (size_t i = 0; i < pol.heads.size(); ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(post_json(R"({"model":"auto"})")));
+        EXPECT_EQ(c.recv_status(), 500) << i;
+    }
+    // On the head: answered before any of the body went.
+    const Halves h = openai_sdk_halves();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_EQ(c.recv_status(), 500);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.accepted(), 0);
+    EXPECT_EQ(pol.decides().size(), pol.heads.size() + 1);
+    EXPECT_FALSE(pol.decides().back().whole);
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyHeadDecide,

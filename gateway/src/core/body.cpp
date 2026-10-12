@@ -55,17 +55,20 @@ namespace llmbridge::detail
 
     // Admitted before its last byte: forwarded as it arrives, or parked unsent in rbuf to
     // its last byte (12c), which holds no venue and no slot. An OpenAI client's JSON is
-    // checked as it passes either way; a file upload is not JSON.
+    // checked as it passes either way; a file upload is not JSON. Any client's JSON that
+    // streams under a model substitution is scanned too, its model tracked (12d).
     void Engine::start_body(ClientConn* c, bool forward) noexcept
     {
         ReqState& f = c->req.f;
         f.body_in_rbuf = true;
-        f.body_scanned = json_media_type(f.head.content_type.in(c->rbuf)) &&
-                         client_dialect_of(c->rbuf) == Dialect::OpenAI;
+        const bool json = json_media_type(f.head.content_type.in(c->rbuf));
+        const bool openai = client_dialect_of(c->rbuf) == Dialect::OpenAI;
+        f.subst_tracked = json && forward && !f.subst_model.empty();
+        f.body_scanned = json && (openai || f.subst_tracked);
         if (f.body_scanned)
         {
             if (!c->req.scan) c->req.scan = std::make_unique<provider::BodyScan>();
-            c->req.scan->reset();
+            c->req.scan->reset(/*all_keys=*/openai, f.subst_tracked);
         }
         f.body_in = static_cast<uint32_t>(body_so_far(c).size());
         if (forward)
@@ -169,10 +172,57 @@ namespace llmbridge::detail
     {
         UpstreamConn* u = c->up;
         if (!u || safe <= c->req.f.body_sent) return true; // parked, or nothing new is safe
-        u->out.stage().append(body.substr(c->req.f.body_sent, safe - c->req.f.body_sent));
+        if (c->req.f.splice) append_spliced(c, u->out.stage(), c->req.f.body_sent, safe);
+        else u->out.stage().append(body.substr(c->req.f.body_sent, safe - c->req.f.body_sent));
         c->req.f.body_sent = static_cast<uint32_t>(safe);
         // Unconnected, the connect's completion sends it; staged is not progress, sent is.
         return !u->connected || send_upstream(u);
+    }
+
+    namespace
+    {
+        ModelSplice splice_of(const ReqState& f) noexcept { return {f.subst_for.view(), f.subst_model.view()}; }
+    } // namespace
+
+    // The scan holds the model's value back until it closes, so a range never splits it.
+    void Engine::append_spliced(const ClientConn* c, std::string& out, size_t from, size_t to) const noexcept
+    {
+        const provider::BodyScan& s = *c->req.scan;
+        splice_of(c->req.f).append(out, body_so_far(c), from, to, c->msg.body_len, s.model_at(), s.model_end());
+    }
+
+    bool Engine::splice_hit(const ClientConn* c) const noexcept
+    {
+        const provider::BodyScan& s = *c->req.scan;
+        return splice_of(c->req.f).matches(body_so_far(c), s.model_at(), s.model_end());
+    }
+
+    const char* Engine::forward_parts(const ClientConn* c, const Upstream& up, const NamedKey& key,
+                                      std::string& into) const noexcept
+    {
+        const ReqState& f = c->req.f;
+        const std::string_view head(c->rbuf.data(), c->msg.header_len);
+        if (!f.splice)
+            return build_forward(head, c->msg.header_len, f.head, _strip_headers, up.host_hdr, up.base_path,
+                                 body_so_far(c).substr(0, f.body_sent), into, c->msg.body_len, key);
+        // The length is ours: the client's, and what the replacement adds (12d).
+        if (const char* bad = build_forward(head, c->msg.header_len, f.head, _strip_headers, up.host_hdr,
+                                            up.base_path, {}, into, c->msg.body_len + splice_of(f).grow(), key))
+            return bad;
+        append_spliced(c, into, 0, f.body_sent);
+        return nullptr;
+    }
+
+    // A body sent whole (held, parked or redone, or failed over once whole): its model is
+    // known, so a substitution is an override like Decision::model, applied in one rewrite.
+    void Engine::resolve_substitution(ClientConn* c) noexcept
+    {
+        ReqState& f = c->req.f;
+        f.splice = false;
+        f.model_substituted = false;
+        if (f.subst_model.empty() || !f.model_override.empty() || f.model.view() != f.subst_for.view()) return;
+        f.model_override.set(f.subst_model.view());
+        f.model_substituted = true;
     }
 
     bool Engine::end_upload(ClientConn* c, int64_t t) noexcept

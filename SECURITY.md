@@ -201,12 +201,24 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   which may log them. A policy that must not show a venue a prompt it might refuse
   answers `hold` on the head, which keeps the body in the gateway to its last byte, or
   does not opt in. GATEWAY-INTERNALS.md 12c.
+- **A model substitution makes the declared length ours.** Under
+  `Decision::substitute_model` a streamed body's Content-Length is computed by the gateway,
+  not copied: the client's plus the replacement's growth over the sentinel, both strings
+  held to printable ASCII with no quote or backslash, so nothing is escaped and the count is
+  exact. The bytes then sent always total it: the replacement in the sentinel's place, or
+  the client's own bytes followed by spaces. A body the scan refuses stops short of it, as
+  in any streamed body, and is reset. Under a substitution an Anthropic or other client's
+  streamed JSON is scanned as well: a repeated `model` or an escaped top-level key is
+  refused before it leaves, so the model the gateway matched is the one the venue reads.
+  The sentinel is matched raw: an escaped spelling of it goes as sent. GATEWAY-INTERNALS.md
+  12d.
 - **A non-OpenAI client's top-level keys are not checked.** The gateway refuses an OpenAI
   client's body whose top-level keys a provider could read differently from it (a
   repeated, escaped or excess key), held or arriving; another dialect's body is not
   checked, so an Anthropic client's `{"model":"a",...,"model":"b"}` shows the policy and
   the sink `a` while a provider that takes the last key runs `b`. This predates head
   decisions, and a withheld last byte does not close it: nothing reads the second key.
+  A body streamed under a model substitution is the exception: its `model` is checked.
 - **A key in the request target is forwarded.** A Gemini client byte-forwarding to a
   Gemini venue may carry its own key as `?key=`; a named key header goes beside it, not
   instead, so the venue receives two keys and Google decides which applies. The start

@@ -44,6 +44,8 @@ namespace llmbridge
 
 namespace llmbridge::detail
 {
+    struct NamedKey;
+
     /// One per worker thread. Internal: the facade, the backends and core/ reach in.
     class Engine
     {
@@ -94,6 +96,14 @@ namespace llmbridge::detail
         void pump_body(ClientConn* c) noexcept;       // scan, then stage what is safe upstream
         /// Stage what may go, up to `safe`, and send it; false when the send lost the venue.
         bool forward_body(ClientConn* c, std::string_view body, size_t safe) noexcept;
+        /// A model substitution spliced into a streamed body (GATEWAY-INTERNALS.md 12d):
+        /// the venue's bytes for body[from, to), and whether its model was the sentinel.
+        void append_spliced(const ClientConn* c, std::string& out, size_t from, size_t to) const noexcept;
+        [[nodiscard]] bool splice_hit(const ClientConn* c) const noexcept;
+        /// A streamed attempt's head and its body's first `body_sent` bytes, spliced or not.
+        [[nodiscard]] const char* forward_parts(const ClientConn* c, const Upstream& up, const NamedKey& key,
+                                                std::string& into) const noexcept;
+        void resolve_substitution(ClientConn* c) noexcept; // a held body: the override it makes
         /// Its last byte is in: the upload's stamps, then the head decision's confirm.
         /// False when the request went another way: refused, parked or redone.
         bool end_upload(ClientConn* c, int64_t t) noexcept;

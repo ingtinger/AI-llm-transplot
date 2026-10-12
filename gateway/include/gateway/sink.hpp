@@ -137,6 +137,9 @@ namespace llmbridge
         /// With `body_streamed`, a confirm that redid or refused wasted a partial upload.
         bool decided_on_head = false;
         ConfirmOutcome confirm_outcome = ConfirmOutcome::None;
+        /// Decision::substitute_model replaced the client's `model` (`model` above), spliced
+        /// into a streamed body or rewritten in a held one; `served_model` is the venue's.
+        bool model_substituted = false;
     };
 
     /// Called on the loop thread once per completed request, streams included.

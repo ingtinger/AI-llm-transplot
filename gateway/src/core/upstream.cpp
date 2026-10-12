@@ -154,17 +154,15 @@ namespace llmbridge::detail
         UpstreamConn* uf = new_upstream(u->venue);
         if (!uf) return false;
         // A streamed body was staged in pieces, so it is rebuilt from the client's buffer,
-        // with the key a policy that decided on its head named, as dispatch sent it.
+        // with the key a policy that decided on its head named and any model it spliced in,
+        // as dispatch sent it.
         if (client->req.f.body_parts)
         {
             const std::string_view head(client->rbuf.data(), client->msg.header_len);
             NamedKey key;
             if ((!client->req.f.key_header.empty() &&
                  named_key(head, client->req.f.head, client->req.f.key_header.view(), upstream_of(u).dialect, key)) ||
-                build_forward(head, client->msg.header_len, client->req.f.head, _strip_headers,
-                              upstream_of(u).host_hdr, upstream_of(u).base_path,
-                              body_so_far(client).substr(0, client->req.f.body_sent), uf->out.stage(),
-                              client->msg.body_len, key))
+                forward_parts(client, upstream_of(u), key, uf->out.stage()))
             {
                 delete uf;
                 return false;
@@ -355,9 +353,11 @@ namespace llmbridge::detail
         // new venue's dialect and erases exactly these bytes again, so a pipelined
         // request queued behind it keeps its place. A body kept in rbuf is still there.
         if (!f.body_in_rbuf) client->rbuf.insert(0, client->req.saved);
-        // A body still arriving goes on as it arrives to a venue that takes it as it is,
-        // else it parks to its last byte (GATEWAY-INTERNALS.md 12c).
+        // A body still arriving goes on as it arrives to a venue that takes it as it is, a
+        // substitution spliced if its model was tracked from the first byte, else it parks to
+        // its last byte (GATEWAY-INTERNALS.md 12c, 12d).
         else if (f.body_streaming && !(f.model_override.empty() && f.tier_override.empty() &&
+                                       (f.subst_model.empty() || f.subst_tracked) &&
                                        venue_streams(client_dialect_of(client->rbuf), client->upstream_slot)))
         {
             stop_body(client);
@@ -413,13 +413,16 @@ namespace llmbridge::detail
         // The new venue's overrides, never the failed one's: its model name is wrong for
         // another venue. Copied now, since the views die once on_failure has returned.
         if (!client->req.f.model_override.set(r.model) ||
-            !client->req.f.tier_override.set(r.service_tier))
+            !client->req.f.tier_override.set(r.service_tier) ||
+            !substitution_ok(r.substitute_model, r.substitute_for))
         {
-            LB_WARN(ReqId{client->req.f.req_seq}, " failover override longer than the gateway "
+            LB_WARN(ReqId{client->req.f.req_seq}, " failover override unusable or longer than the gateway "
                                                   "holds; giving up");
             return {};
         }
         if (!r.credential_header.empty()) client->req.f.key_header.set(r.credential_header);
+        client->req.f.subst_model.set(r.substitute_model);
+        client->req.f.subst_for.set(r.substitute_for);
         return r;
     }
 

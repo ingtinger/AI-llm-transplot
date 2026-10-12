@@ -705,7 +705,9 @@ across reads or sits in the last one. On a refusal the gateway stops sending, se
 `SO_LINGER` 0 on the upstream and closes it: the venue sees a reset and a body
 short of its `Content-Length`, which it never runs, and the connection is never
 pooled. The client gets the 400 a held body would have got. Other clients' bodies
-are not scanned; their translators would refuse a bad one, and here none runs.
+are not scanned; their translators would refuse a bad one, and here none runs. The
+one exception is a body a model substitution is spliced into (12d), whose JSON is
+scanned whatever the client's dialect.
 
 **A response before the last byte.** A venue may answer early (an error, usually).
 `end_body_stream` stops forwarding, marks the upstream not poolable, drops the copy
@@ -816,7 +818,8 @@ cut name: `ModelOf.EveryPrefixYieldsNothingOrTheWholeBodysModel`), `stream` and
   contacted. It says `Connection: keep-alive`: the rest of the body is read and dropped
   (`discard`, on the body's deadline), and the connection carries the next request.
 - **Allowed as is.** No override, no `hold`, and the venue it names byte-forwards: the body
-  streams there as in 12, in a `--stream-body-max` slot.
+  streams there as in 12, in a `--stream-body-max` slot. A model substitution
+  (`substitute_model`, 12d) is not an override: it is spliced in as the body streams.
 - **Allowed otherwise.** An override, `hold`, or a venue that translates needs the whole
   body. It is **parked** (`body_parked`): kept in rbuf with nothing sent, holding no venue
   and no slot, an OpenAI client's JSON still checked by BodyScan as it arrives, and the
@@ -862,3 +865,76 @@ is counted (LATENCY.md 2b).
 `streamed_body_confirm_refusals`, which `policy_denied` counts too. A sink record carries
 `decided_on_head` and `confirm_outcome`; with `body_streamed`, which a redo leaves set, a
 refusal or a redo of a body a venue had part of is a wasted partial upload.
+
+### 12d. A model substitution spliced into the stream
+
+The OpenAI and Anthropic SDKs serialize `model` after `messages`, so on a head decision
+(12c) the model of nearly every request is still to come. A policy that routes a sentinel
+model (kottos' `"auto"`) to a real one would have to rewrite it, and an override parks the
+body: no gain from deciding on the head. Or let it stream and redo the request at the
+confirm: a wasted partial upload per request. `Decision::substitute_model` and
+`substitute_for` avoid both. They are conditional: when the body's top-level `model` is
+the plain JSON string `substitute_for`, it goes as `substitute_model`; any other model, or
+none, goes as the client sent it. Generic, not kottos': the sentinel is the policy's.
+
+**Where it applies.** On a body sent whole (decided whole, parked, redone, or failed over
+once whole) the model is known, so `resolve_substitution` turns it into an override at
+`dispatch`, the one rewrite a held body gets: `f.model`, the plain string `capture_model`
+read, equal to the sentinel. On a body streamed on its head decision it is spliced into the
+stream, by `ModelSplice` (request.hpp), so the body streams as one with no override does.
+
+**The declared length.** The head goes before the model is seen, so its Content-Length is
+computed by us, not taken from the client: the client's plus `grow()`, what the replacement
+adds over the sentinel (0 for a shorter one). Both are held to `substitute_ok` (printable
+ASCII, no `"` or `\`, at most 255 and 64 bytes), so the replacement goes between quotes
+with no escaping and its size is its wire size; one that fails it is a 500, as an override
+too long is, at the decision or, for a `Retry`, a failover given up.
+
+**Finding the model.** Every streamed JSON body under a substitution is scanned, whatever
+the client's dialect: `start_body` resets BodyScan with `track_model` (`subst_tracked`), an
+OpenAI body under its usual rules, another dialect's with only `model` refused if repeated
+and any escaped top-level key refused, so the model the gateway matched is the one the venue
+reads. BodyScan holds the model's value back from `safe()` from its first byte until it
+closes, then tells its span (`model_at`, `model_end`), so a forwarded range never splits
+it. A body not sent as JSON is not scanned and goes as it is.
+
+**What goes.** `ModelSplice::append` maps each range of the client's bytes to the venue's:
+
+- the value is exactly `"` sentinel `"`, raw: it goes as `"` replacement `"`, then
+  `shrink()` spaces when the replacement is shorter, whitespace after a value being JSON's;
+- any other value (a real model, an escaped spelling of the sentinel, a non-string): it goes
+  as sent, and `grow()` spaces follow the body's last byte;
+- no top-level `model`: the same spaces after the last byte;
+- a repeated top-level `model`: refused by BodyScan before it leaves, as in 12.
+
+Every other byte passes through unchanged, and the venue gets exactly the declared length,
+valid JSON when the client's was. The sentinel is matched raw: `"\u0061uto"` reads as
+`auto` to a venue, but it is not the plain string `model_of` returns either, so the gateway
+never substitutes a model it would not report as the sentinel; it goes as sent, and
+`confirm()` sees no model and no substitution (`fuzz_body_stream` checks the match and
+`model_of` agree). `body_sent` stays a count of the client's bytes; the last byte, and with
+it any trailing spaces, still waits for the confirm.
+
+**The confirm.** `confirm(whole, early)` sees the client's own model (`"auto"`) and
+`whole.model_substituted`, true when the splice replaced it; `early` carries the
+substitution in force. A keep is judged by the model the venue gets, not the fields that
+name it: a confirm returning `early`, or naming the replacement as `Decision::model`, keeps
+the request, with no redo. Any other answer redoes it as in 12c, the whole body rewritten
+as a held one. For a body that streamed without the splice (not JSON) the venue got the
+client's model, so keeping a substitution that applies to it is a redo.
+
+**Failover and retry.** `Retry::substitute_model` and `substitute_for` are the new venue's,
+as its `model` is: empty substitutes nothing. A failover while the body streams resends it
+from its first byte under the retry's substitution, spliced again (`forward_parts`); one
+whose head decision named none, so the model was not tracked from the first byte, parks.
+Once whole, the retry's substitution is an override as above. A stale connection's retry
+rebuilds the spliced head and bytes from rbuf with `forward_parts` too.
+
+**Not done: `service_tier`.** `Decision::service_tier` still parks a body decided on its
+head. Inserting it after the opening `{` would need the first member held until it is known
+whether the object is empty, and a redo whenever the client sent its own: left for later.
+
+**Counted.** At a confirm that keeps a spliced body, `streamed_model_substituted` when the
+model was the sentinel, `streamed_model_padded` when it was not and spaces followed the
+body. A sink record's `model_substituted` says the venue got the replacement, spliced or
+rewritten whole; `model` stays the client's, `served_model` the venue's.

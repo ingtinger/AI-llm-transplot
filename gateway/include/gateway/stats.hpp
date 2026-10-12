@@ -76,5 +76,10 @@ namespace llmbridge
         uint64_t streamed_body_parked = 0;
         uint64_t streamed_body_redone = 0;
         uint64_t streamed_body_confirm_refusals = 0;
+        /// A model substitution spliced into a streamed body (GATEWAY-INTERNALS.md 12d), at
+        /// a confirm that kept it: the model was the sentinel and went replaced; it was not,
+        /// and spaces after the body made up the replacement's extra length.
+        uint64_t streamed_model_substituted = 0;
+        uint64_t streamed_model_padded = 0;
     };
 } // namespace llmbridge
