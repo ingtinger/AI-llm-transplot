@@ -131,6 +131,7 @@ namespace llmbridge::detail
                     }
                     ++_stats.streamed_bodies;
                     ++_bodies_streaming;
+                    c->req.f.body_in = static_cast<uint32_t>(body_so_far(c).size());
                     return dispatch(c);
                 }
             }

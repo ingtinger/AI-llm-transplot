@@ -65,14 +65,25 @@ namespace llmbridge::detail
         }
     }
 
-    // The reply closes the connection, so the rest of the body is never waited for.
+    // --body-timeout from its head, or --body-grace plus a second for every --body-min-rate
+    // bytes in, whichever is sooner: a slow but steady upload keeps earning time.
+    int64_t Engine::body_deadline(const ReqState& f) const noexcept
+    {
+        int64_t at = _body_timeout_ns > 0 ? f.ts_req_recvd + _body_timeout_ns : INT64_MAX;
+        if (_body_min_rate > 0)
+            at = std::min(at, f.ts_req_recvd + _body_grace_ns +
+                                  static_cast<int64_t>(f.body_in * 1'000'000'000ULL / _body_min_rate));
+        return at;
+    }
+
+    // The reply cuts the body (error_respond) and closes the connection, so the rest of
+    // the body is never waited for.
     void Engine::body_timeout(ClientConn* c, uint64_t& counter, const char* why) noexcept
     {
         ++counter;
         LB_WARN(ReqId{c->req.f.req_seq}, " TIMEOUT ", why, " ", *c, " body_in=",
                 static_cast<uint64_t>(body_so_far(c).size()), " of ", static_cast<uint64_t>(c->msg.body_len),
                 " after_ns=", now_ns() - c->req.f.ts_req_recvd);
-        cut_body(c);
         error_respond(c, 408, why, kSlowBodyMessage);
     }
 
@@ -90,8 +101,12 @@ namespace llmbridge::detail
     void Engine::pump_body(ClientConn* c) noexcept
     {
         const int64_t t = now_ns();
+        // Late before these bytes came: they never go, so the venue never has the body whole.
+        if (t > body_deadline(c->req.f))
+            return body_timeout(c, _stats.streamed_body_timeouts, "streamed body too slow");
         const bool after_t3 = c->req.f.ts_up_sent != 0;
         const std::string_view body = body_so_far(c);
+        c->req.f.body_in = static_cast<uint32_t>(body.size());
         const bool last = body.size() == c->msg.body_len;
         size_t safe = body.size();
         if (c->req.f.body_scanned)
@@ -157,6 +172,7 @@ namespace llmbridge::detail
         const size_t n = static_cast<size_t>(std::min<uint64_t>(c->req.discard, c->rbuf.size()));
         c->rbuf.erase(0, n);
         c->req.discard -= n;
+        c->req.f.body_in += static_cast<uint32_t>(n); // its deadline still runs (sweep_client)
         if (c->req.discard) return;
         c->ts_first_byte = c->rbuf.empty() ? 0 : now_ns(); // the next request's arrival
         if (!c->req.close_on_drain) return;

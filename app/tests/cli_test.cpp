@@ -43,6 +43,9 @@ Flags override the file wherever they appear. In parentheses: the file key.
   --client-idle SECONDS       idle client lifetime, 0 = off (timeouts.client_idle_s)
   --pool-idle SECONDS         idle pooled upstream lifetime, 0 = off (timeouts.pool_idle_s)
   --connect-timeout SECONDS   upstream connect and TLS handshake limit, 0 = off (timeouts.connect_s)
+  --body-timeout SECONDS      a streamed body's whole upload, from its head, 0 = off (timeouts.body_s)
+  --body-grace SECONDS        a streamed body's start, before --body-min-rate applies (timeouts.body_grace_s)
+  --body-min-rate BYTES       a streamed body's least average upload in bytes a second, past its grace, 0 = off, 0..1073741824 (timeouts.body_min_rate)
   --io NAME                   event loop: auto|epoll|uring (runtime.io)
   --log-level LEVEL           log level: trace|debug|info|warn|error|off (runtime.log_level)
   --workers N                 event loops sharing the port, 1..4096 (runtime.workers)
@@ -95,6 +98,10 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_pair(Args{"--stream-body", "no"}, "must be one of: on off"),
         std::make_pair(Args{"--stream-body-max", "-1"}, "out of range"),
         std::make_pair(Args{"--stream-body-max", "2000000"}, "out of range"),
+        std::make_pair(Args{"--body-timeout", "-1"}, "out of range"),
+        std::make_pair(Args{"--body-grace", "ten"}, "not a valid number"),
+        std::make_pair(Args{"--body-min-rate", "1.5"}, "must be an integer"),
+        std::make_pair(Args{"--body-min-rate", "-1"}, "out of range"),
         // A flag missing its value was ignored, or swallowed the next flag.
         std::make_pair(Args{"--io", "urnig", "--upstream-timeout", "-5", "--workers"},
                        "must be one of"),
@@ -141,7 +148,8 @@ TEST(Cli, ValuesAndSwitchesLand)
     ASSERT_EQ(parse({"--duration", "0.5", "--listen", "0", "--timing-headers", "--listen-tls",
                      "--tls-cert", "/c", "--tls-key", "/k", "--prefault-mb", "16",
                      "--client-idle", "60", "--pool-idle", "45", "--connect-timeout", "2",
-                     "--stream-body", "off", "--stream-body-max", "0"},
+                     "--stream-body", "off", "--stream-body-max", "0", "--body-timeout", "600",
+                     "--body-grace", "2.5", "--body-min-rate", "0"},
                     s, err),
               Cli::Run)
         << err;
@@ -157,6 +165,9 @@ TEST(Cli, ValuesAndSwitchesLand)
     EXPECT_DOUBLE_EQ(s.connect_s, 2);
     EXPECT_EQ(s.stream_body, "off");
     EXPECT_EQ(s.stream_body_max, 0);
+    EXPECT_DOUBLE_EQ(s.body_s, 600);
+    EXPECT_DOUBLE_EQ(s.body_grace_s, 2.5);
+    EXPECT_EQ(s.body_min_rate, 0);
 }
 
 // The file is applied first wherever --config sits, so a flag always wins.

@@ -96,6 +96,15 @@ namespace llmbridge::detail
         // provider is not an idle client.
         if (!busy)
         {
+            // The rest of a body cut short is read only to be dropped, on the same deadline.
+            if (c->req.discard && now > body_deadline(c->req.f))
+            {
+                ++_stats.streamed_body_timeouts;
+                LB_WARN(ReqId{c->req.f.req_seq}, " TIMEOUT rest of a streamed body too slow ", *c,
+                        " to_drop=", c->req.discard);
+                _ops->close(*c);
+                return;
+            }
             if (_client_idle_ns <= 0 || c->ts_client_activity == 0 ||
                 now - c->ts_client_activity <= _client_idle_ns)
                 return;
@@ -105,6 +114,8 @@ namespace llmbridge::detail
             _ops->close(*c);
             return;
         }
+        if (c->req.f.body_streaming && now > body_deadline(c->req.f))
+            return body_timeout(c, _stats.streamed_body_timeouts, "streamed body too slow");
         // A fresh connect that never became wire-ready. Separate from the idle timeout,
         // which starts at the request write, never on a socket still retrying SYNs.
         if (UpstreamConn* u = c->up;

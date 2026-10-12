@@ -61,6 +61,9 @@ namespace llmbridge
     void Gateway::set_stream_openai_body(bool on) noexcept { _e->_stream_openai_body = on; }
     void Gateway::set_stream_body(bool on) noexcept { _e->_stream_body = on; }
     void Gateway::set_stream_body_max(size_t n) noexcept { _e->_stream_body_max = n; }
+    void Gateway::set_body_timeout_ns(int64_t ns) noexcept { _e->_body_timeout_ns = ns; }
+    void Gateway::set_body_grace_ns(int64_t ns) noexcept { _e->_body_grace_ns = ns; }
+    void Gateway::set_body_min_rate(uint64_t bytes_per_s) noexcept { _e->_body_min_rate = bytes_per_s; }
     void Gateway::set_retain_bytes(size_t n) noexcept { provider::json::set_retain_bytes(n); }
     void Gateway::set_stream_body_min_for_test(size_t n) noexcept { _e->_stream_body_min = n; }
     void Gateway::set_request_sink(RequestSink* sink, std::vector<std::string> capture)

@@ -236,6 +236,10 @@ namespace llmbridge::detail
            << " upstream_timeouts=" << _stats.upstream_timeouts
            << " connect_timeouts=" << _stats.connect_timeouts
            << " upstream_reresolved=" << _stats.upstream_reresolved << "\n";
+        if (_stats.streamed_bodies + _stats.streamed_body_capped > 0)
+            os << "streamed_bodies=" << _stats.streamed_bodies << " refused=" << _stats.streamed_body_refusals
+               << " capped=" << _stats.streamed_body_capped << " timed_out=" << _stats.streamed_body_timeouts
+               << "\n";
         std::fputs(os.str().c_str(), out);
     }
 

@@ -67,5 +67,7 @@ namespace llmbridge
         uint64_t streamed_body_refusals = 0;
         /// Bodies held because the worker already streamed --stream-body-max of them.
         uint64_t streamed_body_capped = 0;
+        /// Streamed bodies cut for arriving too slowly: --body-timeout or --body-min-rate.
+        uint64_t streamed_body_timeouts = 0;
     };
 } // namespace llmbridge

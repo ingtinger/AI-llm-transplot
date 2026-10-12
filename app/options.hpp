@@ -38,6 +38,9 @@ namespace llmbridge::app
         double client_idle_s = static_cast<double>(Gateway::kDefaultClientIdleNs) / 1e9;
         double pool_idle_s = static_cast<double>(Gateway::kDefaultPoolIdleNs) / 1e9;
         double connect_s = static_cast<double>(Gateway::kDefaultConnectNs) / 1e9;
+        double body_s = static_cast<double>(Gateway::kDefaultBodyTimeoutNs) / 1e9;
+        double body_grace_s = static_cast<double>(Gateway::kDefaultBodyGraceNs) / 1e9;
+        int body_min_rate = static_cast<int>(Gateway::kDefaultBodyMinRate);
         std::string io = "auto", log_level = "info";
         int workers = 1;
         bool timing_headers = false;

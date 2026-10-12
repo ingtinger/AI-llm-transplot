@@ -756,6 +756,7 @@ namespace
     // body rode a pooled connection inside the stale-retry window and is not resent.
     TEST_F(Core, ABodyTheClientStoppedSendingIsAClientStall)
     {
+        gw->set_body_min_rate(0); // the idle sweep alone, past any upload deadline
         t.release(t.upstream(), /*keep_alive=*/true);
         ClientConn* c = t.client();
         UpstreamConn* u = stream_part(t, c, 100);
@@ -779,6 +780,7 @@ namespace
     // is the venue's timeout, a 504, and the venue is reset all the same.
     TEST_F(Core, ABodyTheVenueStoppedTakingIsTheVenuesTimeout)
     {
+        gw->set_body_min_rate(0); // the idle sweep alone, past any upload deadline
         ClientConn* c = t.client();
         UpstreamConn* u = stream_part(t, c, 100);
         ASSERT_NE(u, nullptr);
@@ -813,6 +815,7 @@ namespace
     // nothing is left for us to send, and still the venue is the one that stopped.
     TEST_F(Core, BytesTheKernelHoldsUnacknowledgedAreTheVenues)
     {
+        gw->set_body_min_rate(0); // the idle sweep alone, past any upload deadline
         const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
         int small = 4096;
         ::setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
@@ -844,5 +847,69 @@ namespace
         EXPECT_EQ(t.stats().client_idle_timeouts, 0u);
         ::close(venue);
         ::close(lfd);
+    }
+
+    // The defaults, a 10 s grace and 1 KiB a second, against a body as large as one can be:
+    // uploaded at 2 KiB a second, slower than any real link, it is never cut. At 512 bytes a
+    // second it is cut once its time runs out, 20 s in. Driven by the sweep alone, the venue
+    // taking every byte as it comes.
+    TEST_F(Core, TheDefaultsNeverCutASteadySlowBody)
+    {
+        for (const uint64_t rate : {2048u, 512u})
+        {
+            ClientConn* c = t.client();
+            UpstreamConn* u = stream_part(t, c, 0);
+            ASSERT_NE(u, nullptr);
+            u->connected = u->wire_ready = true;
+            const int64_t t0 = c->req.f.ts_req_recvd;
+            int64_t cut_at = 0;
+            for (int64_t s = 1; s <= 16 * 1024 * 1024 / 2048 && !cut_at; ++s)
+            {
+                c->req.f.body_in = static_cast<uint32_t>(rate * static_cast<uint64_t>(s));
+                c->req.f.ts_progress = t0 + s * 1'000'000'000;
+                t.sweep(c, t0 + s * 1'000'000'000 + 1); // just after its bytes for second s
+                if (c->doomed || c->req.f.phase == Phase::Replying) cut_at = s;
+            }
+            if (rate == 2048) EXPECT_EQ(cut_at, 0) << "a steady 2 KiB a second was cut";
+            else EXPECT_EQ(cut_at, 20) << "512 bytes a second runs out of time at 20 s";
+        }
+        EXPECT_EQ(t.stats().streamed_body_timeouts, 1u);
+    }
+
+    // The bytes that come after the deadline passed are never forwarded, even when they
+    // are the body's last: the venue holds part of the body and a reset.
+    TEST_F(Core, BytesAfterTheDeadlineAreNeverForwarded)
+    {
+        gw->set_body_timeout_ns(1'000'000'000);
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        u->connected = u->wire_ready = true;
+        const size_t staged = u->out.bytes().size();
+        c->req.f.ts_req_recvd -= 2'000'000'000; // its head came 2 s ago
+        io.next_send = Sent::Queued;
+        c->rbuf.append(kBody.substr(100));
+        t.bytes(c);
+        EXPECT_EQ(u->out.bytes().size(), staged) << "the rest went up";
+        EXPECT_TRUE(u->doomed);
+        EXPECT_TRUE(u->reset_on_close);
+        EXPECT_EQ(c->out.bytes().rfind("HTTP/1.1 408 Request Timeout\r\n", 0), 0u) << c->out.bytes();
+        EXPECT_EQ(t.stats().streamed_body_timeouts, 1u);
+        EXPECT_EQ(t.bodies_streaming(), 0u);
+    }
+
+    // The part of the body already in at its head earns its time like any other.
+    TEST_F(Core, TheBodyInAtItsHeadEarnsItsTime)
+    {
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 10 * 1024);
+        ASSERT_NE(u, nullptr);
+        u->connected = u->wire_ready = true;
+        const int64_t t0 = c->req.f.ts_req_recvd;
+        c->req.f.ts_progress = t0 + 15'000'000'000;
+        t.sweep(c, t0 + 15'000'000'000); // 10 s of grace and 10 s for its 10 KiB
+        EXPECT_EQ(t.stats().streamed_body_timeouts, 0u);
+        t.sweep(c, t0 + 20'000'000'001);
+        EXPECT_EQ(t.stats().streamed_body_timeouts, 1u);
     }
 } // namespace

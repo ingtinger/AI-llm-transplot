@@ -37,6 +37,7 @@ namespace llmbridge
     struct UpstreamConn;
     class UpstreamPool;
     struct HeadFacts;
+    struct ReqState;
     template <class T> class Registry;
 }
 
@@ -90,6 +91,8 @@ namespace llmbridge::detail
         void reset_venue(UpstreamConn* u) noexcept;   // never pooled, and its close is a reset
         /// The client gets a 408 and the venue a reset; `counter` says which limit it missed.
         void body_timeout(ClientConn* c, uint64_t& counter, const char* why) noexcept;
+        /// When a body with `f.body_in` bytes in must have its last; INT64_MAX for never.
+        [[nodiscard]] int64_t body_deadline(const ReqState& f) const noexcept;
         void refuse_body(ClientConn* c) noexcept;     // reset the upstream, answer the 400
         void end_body_stream(ClientConn* c, UpstreamConn* u) noexcept; // a response byte arrived
         void drop_discard(ClientConn* c) noexcept;    // bytes of a request that is over
@@ -234,6 +237,10 @@ namespace llmbridge::detail
         size_t _stream_body_min = 16 * 1024; ///< a body under this arrives too fast to matter
         size_t _stream_body_max = Gateway::kDefaultStreamBodyMax; ///< at once; 0 = no cap
         size_t _bodies_streaming = 0; ///< bodies arriving now, each with a venue connection held
+        /// A streamed body's upload deadline (body_deadline); 0 turns either limit off.
+        int64_t _body_timeout_ns = Gateway::kDefaultBodyTimeoutNs;
+        int64_t _body_grace_ns = Gateway::kDefaultBodyGraceNs;
+        uint64_t _body_min_rate = Gateway::kDefaultBodyMinRate;
         Policy* const _policy = nullptr; ///< `const`: swapping it under the loop would race
         bool _wants_prefix_hash = false; ///< Policy::wants_prefix_hash(), read once
         RequestSink* _sink = nullptr;

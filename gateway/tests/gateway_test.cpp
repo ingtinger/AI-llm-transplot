@@ -872,6 +872,8 @@ namespace
             if (_epoll_write_cap) _gw->set_epoll_write_cap_for_test(_epoll_write_cap);
             if (_upstream_sndbuf) _gw->set_upstream_sndbuf_for_test(_upstream_sndbuf);
             if (_stream_body_max >= 0) _gw->set_stream_body_max(static_cast<size_t>(_stream_body_max));
+            if (_body_timeout_ns >= 0) _gw->set_body_timeout_ns(_body_timeout_ns);
+            if (_body_grace_ns >= 0) _gw->set_body_grace_ns(_body_grace_ns);
             _proxy_port = _gw->bound_port();
             // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
@@ -911,6 +913,8 @@ namespace
         size_t _epoll_write_cap = 0;     // set before start(); 0 writes all it can
         int _upstream_sndbuf = 0;        // set before start(); pins SO_SNDBUF upstream
         int64_t _stream_body_max = -1;   // set before start(); -1 keeps the default
+        int64_t _body_timeout_ns = -1;   // set before start(); -1 keeps the default
+        int64_t _body_grace_ns = -1;     // set before start(); -1 keeps the default
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
@@ -12692,6 +12696,149 @@ TEST_P(ProxyBodyStream, AVenueThatStopsReadingMidBodyIsTheVenuesTimeout)
     const llmbridge::Stats& st = _gw->stats();
     EXPECT_EQ(st.upstream_timeouts, 1u);
     EXPECT_EQ(st.client_idle_timeouts, 0u);
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+namespace
+{
+    /// `r` a part every `gap_ms` until a reply comes or `ms` pass; the reply, or "".
+    std::string trickle(Client& c, const std::string& r, size_t part, int gap_ms, int ms = 3000)
+    {
+        const int64_t until = llmbridge::now_ns() + int64_t{ms} * 1'000'000;
+        std::string reply;
+        for (size_t off = 0; reply.empty() && off < r.size() && llmbridge::now_ns() < until; off += part)
+        {
+            if (!c.send(r.substr(off, part))) break;
+            reply = c.recv_response(gap_ms);
+        }
+        return reply.empty() ? c.recv_response(gap_ms) : reply;
+    }
+} // namespace
+
+// A client trickling its body held a venue connection for as long as it kept a byte
+// coming. Past --body-timeout it is cut: the client gets a 408 and its connection closes,
+// the venue a reset, with part of the body and never all of it.
+TEST_P(ProxyBodyStream, ATricklingBodyIsCutAtItsDeadline)
+{
+    _backend.set_response(http_ok("{}"));
+    _body_timeout_ns = 400'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const int64_t t0 = llmbridge::now_ns();
+    ASSERT_TRUE(c.send(h.first));
+    const std::string r = trickle(c, h.rest, 1, 50);
+    const int64_t took = llmbridge::now_ns() - t0;
+    EXPECT_EQ(Client::status_of(r), 408) << r;
+    EXPECT_NE(r.find("did not arrive in time"), std::string::npos) << r;
+    EXPECT_GE(took, 400'000'000);
+    EXPECT_TRUE(c.wait_closed());
+    EXPECT_TRUE(wait_for([&] { return _backend.incomplete_requests().size() == 1; })) << "the venue was kept";
+    shutdown();
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.streamed_body_timeouts, 1u);
+    EXPECT_EQ(st.client_idle_timeouts, 0u);
+    EXPECT_EQ(st.upstream_timeouts, 0u);
+    EXPECT_EQ(_gw->pooled_upstream_count(), 0u);
+    EXPECT_EQ(_backend.requests_seen(), 0) << "the venue got the whole body";
+    EXPECT_EQ(_backend.resets(), 1) << "the venue was not reset";
+}
+
+// Under the minimum rate: the default 1 KiB a second, past a grace cut to 200 ms. A body
+// at 320 bytes a second is cut once the time its bytes earned runs out.
+TEST_P(ProxyBodyStream, ABodyUnderTheMinimumRateIsCut)
+{
+    _backend.set_response(http_ok("{}"));
+    _body_grace_ns = 200'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    const size_t head = h.first.find("\r\n\r\n") + 4;
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first.substr(0, head))); // the head alone: no byte of credit yet
+    const std::string r = trickle(c, h.first.substr(head) + h.rest, 16, 50);
+    EXPECT_EQ(Client::status_of(r), 408) << r;
+    EXPECT_TRUE(c.wait_closed());
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 1u);
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+// The same rate and grace never cut a client that is slow but steady: 5 KiB a second is
+// far below a real link and well above the floor, and it earns more time than it spends.
+// It starts with a KiB, a second's credit, so no scheduler stall at its start cuts it.
+TEST_P(ProxyBodyStream, ASteadySlowBodyAboveTheMinimumRateIsNotCut)
+{
+    _backend.set_response(http_ok("{}"));
+    _body_grace_ns = 200'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})", 16 * 1024);
+    const size_t head = h.first.find("\r\n\r\n") + 4;
+    const std::string body = h.first.substr(head) + h.rest;
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first.substr(0, head) + body.substr(0, 1024)));
+    const size_t steady = 1024 + 256 * 30; // then 1.5 s of it
+    EXPECT_EQ(trickle(c, body.substr(1024, steady - 1024), 256, 50, 10'000), "") << "cut while steady";
+    ASSERT_TRUE(c.send(body.substr(steady)));
+    EXPECT_EQ(c.recv_status(), 200);
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 0u);
+    EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
+}
+
+// A venue that answers before the body is in leaves its rest to be read and dropped, and a
+// client trickling that rest held its connection open with no limit at all. The deadline
+// runs on as the rest comes: a steady one earns its time and the connection carries the
+// next request; a trickle runs out of it and the connection closes.
+TEST_P(ProxyBodyStream, TheRestOfACutShortBodyKeepsItsDeadline)
+{
+    _backend.set_reply_before_read(true);
+    _body_grace_ns = 500'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})", 16 * 1024);
+    const size_t head = h.first.find("\r\n\r\n") + 4;
+    const std::string rest = h.first.substr(head) + h.rest;
+    // 320 bytes a second, then 20 KiB; in that order, as this venue answers a connection
+    // once and the steady one's next request would leave one pooled.
+    for (const size_t part : {size_t{16}, size_t{1024}})
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(h.first.substr(0, head)));
+        ASSERT_EQ(c.recv_status(), 200);
+        bool closed = false;
+        for (size_t off = 0; !closed && off < rest.size() && off < 60 * part; off += part)
+            closed = !c.send(rest.substr(off, part)) || c.wait_closed(50);
+        if (part == 16)
+        {
+            EXPECT_TRUE(closed) << "the trickled rest kept the connection open";
+            continue;
+        }
+        EXPECT_FALSE(closed) << "the steady rest was cut";
+        ASSERT_TRUE(c.send(make_request()));
+        EXPECT_EQ(c.recv_status(), 200) << "the next request on the connection";
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 1u);
+}
+
+// With nothing more arriving, the sweep cuts the body at its deadline, long before the
+// venue's idle timeout would.
+TEST_P(ProxyBodyStream, ABodyThatStopsComingIsCutAtItsDeadline)
+{
+    _backend.set_response(http_ok("{}"));
+    _body_timeout_ns = 300'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_EQ(c.recv_status(2000), 408);
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 1u);
+    EXPECT_EQ(_gw->stats().client_idle_timeouts, 0u);
     EXPECT_EQ(_backend.requests_seen(), 0);
 }
 

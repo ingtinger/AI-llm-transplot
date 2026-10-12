@@ -809,6 +809,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
         if (connect_ns > 0) _gw->set_connect_ns(connect_ns);
         if (_write_cap > 0) _gw->set_epoll_write_cap_for_test(_write_cap);
         if (_up_sndbuf > 0) _gw->set_upstream_sndbuf_for_test(_up_sndbuf);
+        if (_body_timeout_ns > 0) _gw->set_body_timeout_ns(_body_timeout_ns);
         if (_sink) _gw->set_request_sink(_sink, {});
         _port = _gw->bound_port();
         _gt = std::thread([this] { _gw->run(); });
@@ -877,6 +878,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     std::string _ca_path;
     size_t _write_cap = 0; // set before start_inbound(); epoll only
     int _up_sndbuf = 0;    // set before start(); SO_SNDBUF on upstream connections
+    int64_t _body_timeout_ns = 0; // set before start(); --body-timeout
     llmbridge::RequestSink* _sink = nullptr; // set before start(); read after the join
     LastRecord _last;                        // a sink for _sink, alive until the join
 };
@@ -997,6 +999,31 @@ TEST_P(GatewayTls, AStreamedBodyReachesATlsVenueWhole)
     _gt.join();
     EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
     EXPECT_EQ(_gw->stats().upstream_unsent, 0u) << "the body was cut short";
+}
+
+// A body trickled to a TLS venue is cut at its deadline like any other: the client gets
+// a 408, and the venue, its handshake done and part of the body in, never the rest.
+TEST_P(GatewayTls, ATrickledBodyToATlsVenueIsCutAtItsDeadline)
+{
+    _body_timeout_ns = 300'000'000;
+    start();
+    const std::string req = make_request(R"({"model":"gpt","messages":[{"role":"user","content":")" +
+                                         std::string(64 * 1024, 'p') + R"("}]})");
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(req.substr(0, 20000))); // the head and a part: it streams
+    std::string r;
+    for (size_t off = 20000; r.empty() && off < 20100; ++off)
+    {
+        if (!c.send(req.substr(off, 1))) break;
+        r = c.recv_response(50);
+    }
+    EXPECT_EQ(Client::status_of(r), 408) << r.substr(0, 300);
+    _gw->request_stop();
+    _gt.join();
+    EXPECT_EQ(_backend.handshakes(), 1);
+    EXPECT_EQ(_backend.requests(), 0) << "the venue got the whole body";
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 1u);
 }
 
 // A streamed body over a TLS upstream: every part's flush completes the request again,

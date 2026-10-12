@@ -260,6 +260,9 @@ static int run(int argc, char** argv)
         gw->set_client_idle_ns(static_cast<int64_t>(cfg.client_idle_s * 1e9));
         gw->set_pool_idle_ns(static_cast<int64_t>(cfg.pool_idle_s * 1e9));
         gw->set_connect_ns(static_cast<int64_t>(cfg.connect_s * 1e9));
+        gw->set_body_timeout_ns(static_cast<int64_t>(cfg.body_s * 1e9));
+        gw->set_body_grace_ns(static_cast<int64_t>(cfg.body_grace_s * 1e9));
+        gw->set_body_min_rate(static_cast<uint64_t>(cfg.body_min_rate));
         gw->set_prefault_bytes(static_cast<size_t>(cfg.prefault_mb * (1 << 20)));
         gw->set_retain_bytes(static_cast<size_t>(cfg.retain_mb * (1 << 20)));
         gw->set_stream_body(cfg.stream_body == "on");
@@ -322,6 +325,10 @@ static int run(int argc, char** argv)
         agg.cold_builds += s.cold_builds;
         agg.warm_reuses += s.warm_reuses;
         agg.tls_out_grows += s.tls_out_grows;
+        agg.streamed_bodies += s.streamed_bodies;
+        agg.streamed_body_refusals += s.streamed_body_refusals;
+        agg.streamed_body_capped += s.streamed_body_capped;
+        agg.streamed_body_timeouts += s.streamed_body_timeouts;
         if (s.tls_buffered_peak > agg.tls_buffered_peak)
             agg.tls_buffered_peak = s.tls_buffered_peak;
         agg.overhead.merge(s.overhead);
@@ -347,6 +354,13 @@ static int run(int argc, char** argv)
                  (unsigned long long)agg.upstream_conns_opened,
                  (unsigned long long)agg.upstream_reused, (unsigned long long)agg.upstream_retries,
                  (unsigned long long)agg.upstream_unsent);
+    // Only when a body streamed or was held at the cap, like accept(TLS) below.
+    if (agg.streamed_bodies + agg.streamed_body_capped > 0)
+        std::fprintf(stderr, "streamed_bodies=%llu  refused=%llu  capped=%llu  timed_out=%llu\n",
+                     (unsigned long long)agg.streamed_bodies,
+                     (unsigned long long)agg.streamed_body_refusals,
+                     (unsigned long long)agg.streamed_body_capped,
+                     (unsigned long long)agg.streamed_body_timeouts);
     agg.overhead.print(std::cerr, "added-total  ");
     agg.req_path.print(std::cerr, "  request-path ");
     agg.connect.print(std::cerr, "  connect(TLS) ");

@@ -170,10 +170,11 @@ namespace llmbridge
         FixedStr<kSinkCaptureBytes> captured[kSinkCaptureMax];
         HeadFacts head;
         /// A body forwarded as it arrives (GATEWAY-INTERNALS.md 12): bytes of it staged
-        /// upstream, more still due, the request still at the front of rbuf for a
-        /// resend, and each chunk checked by BodyScan first (an OpenAI client).
-        /// `body_streamed` stays set once the request is done.
+        /// upstream and in from the client, dropped ones too, more still due, the request
+        /// still at the front of rbuf for a resend, and each chunk checked by BodyScan
+        /// first (an OpenAI client). `body_streamed` stays set once the request is done.
         uint32_t body_sent = 0;
+        uint32_t body_in = 0;
         bool body_streaming = false;
         bool body_in_rbuf = false;
         bool body_scanned = false;
