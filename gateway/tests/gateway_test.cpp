@@ -262,6 +262,9 @@ namespace
         void set_responses(std::vector<std::string> r) { _sequence = std::move(r); }
         void set_trickle(int chunk) { _trickle_chunk = chunk; }        // write reply in chunks
         void set_close_mid_response(bool b) { _close_mid = b; }         // simulate upstream abort
+        // Read each request, then close without a byte of reply: a venue failing before it
+        // answers, which a policy may fail over from.
+        void set_close_unanswered(bool b) { _close_unanswered = b; }
         // Write until the gateway stops reading (300 ms), then reset the connection.
         void set_reset_mid_response(bool b) { _reset_mid = b; }
         // On each connection, read the second request, wait `ms`, then close unanswered.
@@ -469,6 +472,11 @@ namespace
                 const int nth = _requests_seen.fetch_add(1, std::memory_order_relaxed);
                 ++done_here;
                 buf.erase(0, m.total_len);
+                if (_close_unanswered)
+                {
+                    ::close(c);
+                    return;
+                }
                 if (_drop_second_ms > 0 && served_here++ == 1)
                 {
                     std::this_thread::sleep_for(std::chrono::milliseconds(_drop_second_ms));
@@ -563,6 +571,7 @@ namespace
         int _trickle_chunk = 0;
         int _chunked_chunks = 0;
         bool _close_mid = false;
+        bool _close_unanswered = false;
         bool _reset_mid = false;
         int _drop_second_ms = 0;
         bool _close_after_first = false;
@@ -10884,7 +10893,8 @@ TEST_P(ProxyKeyHeader, TheFamilyNeverReachesAByteForwardedVenue)
 // domain's key, not the family header itself. Every refusal reaches no upstream.
 namespace
 {
-    /// Decides with the leg `pick` selects; a null header names none.
+    /// Decides with the leg `pick` selects, then fails over through `next`, one leg per
+    /// attempt. A null header names none.
     class KeyedPolicy final : public llmbridge::Policy
     {
       public:
@@ -10893,18 +10903,30 @@ namespace
             int venue;
             const char* header;
         };
-        explicit KeyedPolicy(std::vector<Leg> legs) : _legs(std::move(legs)) {}
+        explicit KeyedPolicy(std::vector<Leg> legs, std::vector<Leg> next = {})
+            : _legs(std::move(legs)), _next(std::move(next))
+        {
+        }
         llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
         {
             const Leg& l = _legs[static_cast<size_t>(_pick.load(std::memory_order_relaxed))];
             return {.allow = true, .upstream_index = l.venue, .credential_header = name(l)};
         }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            failures.fetch_add(1, std::memory_order_relaxed);
+            if (f.attempt >= static_cast<int>(_next.size())) return {};
+            const Leg& l = _next[static_cast<size_t>(f.attempt)];
+            return {.retry = true, .upstream_index = l.venue, .credential_header = name(l)};
+        }
         /// Atomic for the reason PinnedPolicy's index is: the test thread writes it.
         void pick(int i) { _pick.store(i, std::memory_order_relaxed); }
+        std::atomic<int> failures{0};
 
       private:
         static std::string_view name(const Leg& l) { return l.header ? l.header : ""; }
         std::vector<Leg> _legs;
+        std::vector<Leg> _next;
         std::atomic<int> _pick{0};
     };
 
@@ -11279,18 +11301,24 @@ TEST_P(ProxyKeyHeader, KeysNeverCrossClientsOnAPooledConnection)
     }
 }
 
-// No key, named or not, reaches a log line, on success or on a refusal. The refusals are
-// logged, by reason.
+// No key, named or not, reaches a log line: not on success, not on a refusal, not across
+// a failover. The refusals are logged, by reason.
 TEST_P(ProxyKeyHeader, NoKeyReachesTheLog)
 {
     HeartbeatSink log;
     llmbridge::net::log::set_sink(&log);
-    TestBackend a;
+    TestBackend a, b;
     a.set_response(venue_reply(UpstreamDialect::OpenAI));
+    a.set_close_unanswered(true);
+    b.set_response(venue_reply(UpstreamDialect::Anthropic));
     a.start();
-    KeyedPolicy pol({{0, "x-kottos-key-alpha"}, {0, "authorization"}});
-    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
-    const std::string both = "Authorization: Bearer sk-AUTH-LOGGED\r\nx-kottos-key-alpha: KEY-ALPHA\r\n";
+    b.start();
+    KeyedPolicy pol({{0, "x-kottos-key-alpha"}, {0, "authorization"}}, {{1, "x-kottos-key-bravo"}});
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}},
+          &pol);
+    const std::string both = "Authorization: Bearer sk-AUTH-LOGGED\r\nx-kottos-key-alpha: KEY-ALPHA\r\n"
+                             "x-kottos-key-bravo: KEY-BRAVO\r\n";
     EXPECT_EQ(Client::status_of(exchange(openai_request_hdrs("hi", both))), 200);
     EXPECT_EQ(Client::status_of(exchange(openai_request_hdrs("hi", "Authorization: Bearer sk-AUTH-LOGGED\r\n"))),
               400);
@@ -11306,9 +11334,131 @@ TEST_P(ProxyKeyHeader, NoKeyReachesTheLog)
     for (const char* reason : {"reply 400 credential header missing", "reply 400 credential header repeated",
                                "reply 400 malformed credential", "reply 400 credential header unusable"})
         EXPECT_NE(log.text.find(reason), std::string::npos) << reason << " in:\n" << log.text;
+    EXPECT_NE(log.text.find("retrying on 1"), std::string::npos) << log.text;
     for (const char* secret : {"KEY-", "sk-AUTH-LOGGED"})
         EXPECT_EQ(log.text.find(secret), std::string::npos) << secret << " in:\n" << log.text;
     a.stop();
+    b.stop();
+}
+
+// Venue A reads the request and drops the connection unanswered, and the policy fails over
+// to B under B's own header. B gets B's key alone, never A's, and A never saw B's.
+TEST_P(ProxyKeyHeader, AFailoverCarriesTheNextVenuesKeyAndNeverTheFirsts)
+{
+    using D = UpstreamDialect;
+    for (const auto& [da, db] : {std::pair{D::Anthropic, D::OpenAI}, std::pair{D::OpenAI, D::OpenAI},
+                                 std::pair{D::OpenAI, D::Anthropic}})
+    {
+        SCOPED_TRACE(std::string(da == D::Anthropic ? "anthropic" : "openai") + " -> " +
+                     (db == D::Anthropic ? "anthropic" : "openai"));
+        TestBackend a, b;
+        a.set_response(venue_reply(da));
+        a.set_close_unanswered(true);
+        b.set_response(venue_reply(db));
+        a.start();
+        b.start();
+        KeyedPolicy pol({{0, "x-kottos-key-alpha"}}, {{1, "x-kottos-key-bravo"}});
+        start({{"127.0.0.1", a.port(), false, "", da, ""}, {"127.0.0.1", b.port(), false, "", db, ""}}, &pol);
+        const std::string resp = exchange(openai_request_hdrs(
+            "hi", keyed_headers("x-kottos-key-alpha: KEY-ALPHA\r\nx-kottos-key-bravo: KEY-BRAVO\r\n")));
+        shutdown();
+        EXPECT_EQ(Client::status_of(resp), 200) << resp;
+        EXPECT_EQ(pol.failures.load(), 1);
+        EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+        const std::string up_a = a.all_requests();
+        const std::string up_b = b.all_requests();
+        EXPECT_TRUE(only_the_named_key(up_a, "KEY-ALPHA"));
+        EXPECT_EQ(up_a.find("KEY-BRAVO"), std::string::npos) << up_a;
+        EXPECT_TRUE(only_the_named_key(up_b, "KEY-BRAVO"));
+        EXPECT_EQ(up_b.find("KEY-ALPHA"), std::string::npos) << "A's key followed the failover: " << up_b;
+        a.stop();
+        b.stop();
+        restart();
+    }
+}
+
+// After a decision that named a key, a retry naming none would fall back to Authorization,
+// and one naming a header outside the family cannot be honoured. Either way the client sees
+// the failure and the next venue is never contacted.
+TEST_P(ProxyKeyHeader, AFailoverThatNamesNoUsableKeyGivesUp)
+{
+    for (const char* next : {static_cast<const char*>(nullptr), "authorization"})
+    {
+        SCOPED_TRACE(next ? next : "(none)");
+        TestBackend a, b;
+        a.set_response(venue_reply(UpstreamDialect::OpenAI));
+        a.set_close_unanswered(true);
+        b.set_response(venue_reply(UpstreamDialect::OpenAI));
+        a.start();
+        b.start();
+        KeyedPolicy pol({{0, "x-kottos-key-alpha"}}, {{1, next}});
+        start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+               {"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}},
+              &pol);
+        const std::string resp = exchange(openai_request_hdrs(
+            "hi", "Authorization: Bearer sk-AUTH-OTHER\r\nx-kottos-key-alpha: KEY-ALPHA\r\n"));
+        shutdown();
+        EXPECT_EQ(Client::status_of(resp), 502) << resp;
+        EXPECT_EQ(pol.failures.load(), 1);
+        EXPECT_EQ(b.requests_seen(), 0) << b.last_request();
+        EXPECT_EQ(_gw->stats().upstream_failovers, 0u);
+        a.stop();
+        b.stop();
+        restart();
+    }
+}
+
+// The retry names a header the client never sent. Refused like a first attempt would be:
+// a 400 that says so, and the next venue sees nothing, Authorization included.
+TEST_P(ProxyKeyHeader, AFailoverToAKeyTheClientDidNotSendIsRefused)
+{
+    TestBackend a, b;
+    a.set_response(venue_reply(UpstreamDialect::OpenAI));
+    a.set_close_unanswered(true);
+    b.set_response(venue_reply(UpstreamDialect::Anthropic));
+    a.start();
+    b.start();
+    KeyedPolicy pol({{0, "x-kottos-key-alpha"}}, {{1, "x-kottos-key-bravo"}});
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}},
+          &pol);
+    const std::string resp = exchange(openai_request_hdrs(
+        "hi", "Authorization: Bearer sk-AUTH-OTHER\r\nx-kottos-key-alpha: KEY-ALPHA\r\n"));
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 400) << resp;
+    EXPECT_NE(resp.find(llmbridge::refuse::kKeyHeaderMissing), std::string::npos) << resp;
+    EXPECT_EQ(a.requests_seen(), 1);
+    EXPECT_EQ(b.requests_seen(), 0) << b.last_request();
+    a.stop();
+    b.stop();
+}
+
+// The other order is allowed: a decision on the client's own Authorization may fail over
+// to a venue whose key is named, and that venue gets the named key only.
+TEST_P(ProxyKeyHeader, AFailoverMayNameAKeyAfterAnUnnamedDecision)
+{
+    TestBackend a, b;
+    a.set_response(venue_reply(UpstreamDialect::OpenAI));
+    a.set_close_unanswered(true);
+    b.set_response(venue_reply(UpstreamDialect::OpenAI));
+    a.start();
+    b.start();
+    KeyedPolicy pol({{0, nullptr}}, {{1, "x-kottos-key-bravo"}});
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}},
+          &pol);
+    const std::string resp = exchange(openai_request_hdrs(
+        "hi", "Authorization: Bearer sk-AUTH-FOR-A\r\nx-kottos-key-bravo: KEY-BRAVO\r\n"));
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 200) << resp;
+    const std::string up_a = a.last_request();
+    const std::string up_b = b.last_request();
+    EXPECT_NE(up_a.find("\r\nAuthorization: Bearer sk-AUTH-FOR-A\r\n"), std::string::npos) << up_a;
+    EXPECT_EQ(up_a.find("KEY-BRAVO"), std::string::npos) << up_a;
+    EXPECT_TRUE(only_the_named_key(up_b, "KEY-BRAVO"));
+    EXPECT_EQ(up_b.find("sk-AUTH-FOR-A"), std::string::npos) << up_b;
+    a.stop();
+    b.stop();
 }
 
 // ── What a relayed response keeps, and what a forwarded request drops ─────────────

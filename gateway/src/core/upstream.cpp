@@ -153,7 +153,8 @@ namespace llmbridge::detail
         // request was translated for this dialect and carries its credential.
         UpstreamConn* uf = new_upstream(u->venue);
         if (!uf) return false;
-        // A streamed body was staged in pieces, so it is rebuilt from the client's buffer.
+        // A streamed body was staged in pieces, so it is rebuilt from the client's buffer;
+        // never with a named key, since a policy's requests are not streamed (body_streams).
         if (client->req.f.body_in_rbuf &&
             build_forward(std::string_view(client->rbuf.data(), client->msg.header_len),
                           client->msg.header_len, client->req.f.head, _strip_headers,
@@ -380,6 +381,13 @@ namespace llmbridge::detail
                                             "giving up");
             return {};
         }
+        // The next venue's key comes from the header the retry names, never the failed
+        // one's; none after a named decision would mean the client's Authorization.
+        if (r.credential_header.empty() ? !client->req.f.key_header.empty() : !key_header_ok(r.credential_header))
+        {
+            LB_WARN(ReqId{client->req.f.req_seq}, " failover named no usable credential header; giving up");
+            return {};
+        }
         // The new venue's overrides, never the failed one's: its model name is wrong for
         // another venue. Copied now, since the views die once on_failure has returned.
         if (!client->req.f.model_override.set(r.model) ||
@@ -389,6 +397,7 @@ namespace llmbridge::detail
                                                   "holds; giving up");
             return {};
         }
+        if (!r.credential_header.empty()) client->req.f.key_header.set(r.credential_header);
         return r;
     }
 
