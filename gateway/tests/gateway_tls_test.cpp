@@ -17,6 +17,7 @@
 // pool, and certificate rejection surfacing as a client-visible 502.
 
 #include "gateway/gateway.hpp"
+#include "gateway/sink.hpp"
 
 #ifdef LLMBRIDGE_HAVE_TLS
 
@@ -778,6 +779,8 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
                                         Gateway::kDefaultUpstreamIdleNs, tls, timing_headers);
         // Before the loop thread exists, like setup_ns in start_inbound.
         if (connect_ns > 0) _gw->set_connect_ns(connect_ns);
+        if (_write_cap > 0) _gw->set_epoll_write_cap_for_test(_write_cap);
+        if (_sink) _gw->set_request_sink(_sink, {});
         _port = _gw->bound_port();
         _gt = std::thread([this] { _gw->run(); });
     }
@@ -844,6 +847,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     uint16_t _port{0};
     std::string _ca_path;
     size_t _write_cap = 0; // set before start_inbound(); epoll only
+    llmbridge::RequestSink* _sink = nullptr; // set before start(); read after the join
 };
 
 TEST_P(GatewayTls, RoundTripThroughTlsUpstream)
@@ -962,6 +966,72 @@ TEST_P(GatewayTls, AStreamedBodyReachesATlsVenueWhole)
     _gt.join();
     EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
     EXPECT_EQ(_gw->stats().upstream_unsent, 0u) << "the body was cut short";
+}
+
+// A streamed body over a TLS upstream: every part's flush completes the request again,
+// and only the first is t3 (LATENCY.md 2b). The write cap has epoll finish each part on
+// writability; io_uring finishes every send on a completion.
+namespace
+{
+    class LastRecord final : public llmbridge::RequestSink
+    {
+      public:
+        void on_request(const llmbridge::RequestRecord& r) noexcept override
+        {
+            std::lock_guard<std::mutex> g(_mu);
+            _r = r;
+            ++_n;
+        }
+        int n()
+        {
+            std::lock_guard<std::mutex> g(_mu);
+            return _n;
+        }
+        llmbridge::RequestRecord last()
+        {
+            std::lock_guard<std::mutex> g(_mu);
+            return _r;
+        }
+
+      private:
+        std::mutex _mu;
+        llmbridge::RequestRecord _r;
+        int _n = 0;
+    };
+} // namespace
+
+TEST_P(GatewayTls, AStreamedBodysLaterPartsDoNotMoveT3)
+{
+    LastRecord sink;
+    _sink = &sink;
+    _write_cap = 4096;
+    start();
+    const std::string req = make_request(R"({"model":"gpt","messages":[{"role":"user","content":")" +
+                                         std::string(256 * 1024, 'p') + R"("}]})");
+    constexpr int kParts = 8;
+    constexpr int kGapMs = 25;
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    const size_t per = (req.size() + kParts - 1) / kParts;
+    for (size_t off = 0; off < req.size(); off += per)
+    {
+        if (off) std::this_thread::sleep_for(std::chrono::milliseconds(kGapMs));
+        ASSERT_TRUE(c.send(req.substr(off, per)));
+    }
+    ASSERT_EQ(Client::status_of(c.recv_response()), 200);
+    _gw->request_stop();
+    _gt.join();
+
+    ASSERT_EQ(sink.n(), 1);
+    const llmbridge::RequestRecord r = sink.last();
+    const int64_t upload = int64_t{kParts - 1} * kGapMs * 1'000'000;
+    EXPECT_TRUE(r.body_streamed);
+    EXPECT_GE(r.client_upload_ns, upload * 3 / 4);
+    EXPECT_GT(r.ts_wire_ready, r.ts_req_built) << "a cold TLS connection's handshake";
+    EXPECT_LT(r.ts_up_sent - r.ts_wire_ready, upload / 4) << "t3 moved with a later part";
+    EXPECT_GE(r.ts_body_sent, r.ts_body_end);
+    EXPECT_LE(r.ts_body_sent, r.ts_up_recvd);
+    EXPECT_GE(r.ts_body_end - r.ts_up_sent, upload / 2);
 }
 
 TEST_P(GatewayTls, PooledConnectionSkipsSecondHandshake)

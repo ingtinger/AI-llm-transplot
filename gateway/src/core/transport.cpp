@@ -6,7 +6,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 // Bytes between a socket and a connection's plaintext buffers: the TLS Session on
-// either leg, and the sent-request test.
+// either leg, and the sent-request test and stamp.
 
 #include "engine.hpp"
 
@@ -207,6 +207,14 @@ namespace llmbridge::detail
     }
 
 #endif // LLMBRIDGE_HAVE_TLS
+
+    // Every send completion with a client, on both backends: t3 is the first in an
+    // attempt and stays ours; later ones are a streamed body's parts (LATENCY.md 2b).
+    void Engine::note_sent(ClientConn* c, int64_t now) noexcept
+    {
+        if (!c->req.f.ts_up_sent) c->req.f.ts_up_sent = now;
+        c->req.f.ts_body_sent = now;
+    }
 
     bool Engine::upstream_request_sent(const UpstreamConn* u) const noexcept
     {

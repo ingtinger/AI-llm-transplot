@@ -234,8 +234,7 @@ namespace llmbridge::detail
         const bool was_flushed = u->client && _e.tls_out_flushed(u);
         bool done = false;
         if (!tls_flush(u, &done)) return false;
-        if (u->client && !was_flushed && _e.tls_out_flushed(u))
-            u->client->req.f.ts_up_sent = now_ns();
+        if (u->client && !was_flushed && _e.tls_out_flushed(u)) _e.note_sent(u->client, now_ns());
         return true;
     }
 
@@ -385,8 +384,7 @@ namespace llmbridge::detail
             if (u->client && u->sent_bytes != sent) u->client->req.f.ts_progress = now_ns();
             if (!tdone) return; // EPOLLOUT re-armed by tls_flush
             disarm_write(u);    // handshake replies arrive via read
-            if (u->client && !was_flushed && _e.tls_out_flushed(u))
-                u->client->req.f.ts_up_sent = now_ns();
+            if (u->client && !was_flushed && _e.tls_out_flushed(u)) _e.note_sent(u->client, now_ns());
             return;
         }
 #endif
@@ -399,7 +397,7 @@ namespace llmbridge::detail
             return;
         }
         disarm_write(u);
-        if (u->client) u->client->req.f.ts_up_sent = now_ns(); // end of request-path work
+        if (u->client) _e.note_sent(u->client, now_ns()); // t3, or a body part's end
     }
 
     void EpollIo::on_upstream_readable(UpstreamConn* u) noexcept

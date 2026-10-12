@@ -709,6 +709,10 @@ request. A reply that closes the connection waits for that drain
 (`close_on_drain`). It takes a response byte: a TLS venue's session tickets arrive
 after its handshake as records with no plaintext, and the body goes on past them.
 
-**Stamps.** t0 is the head's framing, so the rest of the upload is not request-path
-time: it lands in the upstream wait, where the venue is reading it. t3 is restamped
-as each part goes.
+**Stamps.** t0 is the head's framing and t3 the first send, of the head and the body
+so far. Each later part's scan, copy and send is summed into `body_work_ns`, which
+request-path counts. The read that brings the last byte stamps `ts_body_end`, where
+`client_upload_ns` ends, and the last send completion `ts_body_sent`, where the
+provider's wait begins. So the connection's first-byte stamp runs on past the head:
+`pump_body` restarts it for the next request at the last byte, or `drop_discard` once
+a cut-short body's rest has gone. LATENCY.md 2b.

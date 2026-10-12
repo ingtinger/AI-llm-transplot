@@ -120,7 +120,7 @@ namespace llmbridge::detail
                     open_request(c, m, facts, t0);
                     if (_sink) sink_capture(c);
                     c->upstream_slot = 0;
-                    c->req.f.body_streaming = c->req.f.body_in_rbuf = true;
+                    c->req.f.body_streaming = c->req.f.body_in_rbuf = c->req.f.body_streamed = true;
                     // An OpenAI client's JSON is checked as it passes; a file upload is not JSON.
                     c->req.f.body_scanned = json_media_type(facts.content_type.in(c->rbuf)) &&
                                             client_dialect_of(c->rbuf) == Dialect::OpenAI;
@@ -181,7 +181,10 @@ namespace llmbridge::detail
         c->req.f.client_upload_ns = span_since(c->ts_first_byte, t0);
         c->req.f.client_conn_reused = c->ever_framed;
         c->req.f.client_conn_setup_ns = c->req.f.client_conn_reused ? 0 : span_since(c->ts_accepted, t0);
-        // A pipelining client's next request is already here, so its arrival begins now.
+        // Whole, its last byte is in, and a pipelining client's next request already here
+        // begins now. A streamed body's arrival runs on to its last byte (pump_body).
+        if (c->rbuf.size() < m.total_len) return;
+        c->req.f.ts_body_end = t0;
         c->ts_first_byte = c->rbuf.size() > m.total_len ? t0 : 0;
     }
 
@@ -280,14 +283,14 @@ namespace llmbridge::detail
         c->req.f.ts_progress = c->req.f.ts_req_built;
         // Per attempt: a failover's venue is not the last one's. Pooled means no handshake.
         c->req.f.ts_wire_ready = u->connected ? c->req.f.ts_req_built : 0;
-        c->req.f.ts_up_sent = 0;
+        c->req.f.ts_up_sent = c->req.f.ts_body_sent = 0;
         c->req.f.upstream_pooled = u->connected;
         c->req.f.upstream_ip = u->up_addr.sin_addr.s_addr;
 
         if (!u->connected) return; // the connect's completion sends it
         switch (_ops->send(*u))
         {
-            case Sent::Done: c->req.f.ts_up_sent = now_ns(); return;
+            case Sent::Done: return note_sent(c, now_ns());
             case Sent::Queued: return;
             case Sent::Failed: return upstream_lost(u, UpFail::Write);
         }
@@ -307,9 +310,7 @@ namespace llmbridge::detail
             {
                 // The split the timing headers use, so the two cannot disagree; t5 does
                 // not enter it, so t4 stands in.
-                const TimingSplit sp = timing_split(c->req.f.ts_req_recvd, c->req.f.ts_req_built,
-                                                    c->req.f.ts_wire_ready, c->req.f.ts_up_sent,
-                                                    c->req.f.ts_up_recvd, c->req.f.ts_up_recvd);
+                const TimingSplit sp = split_of(c->req.f, c->req.f.ts_up_recvd);
                 const int64_t resp_ns = ts_resp_sent - c->req.f.ts_up_recvd;
                 if (sp.req_path_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(sp.req_path_ns));
                 if (sp.connect_ns >= 0) _stats.connect.record(static_cast<uint64_t>(sp.connect_ns));

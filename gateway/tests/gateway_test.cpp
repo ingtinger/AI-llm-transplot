@@ -841,6 +841,7 @@ namespace
             if (_connect_ns >= 0) _gw->set_connect_ns(_connect_ns);
             if (_client_sndbuf >= 0) _gw->set_client_sndbuf_for_test(_client_sndbuf);
             if (!_stream_openai_body) _gw->set_stream_openai_body(false);
+            if (_epoll_write_cap) _gw->set_epoll_write_cap_for_test(_epoll_write_cap);
             _proxy_port = _gw->bound_port();
             // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
@@ -877,6 +878,7 @@ namespace
         int64_t _connect_ns = -1; // set before start(), like the heartbeat
         int _client_sndbuf = -1;  // set before start(); pins SO_SNDBUF on accepted clients
         bool _stream_openai_body = true; // set before start()
+        size_t _epoll_write_cap = 0;     // set before start(); 0 writes all it can
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
@@ -11256,6 +11258,336 @@ TEST_P(ProxyBodyStream, ABodyThatIsNotDeclaredJsonIsForwardedUnscanned)
     ASSERT_EQ(c.recv_status(), 200);
     const std::string up = _backend.last_request();
     EXPECT_EQ(up.substr(up.size() - body.size()), body);
+}
+
+// ── A streamed body's timing (LATENCY.md 2b) ─────────────────────────────────
+
+namespace
+{
+    constexpr int kParts = 16;
+    constexpr int64_t kUploadNs = 300'000'000; // first part to last
+
+    /// An OpenAI request with a body of about `kb` KiB. Declared JSON it is scanned as
+    /// it passes; with no Content-Type it is not.
+    std::string big_request(size_t kb, bool json, bool stream = false)
+    {
+        const std::string body = std::string(R"({"model":"gpt-4o",)") + (stream ? R"("stream":true,)" : "") +
+                                 R"("messages":[{"role":"user","content":")" + std::string(kb << 10, 'p') +
+                                 R"("}]})";
+        return "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" +
+               std::string(json ? "Content-Type: application/json\r\n" : "") +
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+
+    /// `r` in `parts` pieces over kUploadNs, the head in the first: an upload far slower
+    /// than anything the gateway does with it.
+    bool send_slowly(Client& c, const std::string& r, int parts = kParts)
+    {
+        const size_t per = (r.size() + parts - 1) / parts;
+        const auto gap = std::chrono::nanoseconds(kUploadNs / (parts - 1));
+        for (size_t off = 0; off < r.size(); off += per)
+        {
+            if (off) std::this_thread::sleep_for(gap);
+            if (!c.send(r.substr(off, per))) return false;
+        }
+        return true;
+    }
+
+    /// A timing header's value, -1 when it is absent.
+    long long header_value(const std::string& r, const std::string& name)
+    {
+        const size_t at = r.find("\r\n" + name + ": ");
+        return at == std::string::npos ? -1 : std::stoll(r.substr(at + name.size() + 4));
+    }
+
+    int64_t wire_of(const llmbridge::RequestRecord& r)
+    {
+        return r.ts_wire_ready ? r.ts_wire_ready : r.ts_req_built;
+    }
+
+    /// What request-path records for `r`, from its stamps.
+    int64_t req_path_of(const llmbridge::RequestRecord& r)
+    {
+        return (r.ts_req_built - r.ts_req_recvd) + (r.ts_up_sent - wire_of(r)) + r.body_work_ns;
+    }
+} // namespace
+
+// A streamed body's upload was booked as ours: t3 moved with every part, so the whole
+// upload sat in upwrite and request-path and overflowed both histograms, while
+// client_upload_ns read ~0. t3 is now the first send, the upload runs to the body's
+// last byte, and the venue's wait starts at the last byte sent. 32 KiB in four parts, so
+// our real work on it fits request-path's 2.62 ms under a loaded ASan build too, where
+// one part costs up to 200 us.
+TEST_P(ProxyBodyStream, AStreamedUploadIsTheClientsTimeNotOurs)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(send_slowly(c, big_request(32, /*json=*/false), 4));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_TRUE(r.body_streamed);
+    EXPECT_GE(r.client_upload_ns, kUploadNs * 3 / 4) << "the upload is the client's";
+    EXPECT_GE(r.ts_body_end - r.ts_req_recvd, kUploadNs * 3 / 4);
+    EXPECT_LT(r.ts_up_sent - wire_of(r), kUploadNs / 10) << "upwrite carried the upload";
+    EXPECT_GE(r.ts_body_sent, r.ts_body_end);
+    EXPECT_LE(r.ts_body_sent, r.ts_up_recvd);
+    EXPECT_LT(r.ts_up_recvd - r.ts_body_sent, kUploadNs / 4) << "the venue's wait is from the last byte";
+    EXPECT_GE(r.ts_up_recvd - r.ts_up_sent, kUploadNs * 3 / 4);
+    EXPECT_GT(r.body_work_ns, 0);
+    EXPECT_LT(req_path_of(r), kUploadNs / 10);
+    const llmbridge::Stats& st = _gw->stats();
+    ASSERT_EQ(st.req_path.total(), 1u);
+    EXPECT_EQ(st.req_path.max(), static_cast<uint64_t>(req_path_of(r)));
+    EXPECT_EQ(st.req_path.overflow_count(), 0u) << "the upload overflowed request-path";
+    EXPECT_EQ(st.overhead.overflow_count(), 0u);
+}
+
+// A stream's timing headers split the same request the same way: upwrite and the body
+// work are ours, the upload the client's, the first-byte wait the venue's from the last
+// body byte. Each header is the sink's number.
+TEST_P(ProxyBodyStream, AStreamedBodysHeadersSplitUploadWorkAndWait)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(openai_sse_response(4096));
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(send_slowly(c, big_request(1024, /*json=*/true, /*stream=*/true)));
+    const std::string all = c.recv_stream();
+    ASSERT_NE(all.find("[DONE]"), std::string::npos) << all.substr(0, 600);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_TRUE(r.body_streamed);
+    EXPECT_EQ(header_value(all, "x-llmbridge-upwrite-us"), (r.ts_up_sent - wire_of(r)) / 1000);
+    EXPECT_EQ(header_value(all, "x-llmbridge-body-work-us"), r.body_work_ns / 1000);
+    EXPECT_EQ(header_value(all, "x-llmbridge-client-upload-us"), r.client_upload_ns / 1000);
+    EXPECT_EQ(header_value(all, "x-llmbridge-upstream-ttfb-us"), (r.ts_up_recvd - r.ts_body_sent) / 1000);
+    EXPECT_LT(header_value(all, "x-llmbridge-upwrite-us"), kUploadNs / 10'000);
+    EXPECT_GE(header_value(all, "x-llmbridge-client-upload-us"), kUploadNs * 3 / 4'000);
+    EXPECT_LT(header_value(all, "x-llmbridge-upstream-ttfb-us"), kUploadNs / 4'000);
+    EXPECT_LT(header_value(all, "x-llmbridge-body-work-us"), kUploadNs / 2'000);
+    ASSERT_EQ(_gw->stats().req_path.total(), 1u);
+    EXPECT_EQ(_gw->stats().req_path.max(), static_cast<uint64_t>(req_path_of(r)));
+}
+
+// A held body's record and headers are what they were: its new fields are t0, t3 and 0,
+// so the formulas a reader uses for a streamed body give a held one's old numbers.
+TEST_P(ProxyBodyStream, AHeldBodyKeepsItsNumbers)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string req = openai_request(std::string(4000, 'h'));
+    ASSERT_TRUE(c.send(req.substr(0, 1000))); // in two reads, so it has an upload
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_TRUE(c.send(req.substr(1000)));
+    const std::string resp = c.recv_response();
+    ASSERT_EQ(Client::status_of(resp), 200) << resp;
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_FALSE(r.body_streamed);
+    EXPECT_GE(r.client_upload_ns, 10'000'000);
+    EXPECT_EQ(r.ts_body_end, r.ts_req_recvd);
+    EXPECT_GT(r.ts_up_sent, 0);
+    EXPECT_EQ(r.ts_body_sent, r.ts_up_sent);
+    EXPECT_EQ(r.body_work_ns, 0);
+    EXPECT_EQ(header_value(resp, "x-llmbridge-body-work-us"), -1) << "a held body has no body work";
+    EXPECT_EQ(header_value(resp, "x-llmbridge-upwrite-us"), (r.ts_up_sent - wire_of(r)) / 1000);
+    EXPECT_EQ(header_value(resp, "x-llmbridge-upstream-us"), (r.ts_up_recvd - r.ts_up_sent) / 1000);
+    EXPECT_EQ(header_value(resp, "x-llmbridge-client-upload-us"), r.client_upload_ns / 1000);
+    ASSERT_EQ(_gw->stats().req_path.total(), 1u);
+    EXPECT_EQ(_gw->stats().req_path.max(),
+              static_cast<uint64_t>((r.ts_req_built - r.ts_req_recvd) + (r.ts_up_sent - wire_of(r))));
+}
+
+// The last part's send came up short, so a backend's completion finished it. That
+// completion ends the body; it must not move t3, which is the first send's.
+TEST_P(ProxyBodyStream, APartialWriteOfTheLastPartEndsTheBodyNotT3)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _epoll_write_cap = 4096; // epoll: every send comes up short; io_uring's always completes later
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"pad":")" + std::string(64 * 1024, 'q') + R"("})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() >= h.first.size(); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_TRUE(r.body_streamed);
+    EXPECT_GE(r.ts_body_end - r.ts_up_sent, 100'000'000) << "t3 moved to a later part";
+    EXPECT_GE(r.ts_body_sent, r.ts_body_end);
+    EXPECT_LE(r.ts_body_sent, r.ts_up_recvd);
+    EXPECT_LT(r.ts_up_sent - wire_of(r), 50'000'000);
+    EXPECT_GE(r.client_upload_ns, 100'000'000);
+}
+
+// The retry on a fresh connection is a new attempt: its connect is t2, its first send
+// t3. The stale attempt's t3 was kept before, so upwrite went negative.
+TEST_P(ProxyBodyStream, AStaleRetryOfAStreamedBodyStampsTheFreshAttempt)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(http_ok("{}"));
+    _backend.set_drop_first_mid_second(true);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(c.recv_status(), 200);
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.accepted() == 2; })) << "no retry on a fresh connection";
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() >= make_request().size() + h.first.size(); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+
+    EXPECT_EQ(_gw->stats().upstream_retries, 1u);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    const llmbridge::RequestRecord& r = recs[1].r;
+    EXPECT_TRUE(r.body_streamed);
+    EXPECT_GE(r.ts_wire_ready, r.ts_req_built) << "the fresh connection's connect";
+    EXPECT_GE(r.ts_up_sent, r.ts_wire_ready) << "t3 is the stale attempt's";
+    EXPECT_LT(r.ts_up_sent - r.ts_wire_ready, 50'000'000);
+    EXPECT_GE(r.ts_body_end - r.ts_up_sent, 100'000'000);
+    EXPECT_GE(r.ts_body_sent, r.ts_body_end);
+    EXPECT_LE(r.ts_body_sent, r.ts_up_recvd);
+}
+
+// An upload runs from the head's first byte to the body's last, and no further: a
+// streamed body's later reads stamped the connection's first byte, so the next request
+// on it reported an upload reaching back into this one.
+TEST_P(ProxyBodyStream, AnUploadRunsFromTheHeadToTheLastByteOnly)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    const size_t head = h.first.find("\r\n\r\n") + 4;
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first.substr(0, head))); // the head alone goes upstream at once
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 0; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_TRUE(c.send(h.first.substr(head)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_GE(recs[0].r.client_upload_ns, 200'000'000) << "the upload starts at the head";
+    EXPECT_LT(recs[1].r.client_upload_ns, 50'000'000) << "the next request's upload began in this one";
+}
+
+// The same after a body cut short by an early response: its rest is dropped as it
+// arrives, and the request behind it starts its own clock.
+TEST_P(ProxyBodyStream, AfterACutShortBodyTheNextRequestTimesItsOwnUpload)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_reply_before_read(true);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_EQ(c.recv_status(), 200);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    ASSERT_TRUE(c.send(h.rest + make_request()));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_TRUE(recs[0].r.body_streamed);
+    EXPECT_EQ(recs[0].r.ts_body_end, 0) << "its last byte came after the reply";
+    EXPECT_FALSE(recs[1].r.body_streamed);
+    EXPECT_LT(recs[1].r.client_upload_ns, 50'000'000) << "the next request's upload began in this one";
+}
+
+// --stream-openai-body off holds the body, and its numbers are a held body's; on, the
+// same upload reads the same, and our part stays as small.
+TEST_P(ProxyBodyStream, OnAndOffReadTheSameUpload)
+{
+    llmbridge::RequestRecord rec[2];
+    for (const bool on : {true, false})
+    {
+        TestBackend backend;
+        backend.set_response(http_ok("{}"));
+        backend.start();
+        RecordingSink sink;
+        Gateway gw(0, "127.0.0.1", backend.port(), 0, UpstreamDialect::OpenAI, GetParam());
+        gw.set_stream_openai_body(on);
+        gw.set_request_sink(&sink, {});
+        std::thread loop([&] { gw.run(); });
+        Client c;
+        const bool sent = c.connect(gw.bound_port()) && send_slowly(c, big_request(1024, /*json=*/true));
+        const int status = sent ? c.recv_status() : 0;
+        c.close();
+        gw.request_stop();
+        loop.join();
+        backend.stop();
+        ASSERT_EQ(status, 200) << "on=" << on;
+        const auto recs = sink.records();
+        ASSERT_EQ(recs.size(), 1u) << "on=" << on;
+        rec[on] = recs[0].r;
+        EXPECT_EQ(gw.stats().streamed_bodies, on ? 1u : 0u);
+    }
+    const llmbridge::RequestRecord& off = rec[0];
+    EXPECT_FALSE(off.body_streamed);
+    EXPECT_EQ(off.ts_body_end, off.ts_req_recvd);
+    EXPECT_EQ(off.ts_body_sent, off.ts_up_sent);
+    EXPECT_EQ(off.body_work_ns, 0);
+    for (const llmbridge::RequestRecord& r : rec)
+    {
+        EXPECT_GE(r.client_upload_ns, kUploadNs * 3 / 4) << "on=" << r.body_streamed;
+        EXPECT_LT(req_path_of(r) - r.body_work_ns, kUploadNs / 4) << "on=" << r.body_streamed;
+        EXPECT_LT(r.ts_up_recvd - r.ts_body_sent, kUploadNs / 4) << "on=" << r.body_streamed;
+    }
+    EXPECT_LT(std::abs(rec[1].client_upload_ns - off.client_upload_ns), kUploadNs / 4);
+    EXPECT_LT(rec[1].body_work_ns, kUploadNs / 2) << "the scan's share";
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyBodyStream,

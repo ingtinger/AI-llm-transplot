@@ -531,7 +531,7 @@ namespace llmbridge::detail
     // An upstream's request stays in `out` for a resend; its response comes by recv.
     void UringIo::drained(UpstreamConn* u) noexcept
     {
-        if (u->client) u->client->req.f.ts_up_sent = now_ns();
+        if (u->client) _e.note_sent(u->client, now_ns());
     }
 
     int UringIo::run()

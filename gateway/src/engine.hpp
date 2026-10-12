@@ -135,6 +135,8 @@ namespace llmbridge::detail
         /// Has the request left the machine on every transport it uses? Pooling one
         /// that has not truncates the next client's request (ProxyEarlyResponse).
         [[nodiscard]] bool upstream_request_sent(const UpstreamConn* u) const noexcept;
+        /// Everything staged for `c`'s venue is in the kernel: t3, then ts_body_sent.
+        static void note_sent(ClientConn* c, int64_t now) noexcept;
 
         // Streams (core/stream.cpp).
         void begin_stream(UpstreamConn* u, const net::http::ResponseHead& h) noexcept;

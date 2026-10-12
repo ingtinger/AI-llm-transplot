@@ -37,14 +37,14 @@ namespace llmbridge
     }
 
     TimingSplit timing_split(int64_t t0, int64_t t1, int64_t t2, int64_t t3, int64_t t4,
-                             int64_t t5) noexcept
+                             int64_t t5, int64_t body_sent, int64_t body_work_ns) noexcept
     {
         const int64_t wire = t2 ? t2 : t1; // no connect stamped => wire-ready at t1
         TimingSplit s{};
         s.connect_ns = wire - t1;
         s.upwrite_ns = t3 - wire;
-        s.upstream_ns = t4 - t3;
-        s.req_path_ns = (t1 - t0) + s.upwrite_ns;
+        s.upstream_ns = t4 - (body_sent ? body_sent : t3);
+        s.req_path_ns = (t1 - t0) + s.upwrite_ns + body_work_ns;
         s.compute_ns = (t1 - t0) + (t5 - t4);
         return s;
     }
