@@ -12150,19 +12150,46 @@ namespace
                "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
     }
 
+    /// How long after its bytes are in the socket the loop may stamp them: its wake-up
+    /// and its work on one part, under a loaded sanitizer. Absolute, as the scheduler's,
+    /// and a quarter of the upload, so a clock run from the wrong end of it still fails.
+    constexpr int64_t kStampLagNs = kUploadNs / 4;
+
+    /// When the client's bytes went, on the gateway's clock. A sleep wakes late by as much
+    /// as the scheduler likes, so a timing is checked against its own run's sends, never
+    /// against the pacing asked for or another run.
+    struct SentAt
+    {
+        int64_t connect = 0; ///< set by the caller before connect(), so before the accept
+        int64_t first = 0, first_done = 0; ///< around the first part's send
+        int64_t last = 0, last_done = 0;   ///< around the last part's
+    };
+
     /// `r` in `parts` pieces over kUploadNs, the head in the first: an upload far slower
     /// than anything the gateway does with it.
-    bool send_slowly(Client& c, const std::string& r, int parts = kParts)
+    bool send_slowly(Client& c, const std::string& r, int parts = kParts, SentAt* at = nullptr)
     {
         const size_t per = (r.size() + parts - 1) / parts;
         const auto gap = std::chrono::nanoseconds(kUploadNs / (parts - 1));
+        SentAt unasked;
+        SentAt& t = at ? *at : unasked;
         for (size_t off = 0; off < r.size(); off += per)
         {
             if (off) std::this_thread::sleep_for(gap);
-            if (!c.send(r.substr(off, per))) return false;
+            const std::string part = r.substr(off, per);
+            t.last = llmbridge::now_ns();
+            if (!c.send(part)) return false;
+            t.last_done = llmbridge::now_ns();
+            if (off) continue;
+            t.first = t.last;
+            t.first_done = t.last_done;
         }
         return true;
     }
+
+    /// A streamed body's venue wait counted from its last byte, not its first: half of this
+    /// run's upload tells the two apart, however late the client's sleeps woke.
+    int64_t venue_wait_bound(const SentAt& s) { return (s.last_done - s.first) / 2; }
 
     /// A timing header's value, -1 when it is absent.
     long long header_value(const std::string& r, const std::string& name)
@@ -12464,11 +12491,14 @@ TEST_P(ProxyBodyStream, AfterACutShortBodyTheNextRequestTimesItsOwnUpload)
     EXPECT_LT(recs[1].r.client_upload_ns, 50'000'000) << "the next request's upload began in this one";
 }
 
-// --stream-openai-body off holds the body, and its numbers are a held body's; on, the
-// same upload reads the same, and our part stays as small.
+// --stream-openai-body off holds the body, and its numbers are a held body's; on or off,
+// the upload read is the one the client sent, and our part stays as small. Each run is
+// held to its own sends: two runs' uploads differ by however late the client's sleeps woke.
 TEST_P(ProxyBodyStream, OnAndOffReadTheSameUpload)
 {
+    const std::string req = big_request(1024, /*json=*/true);
     llmbridge::RequestRecord rec[2];
+    SentAt at[2];
     for (const bool on : {true, false})
     {
         TestBackend backend;
@@ -12480,7 +12510,8 @@ TEST_P(ProxyBodyStream, OnAndOffReadTheSameUpload)
         gw.set_request_sink(&sink, {});
         std::thread loop([&] { gw.run(); });
         Client c;
-        const bool sent = c.connect(gw.bound_port()) && send_slowly(c, big_request(1024, /*json=*/true));
+        at[on].connect = llmbridge::now_ns();
+        const bool sent = c.connect(gw.bound_port()) && send_slowly(c, req, kParts, &at[on]);
         const int status = sent ? c.recv_status() : 0;
         c.close();
         gw.request_stop();
@@ -12497,16 +12528,32 @@ TEST_P(ProxyBodyStream, OnAndOffReadTheSameUpload)
     EXPECT_EQ(off.ts_body_end, off.ts_req_recvd);
     EXPECT_EQ(off.ts_body_sent, off.ts_up_sent);
     EXPECT_EQ(off.body_work_ns, 0);
-    for (const llmbridge::RequestRecord& r : rec)
+    for (const bool on : {true, false})
     {
-        EXPECT_GE(r.client_upload_ns, kUploadNs * 3 / 4) << "on=" << r.body_streamed;
-        // Setup less the upload is the connection's wait before its first byte.
-        EXPECT_GE(r.client_conn_setup_ns - r.client_upload_ns, 0) << "on=" << r.body_streamed;
-        EXPECT_LT(r.client_conn_setup_ns - r.client_upload_ns, kUploadNs / 4) << "on=" << r.body_streamed;
-        EXPECT_LT(req_path_of(r) - r.body_work_ns, kUploadNs / 4) << "on=" << r.body_streamed;
-        EXPECT_LT(r.ts_up_recvd - r.ts_body_sent, kUploadNs / 4) << "on=" << r.body_streamed;
+        const llmbridge::RequestRecord& r = rec[on];
+        const SentAt& s = at[on];
+        // The first byte and the last are stamped after the client began the send that
+        // carried each, and within a loop's lag of its end: the upload is the client's own.
+        const int64_t first_byte = r.ts_body_end - r.client_upload_ns;
+        EXPECT_GE(first_byte, s.first) << "on=" << on;
+        EXPECT_LE(first_byte, s.first_done + kStampLagNs) << "on=" << on;
+        EXPECT_GE(r.ts_body_end, s.last) << "on=" << on;
+        EXPECT_LE(r.ts_body_end, s.last_done + kStampLagNs) << "on=" << on;
+        EXPECT_GE(r.client_upload_ns, kUploadNs * 3 / 4) << "on=" << on;
+        // Setup less the upload is the connection's wait before its first byte: the
+        // client's, from its connect to its first send.
+        const int64_t wait = r.client_conn_setup_ns - r.client_upload_ns;
+        EXPECT_GE(wait, 0) << "on=" << on;
+        EXPECT_LE(wait, s.first_done - s.connect + kStampLagNs) << "on=" << on;
+        // Our part is the gateway's own work: absolute, so a stamp holding the upload fails.
+        EXPECT_LT(req_path_of(r) - r.body_work_ns, kUploadNs / 4) << "on=" << on;
+        // Held, the last byte is t3 (above) and the wait is this mock reading a MiB at its
+        // own pace, which a loaded machine stretched past the upload.
+        if (on)
+        {
+            EXPECT_LT(r.ts_up_recvd - r.ts_body_sent, venue_wait_bound(s));
+        }
     }
-    EXPECT_LT(std::abs(rec[1].client_upload_ns - off.client_upload_ns), kUploadNs / 4);
     EXPECT_LT(rec[1].body_work_ns, kUploadNs / 2) << "the scan's share";
 }
 
@@ -12517,6 +12564,7 @@ TEST_P(ProxyBodyStream, OnAndOffReadTheSameFirstToken)
 {
     llmbridge::RequestRecord rec[2];
     uint64_t first_token[2] = {};
+    SentAt at[2];
     for (const bool on : {true, false})
     {
         TestBackend backend;
@@ -12528,7 +12576,8 @@ TEST_P(ProxyBodyStream, OnAndOffReadTheSameFirstToken)
         gw.set_request_sink(&sink, {});
         std::thread loop([&] { gw.run(); });
         Client c;
-        const bool sent = c.connect(gw.bound_port()) && send_slowly(c, big_request(1024, true, true));
+        const bool sent =
+            c.connect(gw.bound_port()) && send_slowly(c, big_request(1024, true, true), kParts, &at[on]);
         const std::string all = sent ? c.recv_stream() : std::string();
         c.close();
         gw.request_stop();
@@ -12546,8 +12595,10 @@ TEST_P(ProxyBodyStream, OnAndOffReadTheSameFirstToken)
     {
         const llmbridge::RequestRecord& r = rec[on];
         EXPECT_EQ(first_token[on], static_cast<uint64_t>(r.ts_first_token - r.ts_body_end)) << "on=" << on;
-        EXPECT_LT(first_token[on], static_cast<uint64_t>(kUploadNs / 4)) << "on=" << on << ": the upload";
     }
+    // Streamed, the upload is not in it. Held, it runs from t0, after the upload, and is
+    // the mock reading the MiB at its own pace: bounded by nothing of ours.
+    EXPECT_LT(first_token[1], static_cast<uint64_t>(venue_wait_bound(at[1]))) << "the upload";
 }
 
 // --stream-body off holds every client's body to its last byte, an Anthropic client's as
