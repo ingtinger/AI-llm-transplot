@@ -8,6 +8,65 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.89.0]. 2026-10-11
+
+### Fixed
+
+- **A Gemini request names its model in the path.** The target was always
+  `/v1beta/models/gemini:generateContent`, which names no model, so every request
+  through the dialect failed against Google. It is now
+  `/v1beta/models/{model}:generateContent`, from the request's `model` or a policy's
+  override, sent as one percent-encoded segment (an API-style `models/` prefix is not
+  doubled). A request with no model is refused (400).
+- **A streamed request to a venue that cannot stream is refused.** An OpenAI client
+  asking a Gemini or Cohere venue for `stream: true` got one JSON body, which an SDK
+  reads as an empty stream; it now gets a 400, as Bedrock's did. A Gemini or Cohere
+  client byte-forwarding to its own dialect still streams.
+- **Finish reasons follow each provider's documented list.** Anthropic `refusal` is
+  `content_filter` and `model_context_window_exceeded` is `length` (both were `stop`);
+  Gemini `SPII`, `IMAGE_SAFETY` and `LANGUAGE` are `content_filter`, as is a prompt
+  blocked before any candidate (`promptFeedback.blockReason`), which was a successful
+  empty answer. Applies to the Anthropic stream as well.
+- **A finish reason that is the provider's own failure is a 502.** Cohere `ERROR` and
+  `TIMEOUT`, and Gemini `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL` and
+  `TOO_MANY_TOOL_CALLS`, read as `stop`, a successful answer; they are now no
+  completion at all, and the gateway answers 502.
+- A Bedrock model id reaches the path decoded from its JSON form: an escaped `\/` in
+  an inference-profile ARN was sent with its backslash.
+
+### Changed
+
+- **One venue table.** `provider/dialect.hpp` (installed) holds `Venue`, `Wire`,
+  `Auth`, `VenueSpec`, `spec()`, `venue_named()`, `venue_names()`, `finish_of()` and
+  `client_wire()`: each venue's one name, body wire, credential scheme, streaming,
+  translators, path builder and finish table. The gateway looks rows up where it
+  switched on the venue, and the flag and config choices are the table's names.
+- **Breaking: `UpstreamDialect` is an alias of `provider::Venue`**, and
+  `llmbridge::Dialect` of `provider::Wire`. The enumerators and their values are
+  unchanged; a forward declaration of `enum class UpstreamDialect` no longer compiles.
+- **The body of a translated request is parsed once.** A model override reaches the
+  venue's translator and path through `RequestOut`, instead of a splice and a second
+  parse. The bytes sent are unchanged.
+- **Behaviour change:** the gateway logs `venue cannot stream` for a refused stream on
+  any venue (Bedrock's was `bedrock venue cannot stream`).
+- **Behaviour change:** `gemini_to_openai_response` and `cohere_to_openai_response`
+  (and the `anthropic_` one, should Anthropic add a failure reason) return empty or
+  false for a failure finish reason.
+- `provider::openai::Finish` and `finish_name()` name a finish reason;
+  `json::detail::parse_count()` counts the documents parsed on a thread.
+- `translate.hpp` is frozen as string facades over the table.
+
+### Tests
+
+- `ProxyVenueTable.AGeminiRequestNamesItsModelInThePath`,
+  `GeminiAndCohereRefuseAStreamedRequest` and `ACohereErrorFinishIsABadGateway` fail
+  on both backends against 0.88.0; `FinishTables.EveryDocumentedValue` lists each
+  provider's documented values and `ABlockedGeminiPromptIsAContentFilter`, both failing
+  against 0.88.0; `VenueTargets.*`, `Dialect.OnlyAVenueThatStreamsServesAStreamedTranslation`
+  and `EveryVenueHasOneName`; `ParseOnce.AnOverriddenTranslatedRequestParsesTheBodyOnce`
+  on a 130 KB body, which fails with the splice put back.
+
+
 ## [0.88.0]. 2026-10-11
 
 ### Fixed

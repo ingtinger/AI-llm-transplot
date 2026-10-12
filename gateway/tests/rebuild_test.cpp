@@ -262,8 +262,9 @@ TEST(Rebuild, PrefaultMapsTheScratchPages)
 {
     const size_t want = 4u << 20;
     llmbridge::Gateway off(0, "127.0.0.1", 1);
-    // An empty string points into its own object, so one resident page is the floor.
-    EXPECT_LE(off.prefault_resident_bytes_for_test(), 4096u);
+    // An empty string points into its own object, whose inline buffer may straddle a
+    // page boundary wherever the allocator placed it: two pages, never the 4 MiB.
+    EXPECT_LE(off.prefault_resident_bytes_for_test(), 2 * 4096u);
     llmbridge::Gateway on(0, "127.0.0.1", 1);
     on.set_prefault_bytes(want);
     EXPECT_GE(on.prefault_resident_bytes_for_test(), want);
