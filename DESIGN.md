@@ -238,6 +238,15 @@ continuously fuzzed:
     nothing but tool schemas, whose document is three times the body, still does).
     The cost is up to that much resident memory per worker, arena and scratch each,
     held whether or not the next body is large: 12 MB measured after 10 MB of schemas.
+  - **Large bodies.** Since v0.91.0 a string's plain run is found sixteen bytes a
+    step (`string_stop`: SSE2 on x86-64, an eight-byte word scan elsewhere), so a
+    long text or base64 string costs a few instructions per sixteen bytes, not a
+    branch per byte. A request body parsed for translation keeps a tool's
+    `parameters` opaque: the schema is checked exactly as a built value is, repeated
+    keys at any depth included, but no node is built for it, since every translator
+    forwards it byte for byte. Text, tool schemas and `cache_control` already went
+    out as spans of the client's body, never decoded and re-encoded. Measured on 10
+    MB bodies, see BENCHMARKS.md "Large request bodies".
 - **HTTP framer** (`net/http.hpp`): header size is capped (`kMaxHeaderLen`), body size
   is capped (`kMaxBodyLen`, blocking a `Content-Length: 9999999999` memory-exhaustion
   trickle), and framing is smuggling-safe. **Content-Length only**; a `Transfer-Encoding`
