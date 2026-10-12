@@ -59,6 +59,14 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 - The rest of a body cut short by an early response, read only to be dropped, could be
   trickled to hold the client connection until `--client-idle` (three days). It keeps
   the body's deadline: past it the connection closes.
+- **A client gone before its `100 Continue` no longer has its request dispatched**
+  (since 0.90.0). On epoll, a client that sent `Expect: 100-continue` and reset before
+  the gateway wrote the interim line was closed by that failed write, and a body that
+  would stream was dispatched anyway: the venue was paired with a client freed at the
+  end of the event batch (a use-after-free once the venue's connection was written to
+  again), and the body took a `--stream-body-max` slot that was never given back.
+  `try_frame` now stops when the interim line closed the client. io_uring was not
+  affected: its send completes later, and the reset closes both legs.
 
 ### Added
 
@@ -115,7 +123,10 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   earns its time; bytes after the deadline never forwarded; every way a body ends frees
   its slot, and a cap of 0 holds no body; a stall told from a venue that stopped
   taking, and bytes the kernel holds unacknowledged counted as the venue's; only a send
-  is progress.
+  is progress; a client whose `100 Continue` failed never dispatched.
+- `ProxyBodyStream.AClientGoneBeforeItsContinueIsNeverDispatched` on both backends: a
+  sink holds the loop while the client's head and its reset both arrive; without the
+  fix epoll leaks the slot and ASan reports the use-after-free.
 - Each check, each credit, each slot release and each reset fails its tests when
   removed, on both backends wherever the test runs on both.
 - The new flags' parse, bounds and `--help` lines; the example config pins every default.
