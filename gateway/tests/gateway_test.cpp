@@ -12731,7 +12731,10 @@ TEST_P(ProxyBodyStream, ATricklingBodyIsCutAtItsDeadline)
     const std::string r = trickle(c, h.rest, 1, 50);
     const int64_t took = llmbridge::now_ns() - t0;
     EXPECT_EQ(Client::status_of(r), 408) << r;
-    EXPECT_NE(r.find("did not arrive in time"), std::string::npos) << r;
+    const ErrorBody e = error_body(r);
+    EXPECT_TRUE(e.parsed) << r;
+    EXPECT_EQ(e.message, "request body did not arrive in time");
+    EXPECT_EQ(e.type, "timeout_error");
     EXPECT_GE(took, 400'000'000);
     EXPECT_TRUE(c.wait_closed());
     EXPECT_TRUE(wait_for([&] { return _backend.incomplete_requests().size() == 1; })) << "the venue was kept";

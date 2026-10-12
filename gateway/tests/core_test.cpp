@@ -751,6 +751,16 @@ namespace
         EXPECT_EQ(t.stats().streamed_body_capped, 1u);
     }
 
+    // A cap of 0 is no cap: every body streams, never one held.
+    TEST_F(Core, ACapOfZeroHoldsNoBody)
+    {
+        gw->set_stream_body_max(0);
+        for (int i = 0; i < 3; ++i) EXPECT_NE(stream_part(t, t.client(), 100), nullptr) << i;
+        EXPECT_EQ(t.bodies_streaming(), 3u);
+        EXPECT_EQ(t.stats().streamed_bodies, 3u);
+        EXPECT_EQ(t.stats().streamed_body_capped, 0u);
+    }
+
     // The idle sweep found neither leg moving mid-body. The venue had every byte that came,
     // so the client stopped sending: a client stall, a 408, the venue reset. The stalled
     // body rode a pooled connection inside the stale-retry window and is not resent.
