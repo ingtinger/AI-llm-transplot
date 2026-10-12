@@ -14036,6 +14036,17 @@ TEST_P(ProxyHeadDecide, ARealModelGoesAsSentPaddedToTheDeclaredLength)
     EXPECT_FALSE(sink.records()[0].r.model_substituted);
 }
 
+// Matched byte for byte: a model as long as the sentinel, or the sentinel in another case,
+// is another model.
+TEST_P(ProxyHeadDecide, AModelAsLongAsTheSentinelIsNotMistakenForIt)
+{
+    HeadPolicy pol;
+    pol.heads = {auto_route()};
+    start_with(pol);
+    expect_padded([this] { shutdown(); }, _backend, pol, _proxy_port, R"("AUTO")", "AUTO");
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 0u);
+}
+
 TEST_P(ProxyHeadDecide, ABodyWithoutAModelIsPadded)
 {
     HeadPolicy pol;
