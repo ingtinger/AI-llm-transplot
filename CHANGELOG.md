@@ -20,11 +20,12 @@ venue is the policy's decision. DESIGN.md "Naming the key for a venue".
   holding the key for the venue that decision or retry picked. Empty keeps today's
   behaviour, the key from `Authorization`, `x-api-key`, `x-goog-api-key` or `api-key`.
   Set, its value goes out as the venue's own key header and is the only credential the
-  venue receives: `x-api-key` for Anthropic (with the client's `anthropic-version`, or
-  2023-06-01), `Authorization: Bearer` for OpenAI-compatible venues and Cohere,
-  `x-goog-api-key` for Gemini, `api-key` for Azure. Translated and byte-forwarded,
-  streamed or not. Both fields come last in their structs, so existing initializers keep
-  compiling, and both are copied, so they need only outlive the call.
+  venue receives: `x-api-key` for Anthropic, `Authorization: Bearer` for
+  OpenAI-compatible venues and Cohere, `x-goog-api-key` for Gemini, `api-key` for Azure.
+  Translated and byte-forwarded, streamed or not. A request translated for Anthropic
+  carries the client's `anthropic-version`, or 2023-06-01; a byte-forward keeps the
+  client's as sent and adds none. Both fields come last in their structs, so existing
+  initializers keep compiling, and both are copied, so they need only outlive the call.
 - `kKeyHeaderPrefix` (`x-kottos-key-`), `kMaxKeyHeaderName` (64) and `key_header_ok` in
   `gateway/policy.hpp`, public so a policy can `static_assert` its own names;
   `refuse::kKeyHeaderMissing`, `kKeyHeaderRepeated`, `kKeyHeaderUnusable` and
@@ -44,11 +45,20 @@ venue is the policy's decision. DESIGN.md "Naming the key for a venue".
   could name, since a repeat could hide past what the gateway reads; a Bedrock venue,
   which signs with a key pair and has no header for a bearer key. `Authorization` never
   stands in, because it may hold another provider's key.
+- **A key named for a venue the gateway does not have is refused.** A decision that
+  names a key with an `upstream_index` past the end of the table gets a 500 before any
+  upstream is contacted; the first venue would have received a key meant for another
+  provider as its own. Unnamed, such an index still means the first venue, and -1, the
+  default, means the first venue named or not.
 - **A failover carries the next venue's key, never the first one's.** The retry's header
-  is adopted before the rebuild. A retry that names none after a decision that named one
-  gives up, and the client sees the failure; one that names a header the client never
-  sent gets the 400, and the next venue is not contacted.
-- **A sink cannot capture a family header**, as it cannot capture `Authorization`.
+  is adopted before the rebuild. A retry that names none after any earlier attempt that
+  named one, the decision or a retry, gives up, and the client sees the failure; one that
+  names a header the client never sent gets the 400, and the next venue is not contacted.
+- **A sink cannot capture a family header, nor a credential header under another
+  spelling.** A capture name is checked as the lookup reads it, without its trailing
+  colon and whitespace, so `Authorization:` is refused as `authorization` is; it
+  captured the client's bearer, in 0.91.0 too. A name with a colon left inside is
+  refused, since it names no header and can match into a value.
 - The key is read in the framing walk, which records each family line a policy could
   name, at most eight, as offsets into the head: no second walk and no allocation,
   named or not. A strip-list entry for the named header does not hide it from that read.
@@ -62,6 +72,10 @@ venue is the policy's decision. DESIGN.md "Naming the key for a venue".
 - **Behaviour change: with a key named, a byte-forwarded request no longer carries the
   client's `Authorization`, `x-api-key`, `x-goog-api-key` or `api-key`**; the named key
   replaces them.
+- **Behaviour change: a sink capture name is read without its trailing colons and
+  whitespace**, so `x-tenant: ` now captures `x-tenant`, and one with a colon inside,
+  which captured nothing or part of a header's value, is refused at `set_request_sink`
+  and logged.
 
 ### Tests
 
@@ -73,16 +87,19 @@ venue is the policy's decision. DESIGN.md "Naming the key for a venue".
   byte-forward swap, every refusal leaving the buffer empty, the family and lines no
   policy could name stripped when nothing is named, and a golden rebuild without the
   family. `TheNamedKeyIsReadFromTheFramingWalkAlone` poisons every head byte outside
-  the recorded spans and still resolves the key; `ANamedKeyStaysWithinTheSameBound`
-  holds the named path to the one-walk timing bound.
+  the recorded spans and still resolves the key, so nothing walks the head again;
+  `ANamedKeyStaysWithinTheSameBound` holds the named path to the unnamed path's timing
+  bound, which says nothing about how many walks it takes.
 - Both backends, `ProxyKeyHeader`: translated requests to Anthropic, Gemini, Cohere and
   Azure, OpenAI and Anthropic client byte-forwards, streams, every malformed header
   refused with nothing sent, the table's bound, a SigV4 venue, names outside the
   family, the family with no policy installed, failover across dialects, a failover
   naming no usable key, a failover to a key the client never sent, an unnamed decision
-  failing over to a named key, three clients on one pooled connection, the sink, and
-  the log. `ProxyBodyStream.TheKeyFamilyNeverLeavesWithAStreamedBody`: the streamed head
-  and a stale connection's rebuild.
+  failing over to a named key, an unnamed retry after a named one, a key named for a
+  venue past the table, three clients on one pooled connection, the sink under every
+  spelling of a credential header's name, and the log.
+  `ProxyBodyStream.TheKeyFamilyNeverLeavesWithAStreamedBody`: the streamed head and a
+  stale connection's rebuild.
 - `AllocCeiling.NamedKeyPassthrough` and `NamedKeyTranslated`: no allocation on either
   backend, as with the same policy naming none.
 - `fuzz_body_stream` asserts no family header leaves in the held or the streamed head.
@@ -92,16 +109,18 @@ venue is the policy's decision. DESIGN.md "Naming the key for a venue".
   keeping the first venue's header on a retry, keeping the client's own credential
   headers beside the named key, letting a repeated header win first, recording only
   the first copy, dropping the charset check, dropping the table's bound, retrying
-  unnamed after a named decision, accepting any name, letting the sink capture a family
-  header, signing a Bedrock request despite a named key, a strip-list entry hiding the
-  named header, reading the key with a second walk, the wrong header for a venue,
-  dropping `anthropic-version`, and not adopting the decision's header at all.
+  unnamed after a named decision or a named retry, accepting any name, letting the sink
+  capture a family header, signing a Bedrock request despite a named key, a strip-list
+  entry hiding the named header, reading the key with a second walk inside `named_key`,
+  the wrong header for a venue, dropping `anthropic-version`, not adopting the
+  decision's header at all, sending a key named for a missing venue to the first one,
+  and checking a capture name with its colon.
 
 ### Known gaps
 
 - A Gemini client byte-forwarding to a Gemini venue can carry its own key in the query
-  (`?key=`); a named key header is added beside it, not instead. No venue in use takes
-  that form.
+  (`?key=`); a named key header is added beside it, not instead, so the venue receives
+  two keys and Google decides which applies.
 
 
 ## [0.92.0]. 2026-10-12
