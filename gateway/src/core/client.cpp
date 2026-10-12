@@ -153,9 +153,12 @@ namespace llmbridge::detail
             const Decision d = policy_decision(c, m);
             if (!d.allow) return error_respond(c, d.deny_status, d.reason, d.message);
             // Out of range is the default: a venue that has left the table must not send
-            // the request somewhere arbitrary.
+            // the request somewhere arbitrary. Unless a key is named for that venue, which
+            // venue 0 would receive as its own.
             if (d.upstream_index >= 0 && static_cast<size_t>(d.upstream_index) < _upstreams.size())
                 c->upstream_slot = d.upstream_index;
+            else if (d.upstream_index >= 0 && !d.credential_header.empty())
+                return error_respond(c, 500, "policy named a key for a venue past the table");
             else if (d.upstream_index >= 0)
                 LB_WARN(ReqId{c->req.f.req_seq}, " policy chose upstream ",
                         static_cast<int64_t>(d.upstream_index), " of ",

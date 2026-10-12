@@ -76,8 +76,8 @@ namespace llmbridge
         bool allow = false;
         /// Must be 400-599; the gateway substitutes 403 for anything else and warns.
         int deny_status = 401;
-        /// Index into the gateway's upstream table; out of range (the -1 default too) means
-        /// the first one. Ignored when `allow` is false.
+        /// Index into the gateway's upstream table; out of range (the -1 default too) means the
+        /// first one, but past the end with credential_header set is a 500. Ignored unless `allow`.
         int upstream_index = -1;
 
         /// Rewrite the request's `model` before sending; empty leaves the client's. Valid

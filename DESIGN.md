@@ -576,7 +576,8 @@ have to know which venue it lands on, which defeats routing.
 
 Two rules make the single-upstream gateway a special case of this one, not a different
 thing. An index that is unset (-1) or past the end of the table means the
-First upstream, so a policy that only authenticates never learns the table exists. And
+First upstream, so a policy that only authenticates never learns the table exists (past
+the end with a key named is refused: "Naming the key for a venue"). And
 **pools are per venue**: a keep-alive connection to one provider is never handed to a
 request bound for another, because that would put the request, and its credential, on a
 socket to the wrong company. A retry after a stale pooled connection stays on the same
@@ -631,8 +632,12 @@ header is absent or empty, appears more than once in any case, or holds a contro
 8-bit byte or more than 8 KiB; when the name is outside the family; when the head carries
 more than eight nameable family lines, since a repeat could hide past the table; and
 when the venue is Bedrock, which signs with a key pair and has no header for a bearer
-key. A failover that names no header after a decision that named one gives up, and the
-client sees the failure; one that names a header the client never sent gets the 400.
+key. A decision naming a key with an index past the end of the table gets a 500, before
+any upstream is contacted. Unnamed, such an index means the first venue; named, the
+first venue would receive a key meant for another provider as its own. -1, the default,
+means the first venue either way. A failover that names no header after a decision that
+named one gives up, and the client sees the failure; one that names a header the client
+never sent gets the 400.
 
 The family itself never leaves. Every header whose name starts with `x-kottos-key-`, in
 any case, is dropped from every byte-forwarded request, with or without a policy: at

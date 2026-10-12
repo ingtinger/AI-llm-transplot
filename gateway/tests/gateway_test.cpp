@@ -11267,6 +11267,48 @@ TEST_P(ProxyKeyHeader, ANameOutsideTheFamilyIsRefused)
     venue.stop();
 }
 
+// A key named for a venue past the gateway's table is meant for some other provider; the
+// first venue would get it as its own key. A 500 before any venue is contacted, as a
+// failover to such a venue gives up. Unnamed, past the table still means the first venue,
+// and so does -1 with a key named.
+TEST_P(ProxyKeyHeader, AKeyNamedForAMissingVenueIsRefused)
+{
+    TestBackend anth, oai;
+    anth.set_response(venue_reply(UpstreamDialect::Anthropic));
+    oai.set_response(venue_reply(UpstreamDialect::OpenAI));
+    anth.start();
+    oai.start();
+    KeyedPolicy pol({{2, "x-kottos-key-openai"}, {9, "x-kottos-key-anthropic"}, {-1, "x-kottos-key-anthropic"},
+                     {2, nullptr}});
+    start({{"127.0.0.1", anth.port(), false, "", UpstreamDialect::Anthropic, ""},
+           {"127.0.0.1", oai.port(), false, "", UpstreamDialect::OpenAI, ""}},
+          &pol);
+    const std::string hdrs = "Authorization: Bearer sk-AUTH-CLIENT\r\nx-kottos-key-openai: sk-OPENAI-SECRET\r\n"
+                             "x-kottos-key-anthropic: sk-ant-SECRET\r\n";
+    std::string resp[4];
+    for (int i = 0; i < 4; ++i)
+    {
+        pol.pick(i);
+        resp[i] = exchange(openai_request_hdrs("hi", hdrs));
+    }
+    shutdown();
+    for (int i = 0; i < 2; ++i)
+    {
+        EXPECT_EQ(Client::status_of(resp[i]), 500) << resp[i];
+        EXPECT_EQ(resp[i].find("SECRET"), std::string::npos) << resp[i];
+    }
+    EXPECT_EQ(Client::status_of(resp[2]), 200) << resp[2];
+    EXPECT_EQ(Client::status_of(resp[3]), 200) << resp[3];
+    const std::string all = anth.all_requests();
+    EXPECT_EQ(anth.requests_seen(), 2) << "a refused request reached the first venue:\n" << all;
+    EXPECT_EQ(occurrences(all, "\r\nx-api-key: sk-ant-SECRET\r\n"), 1u) << all;
+    EXPECT_EQ(occurrences(all, "sk-AUTH-CLIENT"), 1u) << all;
+    EXPECT_EQ(all.find("sk-OPENAI-SECRET"), std::string::npos) << all;
+    EXPECT_EQ(oai.requests_seen(), 0) << oai.all_requests();
+    anth.stop();
+    oai.stop();
+}
+
 // Pooled upstream connections are shared between clients, so a key must ride only the
 // request it came in on, a refused request in between included, and must not idle in
 // the pooled buffer afterwards.
