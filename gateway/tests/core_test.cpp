@@ -761,6 +761,22 @@ namespace
         EXPECT_EQ(t.stats().streamed_body_capped, 0u);
     }
 
+    // The 100 Continue for a body that would stream finds the client gone: the close dooms
+    // it, so nothing is dispatched, no venue is contacted and no slot is taken.
+    TEST_F(Core, AClientThe100ContinueFoundGoneIsNeverDispatched)
+    {
+        ClientConn* c = t.client();
+        c->rbuf = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  "Expect: 100-continue\r\nContent-Length: " + std::to_string(kBody.size()) + "\r\n\r\n";
+        io.next_send = Sent::Failed;
+        t.bytes(c);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"send client", "close client"}));
+        EXPECT_TRUE(c->doomed);
+        EXPECT_EQ(c->up, nullptr);
+        EXPECT_EQ(t.bodies_streaming(), 0u);
+        EXPECT_EQ(t.stats().streamed_bodies, 0u);
+    }
+
     // The idle sweep found neither leg moving mid-body. The venue had every byte that came,
     // so the client stopped sending: a client stall, a 408, the venue reset. The stalled
     // body rode a pooled connection inside the stale-retry window and is not resent.

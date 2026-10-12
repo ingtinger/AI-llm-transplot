@@ -189,7 +189,8 @@ The request side is shared outright. Bytes a backend reads go to `on_client_byte
 a finished request re-frames whatever was pipelined from the same buffer, never
 with another read. An `Expect: 100-continue` is answered by staging the interim line
 in `out` and sending it like any reply; it finishes nothing, because no request is
-framed yet. Reading continues while a request is in flight, so a client may pipeline
+framed yet. A send that fails closes the client, and `try_frame` stops there: a body
+that would stream is never dispatched for a client already gone. Reading continues while a request is in flight, so a client may pipeline
 behind it, up to `kMaxClientBuffered` (no legal request is larger); past that its
 reads are paused through `set_read` (counted in `client_read_pauses`) until the
 requests drain the buffer. On io_uring a pause cancels the multishot recv, whose

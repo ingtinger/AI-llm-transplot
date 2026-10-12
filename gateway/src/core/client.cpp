@@ -113,6 +113,7 @@ namespace llmbridge::detail
                 c->rbuf.reserve(m.total_len);
                 // No body byte yet: the client is waiting on us, not the network.
                 if (c->rbuf.size() <= m.header_len && facts.expect == 2) send_continue(c);
+                if (c->doomed) return; // the 100 found the client gone
                 // A body that needs no rewrite goes upstream as it arrives.
                 if (body_streams(c, m))
                 {

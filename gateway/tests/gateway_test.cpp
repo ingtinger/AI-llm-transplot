@@ -35,6 +35,7 @@
 #include <mutex>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -820,6 +821,12 @@ namespace
             return ::read(_fd, tmp, sizeof(tmp)) == 0;
         }
         void shutdown_both() { ::shutdown(_fd, SHUT_RDWR); } // another thread may use the fd
+        void reset() // an RST, no FIN
+        {
+            linger lg{1, 0};
+            ::setsockopt(_fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+            close();
+        }
         void close() { if (_fd >= 0) { ::close(_fd); _fd = -1; } }
         ~Client() { close(); }
 
@@ -11899,6 +11906,39 @@ namespace
         }
         return p();
     }
+
+    /// Holds the loop inside its first record until released, at most 10 s: whatever a
+    /// client sends meanwhile is in the kernel before the gateway reads any of it.
+    class HoldingSink final : public llmbridge::RequestSink
+    {
+      public:
+        void on_request(const llmbridge::RequestRecord&) noexcept override
+        {
+            std::unique_lock<std::mutex> lk(_mu);
+            if (_held++) return;
+            _cv.notify_all();
+            _cv.wait_for(lk, std::chrono::seconds(10), [this] { return _released; });
+        }
+        bool wait_held()
+        {
+            std::unique_lock<std::mutex> lk(_mu);
+            return _cv.wait_for(lk, std::chrono::seconds(10), [this] { return _held > 0; });
+        }
+        void release()
+        {
+            {
+                std::lock_guard<std::mutex> lk(_mu);
+                _released = true;
+            }
+            _cv.notify_all();
+        }
+
+      private:
+        std::mutex _mu;
+        std::condition_variable _cv;
+        int _held = 0;
+        bool _released = false;
+    };
 } // namespace
 
 class ProxyBodyStream : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
@@ -12611,6 +12651,53 @@ TEST_P(ProxyBodyStream, PastTheCapABodyIsHeldAndStillServed)
     EXPECT_EQ(_gw->stats().streamed_bodies, 2u);
     EXPECT_EQ(_gw->stats().streamed_body_capped, 1u);
     EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// The 100 Continue for a body that would stream found its client reset. On epoll the
+// write fails and closes the client there, and the request went on regardless: it was
+// dispatched, pairing a venue with a client freed at the end of the batch, and took a
+// slot never given back. io_uring learns of the reset from a later completion, after the
+// dispatch, and that close ends both legs. Either way the next body streams. On epoll a
+// write goes 64 bytes a pass, so a venue paired with the freed client is written again
+// after the free, which ASan reports.
+TEST_P(ProxyBodyStream, AClientGoneBeforeItsContinueIsNeverDispatched)
+{
+    _backend.set_response(http_ok("{}"));
+    _stream_body_max = 1;
+    _epoll_write_cap = 64;
+    HoldingSink sink;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const bool uring = GetParam() == llmbridge::IoBackend::Uring;
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    const std::string head =
+        h.first.substr(0, h.first.find("\r\n\r\n") + 2) + "Expect: 100-continue\r\n\r\n";
+    Client gone, first, next;
+    EXPECT_TRUE(gone.connect(_proxy_port) && gone.send(head.substr(0, 20))); // read before the hold
+    EXPECT_TRUE(first.connect(_proxy_port) && first.send(make_request()));
+    EXPECT_EQ(first.recv_status(), 200);
+    // The loop is inside the first record: the rest of the head and the reset both land.
+    EXPECT_TRUE(sink.wait_held());
+    EXPECT_TRUE(gone.send(head.substr(20)));
+    gone.reset();
+    sink.release();
+    if (uring)
+    {
+        EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; })) << "the venue was kept";
+    }
+    const size_t seen = _backend.bytes_seen();
+    EXPECT_TRUE(next.connect(_proxy_port) && next.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > seen + 16 * 1024; })) << "the slot was not freed";
+    EXPECT_TRUE(next.send(h.rest));
+    EXPECT_EQ(next.recv_status(), 200);
+    shutdown();
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.streamed_body_capped, 0u);
+    EXPECT_EQ(st.streamed_bodies, uring ? 2u : 1u);
+    EXPECT_EQ(_backend.requests_seen(), 2) << "the gone client's body was never whole";
+    if (uring) return;
+    EXPECT_EQ(_backend.resets(), 0) << "a venue was given the request";
+    EXPECT_TRUE(_backend.incomplete_requests().empty()) << "a venue was given the request";
 }
 
 // A client that stopped part way through its body was charged to the venue: neither leg
