@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/io.hpp"
 #include "gateway/gateway.hpp"
 #include "net/http.hpp"
 #include "net/tls.hpp" // self-guarded by LLMBRIDGE_HAVE_TLS
@@ -40,9 +41,6 @@ namespace llmbridge
 
 namespace llmbridge::detail
 {
-    class IoOps;
-    struct IoCaps;
-
     /// One per worker thread. Internal: the facade, the backends and core/ reach in.
     class Engine
     {
@@ -71,7 +69,7 @@ namespace llmbridge::detail
         // The backend seam, attached by a backend's run().
         void attach(IoOps* io, const IoCaps& caps) noexcept;
         IoOps* _ops = nullptr;
-        bool _stream_backpressure = false; ///< IoCaps::stream_backpressure of the running backend
+        IoCaps _caps{}; ///< the running backend's
 
         // The request side (core/client.cpp).
         void on_client_bytes(ClientConn* c) noexcept; // frame if idle, then bound what is buffered

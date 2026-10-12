@@ -23,7 +23,8 @@ namespace llmbridge::detail
     constexpr size_t kInitialBuf = 4096;
     constexpr int kPollTickMs = 200; // so request_stop() is observed promptly
     constexpr size_t kMaxClientBuffered = net::http::kMaxHeaderLen + net::http::kMaxBodyLen; // no legal request is larger
-    constexpr size_t kStreamBufCap = 8 << 20; // owed to a stream's client, where reads cannot pause
+    constexpr size_t kStreamBufCap = 8 << 20;      // owed to a stream's client: the ceiling
+    constexpr size_t kStreamPauseAbove = 1 << 20; // io_uring pauses a stream's upstream past this
     constexpr int64_t kAcceptBackoffNs = 100'000'000; // after EMFILE: no busy loop
     // A stale pooled connection fails within a round trip of reuse; later, the
     // provider may have run the request, and a resend would bill it twice.

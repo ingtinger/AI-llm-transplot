@@ -538,7 +538,9 @@ namespace llmbridge::detail
     {
         _e._t_start = now_ns();
         _e._active_backend = 2;
-        _e.attach(this, IoCaps{.stream_backpressure = false});
+        _e.attach(this, IoCaps{.stream_backpressure = true,
+                               .stream_pause_above = kStreamPauseAbove,
+                               .stream_cap = kStreamBufCap});
         if (!submit_accept()) pause_accept("accept arm found the SQ full");
         if (!submit_timer()) _timer_lost = true;
         const auto reap = [this] {

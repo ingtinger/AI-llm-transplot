@@ -33,8 +33,7 @@ namespace llmbridge::detail
 
         Sent send(ConnBase& c) noexcept override;
         bool connect(UpstreamConn& u) noexcept override;
-        /// Cancels and re-arms the multishot recv. Streams do not use it: kStreamBufCap
-        /// bounds them (IoCaps).
+        /// Cancels the multishot recv; a resume re-arms it, or the cancel's completion does.
         void set_read(ConnBase& c, bool on) noexcept override;
         void close(ConnBase& c) noexcept override;
 

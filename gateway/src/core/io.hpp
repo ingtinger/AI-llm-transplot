@@ -9,6 +9,7 @@
 
 // What the shared request lifecycle asks of an event-loop backend, and nothing more.
 
+#include <cstddef>
 #include <cstdint>
 
 namespace llmbridge
@@ -29,10 +30,16 @@ namespace llmbridge::detail
         Failed,
     };
 
+    /// How a backend bounds what a stream owes a slow client. GATEWAY-INTERNALS.md 6c.
     struct IoCaps
     {
-        /// Pauses a stream's upstream for a slow client; else kStreamBufCap bounds it.
+        /// Pauses a stream's upstream for a slow client.
         bool stream_backpressure = false;
+        /// Bytes a stream may owe before it pauses. 0: as soon as a send is left queued,
+        /// which on epoll means the socket is full; an io_uring send is queued in flight.
+        size_t stream_pause_above = 0;
+        /// A stream owing more is dropped, paused or not; 0 for no cap.
+        size_t stream_cap = 0;
     };
 
     /// A backend never calls back into shared code from inside one of these: a send
