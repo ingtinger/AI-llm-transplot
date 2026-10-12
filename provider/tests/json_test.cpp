@@ -809,6 +809,30 @@ TEST(JsonArena, ADroppedDocumentParksItsArenaForTheNextParse)
     EXPECT_EQ(spare.n, 4u);
 }
 
+// ── Large bodies: the run scanner and opaque members ─────────────────────────────
+
+TEST(JsonFast, TheRunScannerStopsWhereTheByteLoopDoes)
+{
+    using llmbridge::provider::json::detail::string_stop;
+    std::mt19937 rng(11);
+    const char kBytes[] = {'a', ' ', '"', '\\', '\x1f', '\x00', '\x7f', '\x80', '\xff', '/', 'u', '\x20'};
+    for (int round = 0; round < 3000; ++round)
+    {
+        // Mostly plain, so runs cross the 8- and 16-byte steps at every alignment.
+        std::string s(rng() % 70, 'x');
+        for (char& c : s)
+            if (rng() % 9 == 0) c = kBytes[rng() % sizeof(kBytes)];
+        for (size_t i = 0; i <= s.size(); ++i)
+        {
+            size_t want = i;
+            while (want < s.size() && s[want] != '"' && s[want] != '\\' &&
+                   static_cast<unsigned char>(s[want]) >= 0x20)
+                ++want;
+            ASSERT_EQ(string_stop(s.data(), i, s.size()), want) << "offset " << i << " of " << s.size();
+        }
+    }
+}
+
 // ── BodyScan: a body checked as it arrives ──────────────────────────────────────
 
 namespace

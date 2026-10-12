@@ -19,14 +19,19 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+#ifdef __SSE2__
+    #include <emmintrin.h>
+#endif
 
 namespace llmbridge::provider::json
 {
@@ -62,6 +67,48 @@ namespace llmbridge::provider::json
         inline std::atomic<size_t>& retain_bytes() noexcept
         {
             static std::atomic<size_t> n{size_t{4} << 20};
+            return n;
+        }
+
+#ifdef __SSE2__
+        /// Bit k set where p[k] of these sixteen bytes is a quote, a backslash or a control byte.
+        inline unsigned stop_mask16(const char* p) noexcept
+        {
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+            const __m128i low = _mm_cmpeq_epi8(_mm_min_epu8(v, _mm_set1_epi8(0x1f)), v); // v <= 0x1f
+            const __m128i hit = _mm_or_si128(
+                _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8('"')), _mm_cmpeq_epi8(v, _mm_set1_epi8('\\'))),
+                low);
+            return static_cast<unsigned>(_mm_movemask_epi8(hit));
+        }
+#endif
+
+        /// The first byte of p[i, n) that ends a plain run inside a string: a quote, a
+        /// backslash or a control byte; n if none. Sixteen bytes a step with SSE2 (all
+        /// of x86-64), else eight, since long strings are most of a large body.
+        inline size_t string_stop(const char* p, size_t i, size_t n) noexcept
+        {
+#ifdef __SSE2__
+            for (; i + 16 <= n; i += 16)
+                if (const unsigned m = stop_mask16(p + i)) return i + static_cast<size_t>(std::countr_zero(m));
+#endif
+            constexpr uint64_t kLo = 0x0101010101010101ULL, kHi = 0x8080808080808080ULL;
+            for (; i + 8 <= n; i += 8)
+            {
+                uint64_t v;
+                std::memcpy(&v, p + i, 8);
+                const uint64_t q = v ^ (kLo * '"'), s = v ^ (kLo * '\\');
+                // Each term's lowest set bit is exact, so the first hit is the lowest byte.
+                const uint64_t hit = (((q - kLo) & ~q) | ((s - kLo) & ~s) | ((v - kLo * 0x20) & ~v)) & kHi;
+                if (hit && std::endian::native == std::endian::little)
+                    return i + static_cast<size_t>(std::countr_zero(hit)) / 8;
+                if (hit) break;
+            }
+            for (; i < n; ++i)
+            {
+                const auto c = static_cast<unsigned char>(p[i]);
+                if (c == '"' || c == '\\' || c < 0x20) return i;
+            }
             return n;
         }
 
@@ -486,7 +533,7 @@ namespace llmbridge::provider::json
             {
                 ++i; // opening quote
                 const size_t start = i;
-                while (i < s.size())
+                while ((i = string_stop(s.data(), i, s.size())) < s.size())
                 {
                     const unsigned char c = static_cast<unsigned char>(s[i]);
                     if (c == '"') { std::string_view sv = s.substr(start, i - start); ++i; return sv; }
@@ -509,7 +556,7 @@ namespace llmbridge::provider::json
                         i += 2;
                         continue;
                     }
-                    ++i;
+                    break; // string_stop stops only at those three
                 }
                 ok = false; // unterminated, raw control character, or bad escape
                 return s.substr(start);

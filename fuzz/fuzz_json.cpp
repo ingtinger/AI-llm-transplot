@@ -22,6 +22,18 @@
 #include <string>
 #include <string_view>
 
+namespace
+{
+    namespace json = llmbridge::provider::json;
+    // Where a plain run inside a string ends, one byte at a time.
+    size_t stop_reference(std::string_view b, size_t i)
+    {
+        for (; i < b.size(); ++i)
+            if (b[i] == '"' || b[i] == '\\' || static_cast<unsigned char>(b[i]) < 0x20) return i;
+        return b.size();
+    }
+} // namespace
+
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
     bool ok = false;
@@ -30,7 +42,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     // Touch the result so nothing is optimised away. The invariant is "does not
     // crash / ASAN-clean on any input", plus the three below.
     if (ok && v.is_object()) (void)v.find("model");
-    namespace json = llmbridge::provider::json;
     const std::string_view in(reinterpret_cast<const char*>(data), size);
     bool any = false;
     (void)json::parse(in, any, json::Keys::Any);
@@ -38,6 +49,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     // And the gateway's top-level walker agrees there is nothing repeated.
     assert(!ok || llmbridge::provider::top_level_key_check(in) !=
                       llmbridge::provider::KeyCheck::DuplicateKey);
+    // The run scanner against the byte loop, from the first offsets.
+    for (size_t i = 0; i <= size && i < 40; ++i)
+        assert(json::detail::string_stop(in.data(), i, in.size()) == stop_reference(in, i));
     // Any bytes escape to one JSON string that decodes back to those bytes.
     std::string lit;
     json::append_escaped(lit, in);

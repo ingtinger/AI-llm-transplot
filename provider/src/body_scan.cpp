@@ -10,10 +10,9 @@
 
 #include "provider/body_scan.hpp"
 
-#include <bit>
 #include <cstring>
 
-#include "provider/json.hpp" // json::detail::kMaxDepth
+#include "provider/json.hpp" // kMaxDepth, string_stop
 
 namespace llmbridge::provider
 {
@@ -45,38 +44,13 @@ namespace llmbridge::provider
     {
         constexpr std::string_view kLits[] = {"true", "false", "null"};
         constexpr size_t kMaxKeys = 256; // top_level_facts' limit
+        using json::detail::string_stop;
 
         bool ws(char c) noexcept { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
         bool digit(char c) noexcept { return c >= '0' && c <= '9'; }
         bool hex(char c) noexcept
         {
             return digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-        }
-
-        // The first byte at or after `i` that ends a plain run inside a string: a quote,
-        // a backslash or a control byte. Eight bytes a step, since strings are the bulk.
-        size_t plain_run(std::string_view b, size_t i) noexcept
-        {
-            constexpr uint64_t kLo = 0x0101010101010101ULL, kHi = 0x8080808080808080ULL;
-            const char* p = b.data();
-            const size_t n = b.size();
-            for (; i + 8 <= n; i += 8)
-            {
-                uint64_t v;
-                std::memcpy(&v, p + i, 8);
-                const uint64_t q = v ^ (kLo * '"'), s = v ^ (kLo * '\\');
-                // Each term's lowest set bit is exact, so the first hit is the lowest byte.
-                const uint64_t hit = (((q - kLo) & ~q) | ((s - kLo) & ~s) | ((v - kLo * 0x20) & ~v)) & kHi;
-                if (hit && std::endian::native == std::endian::little)
-                    return i + static_cast<size_t>(std::countr_zero(hit)) / 8;
-                if (hit) break;
-            }
-            for (; i < n; ++i)
-            {
-                const auto c = static_cast<unsigned char>(p[i]);
-                if (c == '"' || c == '\\' || c < 0x20) return i;
-            }
-            return n;
         }
     } // namespace
 
@@ -154,7 +128,9 @@ namespace llmbridge::provider
             case St::Str:
             {
                 // A two-byte escape is taken in the run: prose carries one every few words.
-                for (i = plain_run(b, i); i + 1 < b.size() && b[i] == '\\'; i = plain_run(b, i + 2))
+                const char* p = b.data();
+                const size_t n = b.size();
+                for (i = string_stop(p, i, n); i + 1 < n && p[i] == '\\'; i = string_stop(p, i + 2, n))
                 {
                     const char e = b[i + 1];
                     if (e == 'u') break;
