@@ -8,6 +8,31 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.86.0]. 2026-10-11
+
+### Changed
+
+- **A connection is a `ClientConn` or an `UpstreamConn`**, both `final` and derived from
+  `ConnBase`, which holds what a socket needs on either leg (fd, buffers, TLS Session,
+  the backend's flags). The request, its stream and the client's stamps live only on a
+  client; the venue, the response framer and the pool links only on an upstream. The
+  single `Connection` struct, with its `is_client` flag and fields that meant one thing
+  or another by kind, is gone, and so is every branch on that flag.
+- **A pooled upstream is 496 bytes, from 2,112** (TLS build), held under 512 by a
+  `static_assert`; a client is 1,872 bytes. Measured with 8,192 clients and 8,192
+  pooled upstreams on one worker, RSS falls by 15.1 MB on both backends (epoll
+  118.2 to 103.1 MB, io_uring 135.1 to 120.0 MB).
+- **Each backend tags an event with the connection's kind**: io_uring in `user_data`
+  next to the op, epoll in the event data. A completion goes to a typed handler; shared
+  code that holds a `ConnBase` reaches the concrete type through one `visit()`.
+- The request link is `ClientConn::up` and `UpstreamConn::client`, still written only
+  by `pair()` and `unpair()`.
+- `Gateway::retire_wbuf` and `adopt_warm`, the buffer-rotation test seams, take an
+  `UpstreamConn*`: a client's buffer cannot be offered.
+
+No behaviour change: the sink records of the corpus tests are identical on both
+backends, and so is the test suite's outcome.
+
 ## [0.85.1]. 2026-10-10
 
 ### Changed
@@ -37,6 +62,9 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   failure there is logged and `run()` returns 1.
 - DESIGN.md "Naming conventions" and GATEWAY-INTERNALS.md sections 4-8 and 11 describe
   the boundary and the two classes.
+- The venue's RTT (`net::tcp_rtt`) stays in the shared `Engine::on_response`: a
+  read-only `getsockopt` that works on either backend's socket, so it is not an `IoOps`
+  call and no driver repeats it.
 
 
 ## [0.84.0]. 2026-10-10
@@ -75,6 +103,8 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
     the old texts should be told.
 - The convention check's "unmarked" rule follows calls through shared methods, now that
   a backend reaches most shared methods only through other shared ones.
+- The venue's RTT (0.81.1) is read in the shared `on_response`, at the head of a
+  stream or of a whole response, on both backends, as before.
 - epoll's send disarms `EPOLLOUT` whenever it completes, so a write event after a
   stream or a reply finds nothing armed.
 
@@ -86,6 +116,7 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   (deterministic, no kernel buffers), the cap where reads cannot pause, a
   Content-Length stream ending without EOF, bytes past it, and one head parse across
   ten body reads.
+
 
 ## [0.83.1]. 2026-10-10
 
