@@ -267,8 +267,11 @@ same reason, so a sink reader takes the time to first token as `ts_first_token` 
 
 For a held body `ts_body_end`, `ts_body_sent` and `body_work_ns` read t0, t3 and 0,
 so the second row reduces to the first and a held request reports exactly what it did
-before bodies streamed; `--stream-openai-body off`, which holds an OpenAI client's
-body, does the same. In v0.90.0 and v0.91.0 a streamed body's t3 moved with each
+before bodies streamed; `--stream-body off`, which holds every body, and
+`--stream-openai-body off`, which holds an OpenAI client's, do the same, as does a body
+held because the worker already streams `--stream-body-max`. A streamed body cut for
+arriving too slowly is a 408 the gateway wrote, with `ts_body_end` 0 (GATEWAY-INTERNALS.md
+12b). In v0.90.0 and v0.91.0 a streamed body's t3 moved with each
 part, so its upload landed in `upwrite-us`, `request-path` and `added-total`,
 overflowing both histograms, while `client_upload_ns` read about 0.
 

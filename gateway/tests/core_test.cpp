@@ -15,10 +15,16 @@
 #include "core/registry.hpp"
 #include "engine.hpp"
 #include "gateway/gateway.hpp"
+#include "net/socket_util.hpp"
 
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <memory>
 #include <string>
@@ -93,6 +99,8 @@ namespace llmbridge
         void gone(ClientConn* c) { e.client_gone(c); }
         const Stats& stats() const { return g.stats(); }
         size_t pooled() const { return g.pooled_upstream_count(); }
+        size_t bodies_streaming() const { return e._bodies_streaming; }
+        void sweep(ClientConn* c, int64_t now) { e.sweep_client(c, now, /*busy=*/true); }
     };
 } // namespace llmbridge
 
@@ -666,5 +674,268 @@ namespace
         EXPECT_EQ(c->req.f.phase, Phase::Idle) << "the reply finished";
         EXPECT_EQ(t.stats().requests, 1u);
         EXPECT_EQ(t.pooled(), 1u);
+    }
+
+    /// An OpenAI client's JSON body, declared whole, of which `part` bytes are in `c`:
+    /// it streams, on an upstream still connecting.
+    const std::string kBody = R"({"model":"m","messages":")" + std::string(20000, 'p') + R"("})";
+    UpstreamConn* stream_part(GatewayCoreTest& t, ClientConn* c, size_t part)
+    {
+        c->rbuf = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  "Content-Length: " + std::to_string(kBody.size()) + "\r\n\r\n" + kBody.substr(0, part);
+        t.bytes(c);
+        return c->up;
+    }
+
+    // A streamed body holds a slot from its head to whatever ends it, and no longer: its
+    // last byte, a response byte, a refusal, the client leaving, or an error reply.
+    TEST_F(Core, EveryWayAStreamedBodyEndsFreesItsSlot)
+    {
+        ClientConn* whole = t.client();
+        ASSERT_NE(stream_part(t, whole, 100), nullptr);
+        ASSERT_TRUE(whole->req.f.body_streaming);
+        EXPECT_EQ(t.bodies_streaming(), 1u);
+        whole->rbuf.append(kBody.substr(100));
+        t.bytes(whole);
+        EXPECT_FALSE(whole->req.f.body_streaming);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "its last byte";
+
+        UpstreamConn* u = stream_part(t, t.client(), 100);
+        ASSERT_NE(u, nullptr);
+        u->rbuf = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        t.upstream_bytes(u);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "a response byte";
+
+        ClientConn* refused = t.client();
+        stream_part(t, refused, 100);
+        refused->rbuf.append(R"(","model":"x")");
+        t.bytes(refused);
+        EXPECT_EQ(t.stats().streamed_body_refusals, 1u);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "a refusal";
+
+        ClientConn* gone = t.client();
+        stream_part(t, gone, 100);
+        t.gone(gone);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "the client leaving";
+
+        ClientConn* failed = t.client();
+        stream_part(t, failed, 100);
+        io.next_send = Sent::Queued; // the reply waits on the client, which stays open
+        t.error_respond(failed, 502);
+        EXPECT_FALSE(failed->doomed);
+        EXPECT_FALSE(failed->req.f.body_streaming);
+        EXPECT_EQ(t.bodies_streaming(), 0u) << "an error reply";
+        EXPECT_EQ(t.stats().streamed_bodies, 5u);
+    }
+
+    // Past the cap the next body is held, framed only at its last byte; a freed slot streams again.
+    TEST_F(Core, PastTheCapABodyIsHeldUntilItsLastByte)
+    {
+        gw->set_stream_body_max(1);
+        ClientConn* first = t.client();
+        ASSERT_NE(stream_part(t, first, 100), nullptr);
+        ClientConn* held = t.client();
+        EXPECT_EQ(stream_part(t, held, 100), nullptr);
+        EXPECT_FALSE(held->req.f.body_streaming);
+        EXPECT_EQ(held->req.f.phase, Phase::Idle) << "nothing framed before the last byte";
+        EXPECT_EQ(t.stats().streamed_body_capped, 1u);
+        held->rbuf.append(kBody.substr(100));
+        t.bytes(held);
+        ASSERT_NE(held->up, nullptr);
+        EXPECT_FALSE(held->req.f.body_streamed);
+        EXPECT_EQ(held->req.f.phase, Phase::Dispatched);
+
+        t.gone(first);
+        EXPECT_NE(stream_part(t, t.client(), 100), nullptr) << "the freed slot";
+        EXPECT_EQ(t.stats().streamed_bodies, 2u);
+        EXPECT_EQ(t.stats().streamed_body_capped, 1u);
+    }
+
+    // A cap of 0 is no cap: every body streams, never one held.
+    TEST_F(Core, ACapOfZeroHoldsNoBody)
+    {
+        gw->set_stream_body_max(0);
+        for (int i = 0; i < 3; ++i) EXPECT_NE(stream_part(t, t.client(), 100), nullptr) << i;
+        EXPECT_EQ(t.bodies_streaming(), 3u);
+        EXPECT_EQ(t.stats().streamed_bodies, 3u);
+        EXPECT_EQ(t.stats().streamed_body_capped, 0u);
+    }
+
+    // The 100 Continue for a body that would stream finds the client gone: the close dooms
+    // it, so nothing is dispatched, no venue is contacted and no slot is taken.
+    TEST_F(Core, AClientThe100ContinueFoundGoneIsNeverDispatched)
+    {
+        ClientConn* c = t.client();
+        c->rbuf = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  "Expect: 100-continue\r\nContent-Length: " + std::to_string(kBody.size()) + "\r\n\r\n";
+        io.next_send = Sent::Failed;
+        t.bytes(c);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"send client", "close client"}));
+        EXPECT_TRUE(c->doomed);
+        EXPECT_EQ(c->up, nullptr);
+        EXPECT_EQ(t.bodies_streaming(), 0u);
+        EXPECT_EQ(t.stats().streamed_bodies, 0u);
+    }
+
+    // The idle sweep found neither leg moving mid-body. The venue had every byte that came,
+    // so the client stopped sending: a client stall, a 408, the venue reset. The stalled
+    // body rode a pooled connection inside the stale-retry window and is not resent.
+    TEST_F(Core, ABodyTheClientStoppedSendingIsAClientStall)
+    {
+        gw->set_body_min_rate(0); // the idle sweep alone, past any upload deadline
+        t.release(t.upstream(), /*keep_alive=*/true);
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        ASSERT_TRUE(u->from_pool);
+        ASSERT_TRUE(u->out.idle()) << "the venue has all that came";
+        io.calls.clear();
+        io.next_send = Sent::Queued; // the reply stays to be read
+        t.sweep(c, c->req.f.ts_progress + Gateway::kDefaultUpstreamIdleNs + 1);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"close upstream", "send client"}));
+        EXPECT_EQ(c->out.bytes().rfind("HTTP/1.1 408 Request Timeout\r\n", 0), 0u) << c->out.bytes();
+        EXPECT_TRUE(u->doomed);
+        EXPECT_TRUE(u->reset_on_close) << "the venue is reset, not sent a FIN";
+        EXPECT_EQ(t.bodies_streaming(), 0u);
+        EXPECT_EQ(t.stats().client_idle_timeouts, 1u);
+        EXPECT_EQ(t.stats().upstream_timeouts, 0u);
+        EXPECT_EQ(t.stats().upstream_retries, 0u);
+    }
+
+    // The same sweep with request bytes the venue has not taken: it stopped reading, so it
+    // is the venue's timeout, a 504, and the venue is reset all the same.
+    TEST_F(Core, ABodyTheVenueStoppedTakingIsTheVenuesTimeout)
+    {
+        gw->set_body_min_rate(0); // the idle sweep alone, past any upload deadline
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        u->connected = u->wire_ready = true; // connected, and the head never taken
+        ASSERT_FALSE(u->out.idle());
+        io.next_send = Sent::Queued;
+        t.sweep(c, c->req.f.ts_progress + Gateway::kDefaultUpstreamIdleNs + 1);
+        EXPECT_EQ(c->out.bytes().rfind("HTTP/1.1 504 Gateway Timeout\r\n", 0), 0u) << c->out.bytes();
+        EXPECT_TRUE(u->doomed);
+        EXPECT_TRUE(u->reset_on_close);
+        EXPECT_EQ(t.stats().upstream_timeouts, 1u);
+        EXPECT_EQ(t.stats().client_idle_timeouts, 0u);
+    }
+
+    // Staging a part is not the venue's progress; sending it is.
+    TEST_F(Core, OnlyASendThatMovesBytesIsProgress)
+    {
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        const int64_t before = c->req.f.ts_progress;
+        c->rbuf.append(kBody.substr(100, 1000));
+        t.bytes(c); // still connecting: staged only
+        EXPECT_EQ(c->req.f.ts_progress, before);
+        u->connected = u->wire_ready = true;
+        c->rbuf.append(kBody.substr(1100, 1000));
+        t.bytes(c); // sent
+        EXPECT_GT(c->req.f.ts_progress, before);
+    }
+
+    // A venue that stopped reading can have every byte we sent in our kernel, unacknowledged:
+    // nothing is left for us to send, and still the venue is the one that stopped.
+    TEST_F(Core, BytesTheKernelHoldsUnacknowledgedAreTheVenues)
+    {
+        gw->set_body_min_rate(0); // the idle sweep alone, past any upload deadline
+        const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+        int small = 4096;
+        ::setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t len = sizeof a;
+        ASSERT_EQ(::bind(lfd, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+        ::getsockname(lfd, reinterpret_cast<sockaddr*>(&a), &len);
+        ::listen(lfd, 1);
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+        const int venue = ::accept(lfd, nullptr, nullptr); // and never read
+        const std::string junk(1 << 16, 'j');
+        while (::send(fd, junk.data(), junk.size(), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}
+        ASSERT_GT(llmbridge::net::unacked_bytes(fd), 0u);
+
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        u->connected = u->wire_ready = true;
+        u->out.sent(u->out.wire().size()); // ours is empty: all of it is in the kernel
+        ::close(u->fd);
+        u->fd = fd; // closed, with a reset, at teardown
+        io.next_send = Sent::Queued;
+        t.sweep(c, c->req.f.ts_progress + Gateway::kDefaultUpstreamIdleNs + 1);
+        EXPECT_EQ(c->out.bytes().rfind("HTTP/1.1 504 Gateway Timeout\r\n", 0), 0u) << c->out.bytes();
+        EXPECT_EQ(t.stats().upstream_timeouts, 1u);
+        EXPECT_EQ(t.stats().client_idle_timeouts, 0u);
+        ::close(venue);
+        ::close(lfd);
+    }
+
+    // The defaults, a 10 s grace and 1 KiB a second, against a body as large as one can be:
+    // uploaded at 2 KiB a second, slower than any real link, it is never cut. At 512 bytes a
+    // second it is cut once its time runs out, 20 s in. Driven by the sweep alone, the venue
+    // taking every byte as it comes.
+    TEST_F(Core, TheDefaultsNeverCutASteadySlowBody)
+    {
+        for (const uint64_t rate : {2048u, 512u})
+        {
+            ClientConn* c = t.client();
+            UpstreamConn* u = stream_part(t, c, 0);
+            ASSERT_NE(u, nullptr);
+            u->connected = u->wire_ready = true;
+            const int64_t t0 = c->req.f.ts_req_recvd;
+            int64_t cut_at = 0;
+            for (int64_t s = 1; s <= 16 * 1024 * 1024 / 2048 && !cut_at; ++s)
+            {
+                c->req.f.body_in = static_cast<uint32_t>(rate * static_cast<uint64_t>(s));
+                c->req.f.ts_progress = t0 + s * 1'000'000'000;
+                t.sweep(c, t0 + s * 1'000'000'000 + 1); // just after its bytes for second s
+                if (c->doomed || c->req.f.phase == Phase::Replying) cut_at = s;
+            }
+            if (rate == 2048) EXPECT_EQ(cut_at, 0) << "a steady 2 KiB a second was cut";
+            else EXPECT_EQ(cut_at, 20) << "512 bytes a second runs out of time at 20 s";
+        }
+        EXPECT_EQ(t.stats().streamed_body_timeouts, 1u);
+    }
+
+    // The bytes that come after the deadline passed are never forwarded, even when they
+    // are the body's last: the venue holds part of the body and a reset.
+    TEST_F(Core, BytesAfterTheDeadlineAreNeverForwarded)
+    {
+        gw->set_body_timeout_ns(1'000'000'000);
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 100);
+        ASSERT_NE(u, nullptr);
+        u->connected = u->wire_ready = true;
+        const size_t staged = u->out.bytes().size();
+        c->req.f.ts_req_recvd -= 2'000'000'000; // its head came 2 s ago
+        io.next_send = Sent::Queued;
+        c->rbuf.append(kBody.substr(100));
+        t.bytes(c);
+        EXPECT_EQ(u->out.bytes().size(), staged) << "the rest went up";
+        EXPECT_TRUE(u->doomed);
+        EXPECT_TRUE(u->reset_on_close);
+        EXPECT_EQ(c->out.bytes().rfind("HTTP/1.1 408 Request Timeout\r\n", 0), 0u) << c->out.bytes();
+        EXPECT_EQ(t.stats().streamed_body_timeouts, 1u);
+        EXPECT_EQ(t.bodies_streaming(), 0u);
+    }
+
+    // The part of the body already in at its head earns its time like any other.
+    TEST_F(Core, TheBodyInAtItsHeadEarnsItsTime)
+    {
+        ClientConn* c = t.client();
+        UpstreamConn* u = stream_part(t, c, 10 * 1024);
+        ASSERT_NE(u, nullptr);
+        u->connected = u->wire_ready = true;
+        const int64_t t0 = c->req.f.ts_req_recvd;
+        c->req.f.ts_progress = t0 + 15'000'000'000;
+        t.sweep(c, t0 + 15'000'000'000); // 10 s of grace and 10 s for its 10 KiB
+        EXPECT_EQ(t.stats().streamed_body_timeouts, 0u);
+        t.sweep(c, t0 + 20'000'000'001);
+        EXPECT_EQ(t.stats().streamed_body_timeouts, 1u);
     }
 } // namespace

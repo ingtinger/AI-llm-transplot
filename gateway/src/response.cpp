@@ -33,6 +33,7 @@ namespace llmbridge::detail
             {402, "billing_error", "payment required"},
             {403, "permission_error", "forbidden"},
             {404, "invalid_request_error", "not found"},
+            {408, "timeout_error", "request timed out"},
             {413, "invalid_request_error", "request too large"},
             {415, "invalid_request_error", "compressed request body is not supported"},
             {429, "rate_limit_error", "rate limit exceeded"},

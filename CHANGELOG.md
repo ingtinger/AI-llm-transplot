@@ -8,6 +8,130 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.94.0]. 2026-10-12
+
+### Security
+
+- **A slow upload no longer holds a provider connection for free.** Since 0.90.0 a
+  byte-forwarded body of 16 KiB or more is forwarded as it arrives, so while it arrives
+  it holds a connection to the venue (a TLS handshake when cold) and a second
+  descriptor. Every byte restarted the idle clock and there was no upload deadline, so
+  a client trickling its body (a slowloris) held both, per connection, with almost no
+  bandwidth; before 0.90.0 a slow upload held only the client socket. Now
+  (GATEWAY-INTERNALS.md 12b):
+  - **An upload deadline.** A streamed body gets `--body-grace` (10 s) and one second
+    more for every `--body-min-rate` bytes it has delivered (1024 a second, 8 kbit/s,
+    below a 2G data link), and with `--body-timeout` (off by default) a limit on the
+    whole upload from its head. A slow but steady upload keeps earning time, so no
+    client whose link is merely slow is cut, however large its body; a trickle runs out
+    of time. A pause spends that time only up to `--upstream-timeout` (120 s): a longer
+    one is cut as a client stall (below), whatever the body earned. A body that misses
+    the deadline gets `408 Request Timeout` with a fixed message and its connection
+    closes once the reply is out; the venue's connection is reset, never pooled, and
+    the bytes that came after the deadline, the body's last included, are never
+    forwarded, so the provider never holds the whole body. Counted in
+    `Stats::streamed_body_timeouts` and logged as `TIMEOUT streamed body too slow`.
+  - **A cap on streamed bodies.** A worker streams at most `--stream-body-max` bodies at
+    once (256). Past it a body is held to its last byte exactly as before 0.90.0, one
+    descriptor and no venue connection, counted in `Stats::streamed_body_capped`. It is
+    bounded as a held body is: on a connection's first request it must arrive within
+    the 30 s setup deadline, so while the slots are full a slower upload on a fresh
+    connection is closed with no reply.
+  - **`--stream-body off`** holds every body, for every client.
+
+### Fixed
+
+- **A client that stops sending mid-body is a client stall, not the venue's timeout.**
+  When neither leg moved for `--upstream-timeout`, a streamed body cut short by its
+  client was counted in `upstream_timeouts` and answered 504. A body the venue has all
+  of (nothing staged, nothing in flight, nothing the kernel holds unacknowledged) is
+  now the client's: `client_idle_timeouts`, a 408, the venue reset. Bytes the venue has
+  not taken are still the venue's: `upstream_timeouts` and a 504, the venue reset too.
+  The stall is answered directly, so it can neither fail over nor be retried.
+- **A venue that stops reading mid-body times out while the body still arrives.** Each
+  part a client sent restarted the idle clock, so a venue that stopped reading was
+  noticed only once the client finished, however long that took. Only a send that
+  moves bytes is progress now.
+- **A venue left with a body that will not be finished is reset on every path.** A
+  refusal already reset it; an error reply mid-body and a client leaving mid-body closed
+  it with a FIN. On io_uring a reset close sent a FIN ahead of its RST; it shuts only
+  the read side first now.
+- The rest of a body cut short by an early response, read only to be dropped, could be
+  trickled to hold the client connection until `--client-idle` (three days). It keeps
+  the body's deadline: past it the connection closes.
+- **A client gone before its `100 Continue` no longer has its request dispatched**
+  (since 0.90.0). On epoll, a client that sent `Expect: 100-continue` and reset before
+  the gateway wrote the interim line was closed by that failed write, and a body that
+  would stream was dispatched anyway: the venue was paired with a client freed at the
+  end of the event batch (a use-after-free once the venue's connection was written to
+  again), and the body took a `--stream-body-max` slot that was never given back.
+  `try_frame` now stops when the interim line closed the client. io_uring was not
+  affected: its send completes later, and the reset closes both legs.
+
+### Added
+
+- **`--stream-body on|off`** (config: `runtime.stream_body`, default on): off holds every
+  byte-forwarded body to its last byte. `--stream-openai-body` stays the narrower
+  switch, for an OpenAI client's body.
+- **`--stream-body-max N`** (config: `runtime.stream_body_max`, 0 to 1048576, default 256,
+  0 for no cap).
+- **`--body-grace SECONDS`** (config: `timeouts.body_grace_s`, default 10),
+  **`--body-min-rate BYTES`** (config: `timeouts.body_min_rate`, 0 to 2^30 bytes a second,
+  default 1024, 0 off) and **`--body-timeout SECONDS`** (config: `timeouts.body_s`,
+  default 0, off). The example config gives the reasoning for each default.
+- `Stats` gains two counters at its end, `streamed_body_capped` and
+  `streamed_body_timeouts`; existing fields keep their places. The exit profile and the
+  SIGUSR1 dump print the streamed-body counters when there are any.
+- `Gateway::set_stream_body`, `set_stream_body_max`, `set_body_timeout_ns`,
+  `set_body_grace_ns`, `set_body_min_rate`, and `kDefaultStreamBodyMax`,
+  `kDefaultBodyTimeoutNs`, `kDefaultBodyGraceNs`, `kDefaultBodyMinRate`.
+- `net::unacked_bytes()`: what a socket's kernel holds unacknowledged (`SIOCOUTQ`).
+
+### Changed
+
+- **Behaviour change:** a streamed body that averages less than 1 KiB a second once
+  its 10 s grace is spent is cut with a 408 by default; `--body-min-rate 0` turns that
+  off.
+- **Behaviour change:** past 256 bodies streaming at once on a worker, the next is held
+  to its last byte.
+- **Behaviour change:** a client stall mid-body is a 408 counted in
+  `client_idle_timeouts`, where it was a 504 counted in `upstream_timeouts`; a venue that
+  stops reading mid-body gets its 504 a full `--upstream-timeout` after it stopped,
+  where it waited for the client's last byte.
+- **Behaviour change:** a venue whose body will not be finished gets an RST and no FIN,
+  on both backends, whatever ended the body.
+- A 408 the gateway writes has the error type `timeout_error`.
+- A held body, and a body held by `--stream-body off` or by the cap, reports exactly
+  what it did: every stamp, header, histogram sample and sink field is unchanged. The
+  sink corpus records match 0.92.0's.
+
+### Tests
+
+- `ProxyBodyStream.*` on both backends: a trickling body cut at `--body-timeout` with a
+  408 typed `timeout_error`, its connection closed, the venue reset and never given the
+  whole body, and not pooled; a body that stops coming cut by the sweep; a body under
+  the minimum rate cut, and a steady slow one above it not; the rest of a cut-short
+  body on the same deadline, a steady rest earning its time and the connection carrying
+  its next request; past `--stream-body-max` a body held and still served, the slot
+  freed for the next; `--stream-body off` holding an OpenAI and an Anthropic client's
+  body with a held body's record; a client stopping mid-body on a pooled connection
+  inside the stale-retry window counted as a client stall, never retried; a venue that
+  stops reading timed out while the client still sends; a client leaving mid-body
+  resetting the venue. `GatewayTls.ATrickledBodyToATlsVenueIsCutAtItsDeadline`.
+- `Core.*` with the `FakeIo` and a clock the test sets: the defaults never cut 2 KiB a
+  second over a 16 MB body and cut 512 bytes a second at 20 s; the body in at the head
+  earns its time; bytes after the deadline never forwarded; every way a body ends frees
+  its slot, and a cap of 0 holds no body; a stall told from a venue that stopped
+  taking, and bytes the kernel holds unacknowledged counted as the venue's; only a send
+  is progress; a client whose `100 Continue` failed never dispatched.
+- `ProxyBodyStream.AClientGoneBeforeItsContinueIsNeverDispatched` on both backends: a
+  sink holds the loop while the client's head and its reset both arrive; without the
+  fix epoll leaks the slot and ASan reports the use-after-free.
+- Each check, each credit, each slot release and each reset fails its tests when
+  removed, on both backends wherever the test runs on both.
+- The new flags' parse, bounds and `--help` lines; the example config pins every default.
+
+
 ## [0.93.0]. 2026-10-12
 
 A request may carry one provider key per `x-kottos-key-<domain>` header, and the policy

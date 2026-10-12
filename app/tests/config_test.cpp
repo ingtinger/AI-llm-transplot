@@ -242,6 +242,11 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
     EXPECT_DOUBLE_EQ(c.duration_s, 0);
     EXPECT_DOUBLE_EQ(c.warmup_s, 0);
     EXPECT_DOUBLE_EQ(c.prefault_mb, 0);
+    EXPECT_EQ(c.stream_body, "on");
+    EXPECT_DOUBLE_EQ(c.body_s, static_cast<double>(llmbridge::Gateway::kDefaultBodyTimeoutNs) / 1e9);
+    EXPECT_DOUBLE_EQ(c.body_grace_s, static_cast<double>(llmbridge::Gateway::kDefaultBodyGraceNs) / 1e9);
+    EXPECT_EQ(c.body_min_rate, static_cast<int>(llmbridge::Gateway::kDefaultBodyMinRate));
+    EXPECT_EQ(c.stream_body_max, static_cast<int>(llmbridge::Gateway::kDefaultStreamBodyMax));
 
     // Every key in the option table must appear, set or as its `_` comment (cert and
     // key cannot be set while tls is false), or the example stops documenting one.

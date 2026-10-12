@@ -9,8 +9,10 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <linux/sockios.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -35,6 +37,13 @@ namespace llmbridge::net
     {
         const linger lg{1, 0};
         ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    }
+
+    size_t unacked_bytes(int fd) noexcept
+    {
+        int n = 0;
+        if (fd < 0 || ::ioctl(fd, SIOCOUTQ, &n) != 0 || n < 0) return 0;
+        return static_cast<size_t>(n);
     }
 
     void set_nosigpipe(int fd) noexcept

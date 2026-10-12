@@ -70,6 +70,7 @@ namespace llmbridge
         /// Reads paused, written only by a backend's set_read. GATEWAY-INTERNALS.md 6c.
         bool read_paused = false;
         bool recv_armed = false; ///< io_uring: a multishot recv is live on this fd
+        bool reset_on_close = false; ///< SO_LINGER 0 is set: its close is a reset, no FIN first
         /// What the socket reads: the ciphertext on TLS, else the plaintext. Only an
         /// io_uring send pins it. GATEWAY-INTERNALS.md 5b.
         OutBuf& wire() noexcept

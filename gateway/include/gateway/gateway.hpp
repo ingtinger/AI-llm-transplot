@@ -67,6 +67,13 @@ namespace llmbridge
         /// An established client gone quiet. A descriptor bound for an exposed
         /// listener, not a load-balancing device; 0 disables it.
         static constexpr int64_t kDefaultClientIdleNs = 3LL * 24 * 3600 * 1000 * 1000 * 1000;
+        /// Bodies a worker forwards as they arrive at once, each holding a venue connection.
+        static constexpr size_t kDefaultStreamBodyMax = 256;
+        /// A streamed body gets the grace, and a second more for each kDefaultBodyMinRate
+        /// bytes it delivers; a total limit is off. GATEWAY-INTERNALS.md 12 says why.
+        static constexpr int64_t kDefaultBodyTimeoutNs = 0;
+        static constexpr int64_t kDefaultBodyGraceNs = 10LL * 1000 * 1000 * 1000; // 10 s
+        static constexpr uint64_t kDefaultBodyMinRate = 1024; // bytes a second
 
         /// `policy` is non-owning and must outlive the Gateway; null means none.
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
@@ -110,6 +117,11 @@ namespace llmbridge
         void set_prefault_bytes(size_t n) noexcept;
         /// Forward an OpenAI client's body as it arrives, each chunk checked first (default on).
         void set_stream_openai_body(bool on) noexcept;
+        void set_stream_body(bool on) noexcept; // any client's; off holds every body (default on)
+        void set_stream_body_max(size_t n) noexcept; // past it a body is held; 0 = no cap
+        void set_body_timeout_ns(int64_t ns) noexcept; // a streamed body's whole upload; 0 = off
+        void set_body_grace_ns(int64_t ns) noexcept;   // before the minimum rate applies
+        void set_body_min_rate(uint64_t bytes_per_s) noexcept; // averaged past the grace; 0 = off
         /// Parse storage each worker keeps between bodies (default 4 MiB). Process-wide.
         void set_retain_bytes(size_t n) noexcept;
         /// Optional per-request sink (sink.hpp), non-owning. `capture` names up to

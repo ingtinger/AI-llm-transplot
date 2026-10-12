@@ -35,6 +35,7 @@
 #include <mutex>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -324,6 +325,8 @@ namespace
         /// Request bytes read over all connections, so far.
         size_t bytes_seen() const { return _bytes_seen.load(); }
         int accepted() const { return _accepted.load(); }
+        /// Connections the gateway ended with a reset (SO_LINGER 0) rather than a FIN.
+        int resets() const { return _resets.load(); }
         /// On the first connection, after its first reply, read what arrives of the next
         /// request once, then close: a pooled connection the provider dropped mid-body.
         void set_drop_first_mid_second(bool b) { _drop_mid_second = b; }
@@ -447,6 +450,7 @@ namespace
                     ssize_t n = ::read(c, tmp, _pace_bytes ? std::min(_pace_bytes, sizeof(tmp)) : sizeof(tmp));
                     if (n <= 0)
                     {
+                        if (n < 0 && errno == ECONNRESET) ++_resets;
                         if (!buf.empty())
                         {
                             std::lock_guard<std::mutex> lk(_mu);
@@ -591,6 +595,7 @@ namespace
         int _rcvbuf = 0;
         std::atomic<int> _requests_seen{0};
         std::atomic<size_t> _bytes_seen{0};
+        std::atomic<int> _resets{0};
         bool _drop_mid_second = false;
         std::vector<std::string> _incomplete;
         std::string _last_request;
@@ -816,6 +821,12 @@ namespace
             return ::read(_fd, tmp, sizeof(tmp)) == 0;
         }
         void shutdown_both() { ::shutdown(_fd, SHUT_RDWR); } // another thread may use the fd
+        void reset() // an RST, no FIN
+        {
+            linger lg{1, 0};
+            ::setsockopt(_fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+            close();
+        }
         void close() { if (_fd >= 0) { ::close(_fd); _fd = -1; } }
         ~Client() { close(); }
 
@@ -867,6 +878,9 @@ namespace
             if (!_stream_openai_body) _gw->set_stream_openai_body(false);
             if (_epoll_write_cap) _gw->set_epoll_write_cap_for_test(_epoll_write_cap);
             if (_upstream_sndbuf) _gw->set_upstream_sndbuf_for_test(_upstream_sndbuf);
+            if (_stream_body_max >= 0) _gw->set_stream_body_max(static_cast<size_t>(_stream_body_max));
+            if (_body_timeout_ns >= 0) _gw->set_body_timeout_ns(_body_timeout_ns);
+            if (_body_grace_ns >= 0) _gw->set_body_grace_ns(_body_grace_ns);
             _proxy_port = _gw->bound_port();
             // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
@@ -905,6 +919,9 @@ namespace
         bool _stream_openai_body = true; // set before start()
         size_t _epoll_write_cap = 0;     // set before start(); 0 writes all it can
         int _upstream_sndbuf = 0;        // set before start(); pins SO_SNDBUF upstream
+        int64_t _stream_body_max = -1;   // set before start(); -1 keeps the default
+        int64_t _body_timeout_ns = -1;   // set before start(); -1 keeps the default
+        int64_t _body_grace_ns = -1;     // set before start(); -1 keeps the default
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
@@ -11889,6 +11906,39 @@ namespace
         }
         return p();
     }
+
+    /// Holds the loop inside its first record until released, at most 10 s: whatever a
+    /// client sends meanwhile is in the kernel before the gateway reads any of it.
+    class HoldingSink final : public llmbridge::RequestSink
+    {
+      public:
+        void on_request(const llmbridge::RequestRecord&) noexcept override
+        {
+            std::unique_lock<std::mutex> lk(_mu);
+            if (_held++) return;
+            _cv.notify_all();
+            _cv.wait_for(lk, std::chrono::seconds(10), [this] { return _released; });
+        }
+        bool wait_held()
+        {
+            std::unique_lock<std::mutex> lk(_mu);
+            return _cv.wait_for(lk, std::chrono::seconds(10), [this] { return _held > 0; });
+        }
+        void release()
+        {
+            {
+                std::lock_guard<std::mutex> lk(_mu);
+                _released = true;
+            }
+            _cv.notify_all();
+        }
+
+      private:
+        std::mutex _mu;
+        std::condition_variable _cv;
+        int _held = 0;
+        bool _released = false;
+    };
 } // namespace
 
 class ProxyBodyStream : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
@@ -12498,6 +12548,388 @@ TEST_P(ProxyBodyStream, OnAndOffReadTheSameFirstToken)
         EXPECT_EQ(first_token[on], static_cast<uint64_t>(r.ts_first_token - r.ts_body_end)) << "on=" << on;
         EXPECT_LT(first_token[on], static_cast<uint64_t>(kUploadNs / 4)) << "on=" << on << ": the upload";
     }
+}
+
+// --stream-body off holds every client's body to its last byte, an Anthropic client's as
+// well as an OpenAI one's, and its record is a held body's: every field what the same
+// request gets sent whole, and the body fields t0, t3, 0 and false.
+TEST_P(ProxyBodyStream, StreamBodyOffHoldsEveryBodyWithAHeldBodysRecord)
+{
+    for (const bool anthropic : {false, true})
+    {
+        RecordingSink::Copy rec[2]; // sent whole, then in two parts
+        for (const bool parts : {false, true})
+        {
+            TestBackend backend;
+            backend.set_response(http_ok("{}"));
+            backend.start();
+            RecordingSink sink;
+            Gateway gw(0, "127.0.0.1", backend.port(), 0,
+                       anthropic ? UpstreamDialect::Anthropic : UpstreamDialect::OpenAI, GetParam());
+            gw.set_stream_body(false);
+            gw.set_request_sink(&sink, {});
+            std::thread loop([&] { gw.run(); });
+            std::string req = big_request(64, /*json=*/true);
+            if (anthropic) req.replace(0, req.find("\r\n"), "POST /v1/messages HTTP/1.1");
+            Client c;
+            bool sent = c.connect(gw.bound_port());
+            size_t early = 0;
+            if (sent && parts)
+            {
+                sent = c.send(req.substr(0, req.size() / 2));
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                early = backend.bytes_seen();
+                sent = sent && c.send(req.substr(req.size() / 2));
+            }
+            else if (sent) sent = c.send(req);
+            const int status = sent ? c.recv_status() : 0;
+            c.close();
+            gw.request_stop();
+            loop.join();
+            backend.stop();
+            ASSERT_EQ(status, 200) << "anthropic=" << anthropic << " parts=" << parts;
+            EXPECT_EQ(early, 0u) << "a byte left before the last, anthropic=" << anthropic;
+            EXPECT_EQ(gw.stats().streamed_bodies, 0u);
+            const auto recs = sink.records();
+            ASSERT_EQ(recs.size(), 1u);
+            rec[parts] = recs[0];
+        }
+        const llmbridge::RequestRecord& whole = rec[0].r;
+        const llmbridge::RequestRecord& off = rec[1].r;
+        EXPECT_FALSE(off.body_streamed);
+        EXPECT_EQ(off.ts_body_end, off.ts_req_recvd);
+        EXPECT_EQ(off.ts_body_sent, off.ts_up_sent);
+        EXPECT_EQ(off.body_work_ns, 0);
+        EXPECT_GE(off.client_upload_ns, 100'000'000) << "the upload is the client's";
+        EXPECT_GE(off.client_conn_setup_ns, off.client_upload_ns);
+        EXPECT_EQ(rec[1].model, rec[0].model);
+        EXPECT_EQ(off.status, whole.status);
+        EXPECT_EQ(off.request_bytes, whole.request_bytes);
+        EXPECT_EQ(off.upstream_index, whole.upstream_index);
+        EXPECT_EQ(off.attempts, whole.attempts);
+        EXPECT_EQ(off.client_conn_reused, whole.client_conn_reused);
+        EXPECT_EQ(off.from_pool, whole.from_pool);
+        EXPECT_EQ(off.streamed, whole.streamed);
+        EXPECT_EQ(off.translated, whole.translated);
+        EXPECT_EQ(off.error_reply, whole.error_reply);
+        EXPECT_EQ(off.tokens_in, whole.tokens_in);
+        EXPECT_EQ(off.backend, whole.backend);
+        EXPECT_EQ(whole.ts_body_end, whole.ts_req_recvd);
+        EXPECT_EQ(whole.ts_body_sent, whole.ts_up_sent);
+    }
+}
+
+// Each streamed body holds a venue connection to its last byte, so a worker streams at
+// most --stream-body-max at once. Past it a body is held as before bodies streamed, the
+// venue seeing none of it until its last byte, and is still served; a slot frees when
+// its body ends.
+TEST_P(ProxyBodyStream, PastTheCapABodyIsHeldAndStillServed)
+{
+    _backend.set_response(http_ok("{}"));
+    _stream_body_max = 1;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client a, b, d;
+    ASSERT_TRUE(a.connect(_proxy_port));
+    ASSERT_TRUE(a.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; })) << "the first did not stream";
+    ASSERT_TRUE(b.connect(_proxy_port));
+    ASSERT_TRUE(b.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(_backend.accepted(), 1) << "the second went upstream past the cap";
+    ASSERT_TRUE(b.send(h.rest));
+    EXPECT_EQ(b.recv_status(), 200) << "a held body is still served";
+    ASSERT_TRUE(a.send(h.rest));
+    EXPECT_EQ(a.recv_status(), 200);
+    const size_t seen = _backend.bytes_seen();
+    ASSERT_TRUE(d.connect(_proxy_port));
+    ASSERT_TRUE(d.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > seen + 16 * 1024; })) << "the slot was not freed";
+    ASSERT_TRUE(d.send(h.rest));
+    EXPECT_EQ(d.recv_status(), 200);
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_bodies, 2u);
+    EXPECT_EQ(_gw->stats().streamed_body_capped, 1u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// The 100 Continue for a body that would stream found its client reset. On epoll the
+// write fails and closes the client there, and the request went on regardless: it was
+// dispatched, pairing a venue with a client freed at the end of the batch, and took a
+// slot never given back. io_uring learns of the reset from a later completion, after the
+// dispatch, and that close ends both legs. Either way the next body streams. On epoll a
+// write goes 64 bytes a pass, so a venue paired with the freed client is written again
+// after the free, which ASan reports.
+TEST_P(ProxyBodyStream, AClientGoneBeforeItsContinueIsNeverDispatched)
+{
+    _backend.set_response(http_ok("{}"));
+    _stream_body_max = 1;
+    _epoll_write_cap = 64;
+    HoldingSink sink;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const bool uring = GetParam() == llmbridge::IoBackend::Uring;
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    const std::string head =
+        h.first.substr(0, h.first.find("\r\n\r\n") + 2) + "Expect: 100-continue\r\n\r\n";
+    Client gone, first, next;
+    EXPECT_TRUE(gone.connect(_proxy_port) && gone.send(head.substr(0, 20))); // read before the hold
+    EXPECT_TRUE(first.connect(_proxy_port) && first.send(make_request()));
+    EXPECT_EQ(first.recv_status(), 200);
+    // The loop is inside the first record: the rest of the head and the reset both land.
+    EXPECT_TRUE(sink.wait_held());
+    EXPECT_TRUE(gone.send(head.substr(20)));
+    gone.reset();
+    sink.release();
+    if (uring)
+    {
+        EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; })) << "the venue was kept";
+    }
+    const size_t seen = _backend.bytes_seen();
+    EXPECT_TRUE(next.connect(_proxy_port) && next.send(h.first));
+    EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > seen + 16 * 1024; })) << "the slot was not freed";
+    EXPECT_TRUE(next.send(h.rest));
+    EXPECT_EQ(next.recv_status(), 200);
+    shutdown();
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.streamed_body_capped, 0u);
+    EXPECT_EQ(st.streamed_bodies, uring ? 2u : 1u);
+    EXPECT_EQ(_backend.requests_seen(), 2) << "the gone client's body was never whole";
+    if (uring) return;
+    EXPECT_EQ(_backend.resets(), 0) << "a venue was given the request";
+    EXPECT_TRUE(_backend.incomplete_requests().empty()) << "a venue was given the request";
+}
+
+// A client that stopped part way through its body was charged to the venue: neither leg
+// moved, so the idle sweep counted an upstream timeout and answered 504. The venue had all
+// that came, so it is a client stall: a 408, and the venue is reset with part of the body.
+// It rode a pooled connection inside the stale-retry window, and is never resent.
+TEST_P(ProxyBodyStream, AClientThatStopsMidBodyIsAClientStall)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), 300'000'000);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(c.recv_status(), 200); // the venue's connection is pooled now
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    ASSERT_TRUE(c.send(h.first));
+    const std::string r = c.recv_response(3000);
+    EXPECT_EQ(Client::status_of(r), 408) << r;
+    EXPECT_NE(r.find("did not arrive in time"), std::string::npos) << r;
+    EXPECT_TRUE(c.wait_closed());
+    EXPECT_TRUE(wait_for([&] { return _backend.incomplete_requests().size() == 1; })) << "the venue was kept";
+    shutdown();
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.client_idle_timeouts, 1u);
+    EXPECT_EQ(st.upstream_timeouts, 0u);
+    EXPECT_EQ(st.upstream_retries, 0u);
+    EXPECT_EQ(st.upstream_failovers, 0u);
+    EXPECT_EQ(st.upstream_reused, 1u) << "the stalled body rode the pooled connection";
+    EXPECT_EQ(st.upstream_conns_opened, 1u) << "it was resent on a fresh one";
+    EXPECT_EQ(_backend.requests_seen(), 1) << "the venue got the stalled body whole";
+    EXPECT_EQ(_backend.resets(), 1) << "the venue was not reset";
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_LT(cut[0].size() - (cut[0].find("\r\n\r\n") + 4), h.body());
+}
+
+// A client that leaves mid-body leaves the venue a body that will never be finished: it is
+// reset, as for every such body, rather than sent a FIN.
+TEST_P(ProxyBodyStream, AClientThatLeavesMidBodyResetsTheVenue)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    c.close();
+    EXPECT_TRUE(wait_for([&] { return _backend.incomplete_requests().size() == 1; })) << "the venue was kept";
+    shutdown();
+    EXPECT_EQ(_backend.resets(), 1);
+    EXPECT_EQ(_backend.requests_seen(), 0);
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 1u);
+}
+
+// A venue that stopped reading while the client kept sending: every part the client sent
+// restarted the idle clock, so the timeout waited for the client to finish. Staged is not
+// sent: the venue's timeout fires while the body is still arriving, as the venue's.
+TEST_P(ProxyBodyStream, AVenueThatStopsReadingMidBodyIsTheVenuesTimeout)
+{
+    static std::atomic<bool> never; // the venue reads nothing for the test's length
+    never = false;
+    _backend.set_response(http_ok("{}"));
+    _backend.set_small_rcvbuf(4096);
+    _backend.hold_reads(&never, 4096, 0);
+    _upstream_sndbuf = 4096;
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), 400'000'000);
+    const Halves h = openai_halves(R"(,"pad":")" + std::string(1 << 20, 'q') + R"("})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    const int64_t t0 = llmbridge::now_ns();
+    std::string r;
+    for (size_t off = 0; r.empty() && off < h.rest.size() && llmbridge::now_ns() - t0 < 4'000'000'000; off += 4096)
+    {
+        ASSERT_TRUE(c.send(h.rest.substr(off, 4096)));
+        r = c.recv_response(50);
+    }
+    const int64_t took = llmbridge::now_ns() - t0;
+    EXPECT_EQ(Client::status_of(r), 504) << r;
+    EXPECT_LT(took, 2'000'000'000) << "the client's parts kept the venue's timeout away";
+    shutdown();
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.upstream_timeouts, 1u);
+    EXPECT_EQ(st.client_idle_timeouts, 0u);
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+namespace
+{
+    /// `r` a part every `gap_ms` until a reply comes or `ms` pass; the reply, or "".
+    std::string trickle(Client& c, const std::string& r, size_t part, int gap_ms, int ms = 3000)
+    {
+        const int64_t until = llmbridge::now_ns() + int64_t{ms} * 1'000'000;
+        std::string reply;
+        for (size_t off = 0; reply.empty() && off < r.size() && llmbridge::now_ns() < until; off += part)
+        {
+            if (!c.send(r.substr(off, part))) break;
+            reply = c.recv_response(gap_ms);
+        }
+        return reply.empty() ? c.recv_response(gap_ms) : reply;
+    }
+} // namespace
+
+// A client trickling its body held a venue connection for as long as it kept a byte
+// coming. Past --body-timeout it is cut: the client gets a 408 and its connection closes,
+// the venue a reset, with part of the body and never all of it.
+TEST_P(ProxyBodyStream, ATricklingBodyIsCutAtItsDeadline)
+{
+    _backend.set_response(http_ok("{}"));
+    _body_timeout_ns = 400'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const int64_t t0 = llmbridge::now_ns();
+    ASSERT_TRUE(c.send(h.first));
+    const std::string r = trickle(c, h.rest, 1, 50);
+    const int64_t took = llmbridge::now_ns() - t0;
+    EXPECT_EQ(Client::status_of(r), 408) << r;
+    const ErrorBody e = error_body(r);
+    EXPECT_TRUE(e.parsed) << r;
+    EXPECT_EQ(e.message, "request body did not arrive in time");
+    EXPECT_EQ(e.type, "timeout_error");
+    EXPECT_GE(took, 400'000'000);
+    EXPECT_TRUE(c.wait_closed());
+    EXPECT_TRUE(wait_for([&] { return _backend.incomplete_requests().size() == 1; })) << "the venue was kept";
+    shutdown();
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.streamed_body_timeouts, 1u);
+    EXPECT_EQ(st.client_idle_timeouts, 0u);
+    EXPECT_EQ(st.upstream_timeouts, 0u);
+    EXPECT_EQ(_gw->pooled_upstream_count(), 0u);
+    EXPECT_EQ(_backend.requests_seen(), 0) << "the venue got the whole body";
+    EXPECT_EQ(_backend.resets(), 1) << "the venue was not reset";
+}
+
+// Under the minimum rate: the default 1 KiB a second, past a grace cut to 200 ms. A body
+// at 320 bytes a second is cut once the time its bytes earned runs out.
+TEST_P(ProxyBodyStream, ABodyUnderTheMinimumRateIsCut)
+{
+    _backend.set_response(http_ok("{}"));
+    _body_grace_ns = 200'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    const size_t head = h.first.find("\r\n\r\n") + 4;
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first.substr(0, head))); // the head alone: no byte of credit yet
+    const std::string r = trickle(c, h.first.substr(head) + h.rest, 16, 50);
+    EXPECT_EQ(Client::status_of(r), 408) << r;
+    EXPECT_TRUE(c.wait_closed());
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 1u);
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+// The same rate and grace never cut a client that is slow but steady: 5 KiB a second is
+// far below a real link and well above the floor, and it earns more time than it spends.
+// It starts with a KiB, a second's credit, so no scheduler stall at its start cuts it.
+TEST_P(ProxyBodyStream, ASteadySlowBodyAboveTheMinimumRateIsNotCut)
+{
+    _backend.set_response(http_ok("{}"));
+    _body_grace_ns = 200'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})", 16 * 1024);
+    const size_t head = h.first.find("\r\n\r\n") + 4;
+    const std::string body = h.first.substr(head) + h.rest;
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first.substr(0, head) + body.substr(0, 1024)));
+    const size_t steady = 1024 + 256 * 30; // then 1.5 s of it
+    EXPECT_EQ(trickle(c, body.substr(1024, steady - 1024), 256, 50, 10'000), "") << "cut while steady";
+    ASSERT_TRUE(c.send(body.substr(steady)));
+    EXPECT_EQ(c.recv_status(), 200);
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 0u);
+    EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
+}
+
+// A venue that answers before the body is in leaves its rest to be read and dropped, and a
+// client trickling that rest held its connection open with no limit at all. The deadline
+// runs on as the rest comes: a steady one earns its time and the connection carries the
+// next request; a trickle runs out of it and the connection closes.
+TEST_P(ProxyBodyStream, TheRestOfACutShortBodyKeepsItsDeadline)
+{
+    _backend.set_reply_before_read(true);
+    _body_grace_ns = 500'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})", 16 * 1024);
+    const size_t head = h.first.find("\r\n\r\n") + 4;
+    const std::string rest = h.first.substr(head) + h.rest;
+    // 320 bytes a second, then 20 KiB; in that order, as this venue answers a connection
+    // once and the steady one's next request would leave one pooled.
+    for (const size_t part : {size_t{16}, size_t{1024}})
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(h.first.substr(0, head)));
+        ASSERT_EQ(c.recv_status(), 200);
+        bool closed = false;
+        for (size_t off = 0; !closed && off < rest.size() && off < 60 * part; off += part)
+            closed = !c.send(rest.substr(off, part)) || c.wait_closed(50);
+        if (part == 16)
+        {
+            EXPECT_TRUE(closed) << "the trickled rest kept the connection open";
+            continue;
+        }
+        EXPECT_FALSE(closed) << "the steady rest was cut";
+        ASSERT_TRUE(c.send(make_request()));
+        EXPECT_EQ(c.recv_status(), 200) << "the next request on the connection";
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 1u);
+}
+
+// With nothing more arriving, the sweep cuts the body at its deadline, long before the
+// venue's idle timeout would.
+TEST_P(ProxyBodyStream, ABodyThatStopsComingIsCutAtItsDeadline)
+{
+    _backend.set_response(http_ok("{}"));
+    _body_timeout_ns = 300'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    EXPECT_EQ(c.recv_status(2000), 408);
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_body_timeouts, 1u);
+    EXPECT_EQ(_gw->stats().client_idle_timeouts, 0u);
+    EXPECT_EQ(_backend.requests_seen(), 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyBodyStream,

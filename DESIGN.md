@@ -174,6 +174,15 @@ accept ─▶ frame request (http::parse) ─▶ [optional] translate to upstrea
 Upstream connections are pooled and reused across requests. The client and upstream
 sides are symmetric small state machines.
 
+A byte-forwarded body of 16 KiB or more that is still arriving when its head is framed
+goes to the venue as it arrives (`--stream-body`, on by default), so the venue does not
+wait out the client's upload. It holds a venue connection until its last byte, so it is
+bounded three ways: at most `--stream-body-max` at once per worker, past which a body is
+held as before; an upload deadline earned at `--body-min-rate` past `--body-grace`, with
+`--body-timeout` on top if set, past which the client gets a 408 and the venue a reset;
+and an idle rule that tells a client that stopped sending from a venue that stopped
+reading. GATEWAY-INTERNALS.md 12.
+
 ## Memory model, honest version
 
 - **Zero-copy where it counts.** The JSON DOM holds `string_view`s into the input

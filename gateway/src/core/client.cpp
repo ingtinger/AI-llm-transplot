@@ -113,6 +113,7 @@ namespace llmbridge::detail
                 c->rbuf.reserve(m.total_len);
                 // No body byte yet: the client is waiting on us, not the network.
                 if (c->rbuf.size() <= m.header_len && facts.expect == 2) send_continue(c);
+                if (c->doomed) return; // the 100 found the client gone
                 // A body that needs no rewrite goes upstream as it arrives.
                 if (body_streams(c, m))
                 {
@@ -130,6 +131,8 @@ namespace llmbridge::detail
                         c->req.scan->reset();
                     }
                     ++_stats.streamed_bodies;
+                    ++_bodies_streaming;
+                    c->req.f.body_in = static_cast<uint32_t>(body_so_far(c).size());
                     return dispatch(c);
                 }
             }
@@ -354,6 +357,8 @@ namespace llmbridge::detail
 
     ConnBase* Engine::forget(ClientConn* c) noexcept
     {
+        if (c->req.f.body_streaming && c->up) reset_venue(c->up);
+        stop_body(c);
         UpstreamConn* u = unpair(c); // the other leg never keeps a pointer to a freed one
         _clients->remove(c);
         LB_DEBUG("close ", *c, " clients=", _clients->size());
@@ -407,7 +412,8 @@ namespace llmbridge::detail
             return;
         }
         // We're replying to the client ourselves, so drop any in-flight upstream.
-        if (UpstreamConn* u = unpair(client)) _ops->close(*u);
+        if (client->req.f.body_streaming) cut_body(client);
+        else if (UpstreamConn* u = unpair(client)) _ops->close(*u);
         append_error(client->out.stage(), code, detail);
         client->req.f.phase = Phase::Replying;
         client->close_after_resp = true; // closes once the reply flushes

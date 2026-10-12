@@ -233,9 +233,10 @@ namespace llmbridge::detail
         if (c.doomed) return;
         ConnBase* other = _e.forget(c);
         // Every op on the fd completes, so the inflight count drains; the fd closes at the free.
+        // A reset sends no FIN ahead of its RST.
         if (c.fd >= 0)
         {
-            ::shutdown(c.fd, SHUT_RDWR);
+            ::shutdown(c.fd, c.reset_on_close ? SHUT_RD : SHUT_RDWR);
             submit_cancel(c.fd);
         }
         if (other) close(*other); // an upstream mid-response is of no use to anyone else
@@ -522,10 +523,7 @@ namespace llmbridge::detail
     // Before the rest is resubmitted, so `out` says whether everything staged is in.
     void UringIo::progressed(UpstreamConn* u) noexcept
     {
-        if (!u->client) return;
-        const int64_t now = now_ns();
-        u->client->req.f.ts_progress = now;
-        _e.note_sent(u, now); // t3, or a body's last byte
+        if (u->client) _e.note_sent(u, now_ns()); // the idle clock, t3, or a body's last byte
     }
 
     void UringIo::drained(ClientConn* c) noexcept

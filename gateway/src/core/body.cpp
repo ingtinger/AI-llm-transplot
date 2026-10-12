@@ -21,17 +21,70 @@
 namespace llmbridge::detail
 {
 
-    bool Engine::body_streams(const ClientConn* c, const net::http::Message& m) const noexcept
+    bool Engine::body_streams(const ClientConn* c, const net::http::Message& m) noexcept
     {
         // A policy reads the body before it routes, so its requests wait for all of it.
-        if (_policy || m.body_len < _stream_body_min || m.encoded || c->rbuf.size() >= m.total_len)
+        if (!_stream_body || _policy || m.body_len < _stream_body_min || m.encoded ||
+            c->rbuf.size() >= m.total_len)
             return false;
         if (!net::http::request_line_ok(c->rbuf)) return false; // the framing path refuses it
         const Dialect client = client_dialect_of(std::string_view(c->rbuf.data(), m.header_len));
         if (client == Dialect::OpenAI && !_stream_openai_body) return false;
         // A byte-forward only: a translation reads the whole body.
         const TranslationPlan plan = resolve_translation(client, _upstreams[0].dialect, false);
-        return plan.ok && !plan.translate;
+        if (!plan.ok || plan.translate) return false;
+        // Each holds a venue connection to its last byte; past the cap one waits, as before.
+        if (_stream_body_max == 0 || _bodies_streaming < _stream_body_max) return true;
+        ++_stats.streamed_body_capped;
+        return false;
+    }
+
+    void Engine::stop_body(ClientConn* c) noexcept
+    {
+        if (!c->req.f.body_streaming) return;
+        c->req.f.body_streaming = false;
+        --_bodies_streaming;
+    }
+
+    // The venue holds a body short of its Content-Length, which it never runs.
+    void Engine::reset_venue(UpstreamConn* u) noexcept
+    {
+        u->peer_eof = true;
+        if (u->fd < 0) return;
+        u->reset_on_close = true;
+        net::set_reset_on_close(u->fd);
+    }
+
+    void Engine::cut_body(ClientConn* c) noexcept
+    {
+        stop_body(c);
+        if (UpstreamConn* u = unpair(c))
+        {
+            reset_venue(u);
+            _ops->close(*u);
+        }
+    }
+
+    // --body-timeout from its head, or --body-grace plus a second for every --body-min-rate
+    // bytes in, whichever is sooner: a slow but steady upload keeps earning time.
+    int64_t Engine::body_deadline(const ReqState& f) const noexcept
+    {
+        int64_t at = _body_timeout_ns > 0 ? f.ts_req_recvd + _body_timeout_ns : INT64_MAX;
+        if (_body_min_rate > 0)
+            at = std::min(at, f.ts_req_recvd + _body_grace_ns +
+                                  static_cast<int64_t>(f.body_in * 1'000'000'000ULL / _body_min_rate));
+        return at;
+    }
+
+    // The reply cuts the body (error_respond) and closes the connection, so the rest of
+    // the body is never waited for.
+    void Engine::body_timeout(ClientConn* c, uint64_t& counter, const char* why) noexcept
+    {
+        ++counter;
+        LB_WARN(ReqId{c->req.f.req_seq}, " TIMEOUT ", why, " ", *c, " body_in=",
+                static_cast<uint64_t>(body_so_far(c).size()), " of ", static_cast<uint64_t>(c->msg.body_len),
+                " after_ns=", now_ns() - c->req.f.ts_req_recvd);
+        error_respond(c, 408, why, kSlowBodyMessage);
     }
 
     std::string_view Engine::body_so_far(const ClientConn* c) const noexcept
@@ -48,8 +101,12 @@ namespace llmbridge::detail
     void Engine::pump_body(ClientConn* c) noexcept
     {
         const int64_t t = now_ns();
+        // Late before these bytes came: they never go, so the venue never has the body whole.
+        if (t > body_deadline(c->req.f))
+            return body_timeout(c, _stats.streamed_body_timeouts, "streamed body too slow");
         const bool after_t3 = c->req.f.ts_up_sent != 0;
         const std::string_view body = body_so_far(c);
+        c->req.f.body_in = static_cast<uint32_t>(body.size());
         const bool last = body.size() == c->msg.body_len;
         size_t safe = body.size();
         if (c->req.f.body_scanned)
@@ -59,7 +116,7 @@ namespace llmbridge::detail
         }
         if (last)
         {
-            c->req.f.body_streaming = false;
+            stop_body(c);
             c->req.f.ts_body_end = t;
             c->req.f.client_upload_ns = span_since(c->ts_first_byte, t);
             // Setup holds the upload, as a held body's does, so subtracting it still works.
@@ -72,8 +129,7 @@ namespace llmbridge::detail
         {
             u->out.stage().append(body.substr(c->req.f.body_sent, safe - c->req.f.body_sent));
             c->req.f.body_sent = static_cast<uint32_t>(safe);
-            c->req.f.ts_progress = t;
-            // Unconnected, the connect's completion sends it.
+            // Unconnected, the connect's completion sends it; staged is not progress, sent is.
             if (u->connected && !send_upstream(u)) return;
         }
         if (after_t3) c->req.f.body_work_ns += now_ns() - t;
@@ -87,13 +143,7 @@ namespace llmbridge::detail
         const char* why = c->req.scan->why();
         LB_WARN(ReqId{c->req.f.req_seq}, " streamed body refused (", why, ") after ",
                 static_cast<uint64_t>(c->req.f.body_sent), " bytes went upstream; resetting it");
-        c->req.f.body_streaming = false;
-        if (UpstreamConn* u = unpair(c))
-        {
-            u->peer_eof = true; // never pooled
-            if (u->fd >= 0) net::set_reset_on_close(u->fd);
-            _ops->close(*u);
-        }
+        cut_body(c);
         end_body_stream(c, nullptr);
         const bool keys = std::string_view(why).find("key") != std::string_view::npos;
         error_respond(c, 400, why, keys ? kAmbiguousKeysMessage : kNotJsonMessage);
@@ -106,7 +156,7 @@ namespace llmbridge::detail
         if (c->req.f.body_streaming && u)
         {
             // The response beat the request out: cut short, the connection is never pooled.
-            c->req.f.body_streaming = false;
+            stop_body(c);
             u->peer_eof = true;
             ++_stats.upstream_unsent;
             LB_WARN("response before the whole body went; the upstream will not be pooled ", *u);
@@ -122,6 +172,7 @@ namespace llmbridge::detail
         const size_t n = static_cast<size_t>(std::min<uint64_t>(c->req.discard, c->rbuf.size()));
         c->rbuf.erase(0, n);
         c->req.discard -= n;
+        c->req.f.body_in += static_cast<uint32_t>(n); // its deadline still runs (sweep_client)
         if (c->req.discard) return;
         c->ts_first_byte = c->rbuf.empty() ? 0 : now_ns(); // the next request's arrival
         if (!c->req.close_on_drain) return;

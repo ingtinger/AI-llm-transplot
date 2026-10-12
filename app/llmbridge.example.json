@@ -41,6 +41,16 @@
     "_connect_s": "How long a fresh upstream connect may take, TCP and TLS handshake together, before the request fails over or gets a 502. The kernel keeps retrying a SYN for about two minutes, and a provider that retires an address (AWS rotates its front ends on a short TTL) answers nothing at all, so without this a request to it waited that long. On a timeout the venue moves to its next resolved address and its name is resolved again. 0 disables.",
     "connect_s": 5,
 
+    "_body_streamed": "The three below bound a body forwarded as it arrives (runtime.stream_body), which holds a connection to the venue, and a second descriptor, until its last byte. A body that misses them is cut: the client gets 408 and its connection closes, the venue's connection is reset, so it holds part of a body short of its Content-Length and never runs it. A held body is not affected.",
+    "_body_min_rate": "The least average upload, in bytes a second, once the grace is over: a body gets body_grace_s, and one second more for every body_min_rate bytes it delivers. 1024 (8 kbit/s, below even a 2G data link) never cuts a client whose link is merely slow, however large its body. A pause is covered by the time its earlier bytes earned, up to timeouts.upstream_s: a body that sends nothing for longer is cut as a client stall, whatever it earned. A client trickling a byte now and then is cut once its grace runs out. 0 disables.",
+    "body_min_rate": 1024,
+
+    "_body_grace_s": "How long a streamed body may take before the minimum rate applies, covering a connection's slow start and a client that sends its head first.",
+    "body_grace_s": 10,
+
+    "_body_s": "A limit on a streamed body's whole upload, from its head to its last byte. Off by default: any such limit cuts a client on a slow link once its body is large enough, and the minimum rate already makes a slow upload pay for its time. Set it where every client is known to be fast. 0 disables.",
+    "body_s": 0,
+
     "_pool_idle_s": "How long a pooled upstream connection may sit unused before it is closed. Every worker keeps its OWN pool, so offered traffic divides across them, each pool crosses this line more often, and every crossing costs the next request a full reconnect and TLS handshake. Raise it when running several workers, or once routing spreads traffic across several upstreams. 0 disables reaping.",
     "pool_idle_s": 30
   },
@@ -64,7 +74,13 @@
     "_retain_mb": "Megabytes of JSON parse storage (the node arena and the parser's stacks, each) a worker keeps between translated bodies, 0 to 16. Past it a large body's storage is freed after the request, so the next one allocates afresh. Raise it to 16 when bodies of several megabytes are common: it costs up to twice this much resident memory per worker.",
     "retain_mb": 4,
 
-    "_stream_openai_body": "\"on\" (default) forwards an OpenAI client's byte-forwarded body to the venue as it arrives, each chunk checked first: a repeated or escaped top-level key, or a byte that is not JSON, stops it, resets the upstream and answers 400. \"off\" holds it until its last byte. Other clients' byte-forwarded bodies are always forwarded as they arrive; a translated body, a body under 16 KiB, and every body while a policy is installed are held.",
+    "_stream_body": "\"on\" (default) forwards a byte-forwarded body of 16 KiB or more to the venue as it arrives, so the venue does not wait for the whole upload. \"off\" holds every body until its last byte, for every client, exactly as before 0.90.0. A translated body, a body under 16 KiB, a compressed one, and every body while a policy is installed are always held.",
+    "stream_body": "on",
+
+    "_stream_body_max": "How many bodies one worker forwards as they arrive at once, 0 to 1048576, 0 for no cap. Each holds a connection to the venue, and a second descriptor, until its last byte, so a client uploading slowly holds both for as long as it takes. Past the cap a body is held to its last byte as before 0.90.0, with one descriptor and no venue connection, and bounded as a held body is: on a connection's first request it must arrive within the 30 s setup deadline, so while the cap is reached an upload slower than that on a fresh connection is closed.",
+    "stream_body_max": 256,
+
+    "_stream_openai_body": "\"on\" (default) forwards an OpenAI client's byte-forwarded body as it arrives too, each chunk checked first: a repeated or escaped top-level key, or a byte that is not JSON, stops it, resets the upstream and answers 400. \"off\" holds an OpenAI client's body until its last byte; other clients' bodies follow stream_body alone.",
     "stream_openai_body": "on",
 
     "_duration_s": "Self-stop after N seconds (fractions allowed; SIGINT/SIGTERM still stop it at once) and print the added-latency profile, for scripted benchmark runs. 0 runs until SIGINT/SIGTERM.",

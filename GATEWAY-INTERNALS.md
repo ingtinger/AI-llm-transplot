@@ -189,7 +189,8 @@ The request side is shared outright. Bytes a backend reads go to `on_client_byte
 a finished request re-frames whatever was pipelined from the same buffer, never
 with another read. An `Expect: 100-continue` is answered by staging the interim line
 in `out` and sending it like any reply; it finishes nothing, because no request is
-framed yet. Reading continues while a request is in flight, so a client may pipeline
+framed yet. A send that fails closes the client, and `try_frame` stops there: a body
+that would stream is never dispatched for a client already gone. Reading continues while a request is in flight, so a client may pipeline
 behind it, up to `kMaxClientBuffered` (no legal request is larger); past that its
 reads are paused through `set_read` (counted in `client_read_pauses`) until the
 requests drain the buffer. On io_uring a pause cancels the multishot recv, whose
@@ -387,11 +388,12 @@ ClientThatNeverReadsCannotGrowUsWithoutBound`) peaks at 55 MB of process RSS pau
 69 MB when the cap dropped it; epoll's is 53 MB.
 
 Either way the idle deadline (`--upstream-timeout`) measures `ts_progress`, which both
-legs advance: a response byte read, a request byte sent, a byte the client took. A
-paused upstream reads nothing while its client drains, and a finished stream reads
-nothing while its client catches up; neither is idle. When neither leg
-moves and bytes are still owed to the client, the sweep logs `client stalled` and counts
-`client_idle_timeouts`, not `upstream_timeouts`.
+legs advance: a response byte read, a request byte sent (`note_sent`, never a part
+merely staged), a byte the client took. A paused upstream reads nothing while its
+client drains, and a finished stream reads nothing while its client catches up;
+neither is idle. When neither leg moves and bytes are still owed to the client, the
+sweep logs `client stalled` and counts `client_idle_timeouts`, not
+`upstream_timeouts`. A body still arriving has its own rule (12).
 
 `read_paused` is written only by a backend's `set_read`, which both guard on the
 current value. A stream pauses its upstream only where `stream_backpressure` holds,
@@ -682,8 +684,9 @@ as it arrives instead, when nothing about it needs the whole body:
   not content-encoded;
 - no policy is installed (a policy reads the body before it routes);
 - the plan is a byte-forward: a translation reads the whole body;
-- an OpenAI client's body streams only with `--stream-openai-body on`, the default.
-  Off, it is held to its last byte exactly as before.
+- `--stream-body on`, the default, and for an OpenAI client `--stream-openai-body on`
+  too. Off, a body is held to its last byte exactly as before;
+- the worker streams fewer than `--stream-body-max` bodies already (below).
 
 `try_frame` opens the request at the head (`open_request`: t0, the sequence number,
 the sink's capture) and dispatches it with the body so far. `dispatch` writes the
@@ -724,3 +727,69 @@ completion `ts_body_sent`, where the provider's wait begins. So the connection's
 first-byte stamp runs on past the head: `pump_body` restarts it for the next request
 at the last byte, or `drop_discard` once a cut-short body's rest has gone.
 LATENCY.md 2b.
+
+### 12b. What a slow upload may hold
+
+A held body costs one descriptor while it arrives. A streamed one also holds a
+connection to the venue, a TLS handshake when cold, and a second descriptor until its
+last byte, and before 0.94.0 nothing bounded how long: every part refreshed the idle
+clock and there was no upload deadline, so a client sending a byte a minute held all
+three with no bandwidth at all. (A held first request is cut by the 30 s setup
+deadline; a streamed one is past it at its head, where `dispatch` sets `ever_framed`.)
+Three bounds and one rule close that.
+
+**How many at once.** `body_streams` admits a body only while the worker streams fewer
+than `--stream-body-max` (256 by default; 0 for no cap). Past it the body is held to its
+last byte exactly as before 0.90.0, counted in `streamed_body_capped`, and bounded as a
+held body is: on a connection's first request it must arrive within the 30 s setup
+deadline. So while the slots are full, an upload slower than that on a fresh connection
+is closed with no reply, where streamed it would have been served (SECURITY.md).
+`_bodies_streaming` counts a slot from the head to whatever ends the body, through one
+function, `stop_body`: its last byte, a response byte, a refusal, an error reply, a
+timeout, or the client leaving (`forget`).
+
+**How slowly.** A streamed body gets `--body-grace` (10 s), and one second more for
+every `--body-min-rate` bytes (1024) it has delivered; `--body-timeout`, off by default,
+caps the whole upload from its head (`body_deadline`). The rate is earned, not
+sampled: a client that sent 1 MB quickly has 17 minutes of credit for the rest, while
+one sending a byte now and then is cut once its grace runs out. A pause spends that
+credit only up to `--upstream-timeout` (120 s): a body that sends nothing for longer is
+a client stall (below) whatever it earned, as it was the venue's 504 before 0.94.0.
+1 KiB a second is 8 kbit/s, below a 2G data link, so the default cuts no client whose
+link is merely slow, however large its body; a total limit cuts every such client once
+the body is large enough, which is why it is off. A slowloris now pays for its time in
+bandwidth, and holds at most `--stream-body-max` venue connections per worker doing it.
+
+The deadline is checked in two places. `sweep_client` cuts a body that sends nothing,
+within one tick of it; `pump_body` checks before a part goes, against the deadline the
+bytes before it earned, so bytes that arrive late never reach the venue, the body's
+last included. A body that misses it gets `body_timeout`: `streamed_body_timeouts`, a
+`TIMEOUT streamed body too slow` line with the bytes in and the body's length, and a
+408 whose text is fixed (`kSlowBodyMessage`). `error_respond` resets the venue, and the
+reply closes the client connection once it is out, without waiting for the rest. The
+rest of a body cut short by an early response, read only to be dropped
+(`drop_discard`), stays on the same deadline: past it the connection closes, where a
+client trickling it held the connection to `--client-idle`.
+
+**Who stopped.** When neither leg moves for `--upstream-timeout`, a body still
+arriving is attributed by what the venue has. All of what came, with nothing staged,
+nothing in flight and nothing the kernel holds unacknowledged (`net::unacked_bytes`,
+`SIOCOUTQ`): the client stopped sending, so it is a client stall, a 408 and
+`client_idle_timeouts`. Bytes the venue has not taken: it stopped reading, so it is the
+venue's, a 504 and `upstream_timeouts`. Only a send that moves bytes is the venue's
+progress; before 0.94.0 staging a part was, so a venue that stopped reading timed out
+only once the client finished.
+
+**Never resent as whole.** A stalled body is not failed over and not retried. Failover
+needs a policy, and a policy's requests are never streamed; the stall path replies
+itself, never through `fail_request`. The stale-connection retry runs only on a venue
+failure inside a second of taking a pooled connection, and resends the head and the
+bytes sent so far under the declared `Content-Length`, the rest following as it
+arrives: a venue that loses the client again holds a body short of its length.
+
+**A reset, every time.** A venue whose body will not be finished is reset, whichever
+path ends it: a refusal, a deadline, a stall, an error reply, the client leaving
+(`cut_body`, `reset_venue`). SO_LINGER 0 makes the close an RST, and the connection is
+never pooled. On io_uring a close shuts the socket down first, so its operations
+complete; a reset shuts only the read side (`reset_on_close`), so the venue gets the
+RST with no FIN ahead of it.

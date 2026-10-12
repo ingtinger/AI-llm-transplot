@@ -37,6 +37,7 @@ namespace llmbridge
     struct UpstreamConn;
     class UpstreamPool;
     struct HeadFacts;
+    struct ReqState;
     template <class T> class Registry;
 }
 
@@ -83,8 +84,15 @@ namespace llmbridge::detail
         void send_continue(ClientConn* c) noexcept;     // the interim 100, staged like any reply
         void respond(ClientConn* client) noexcept;      // send what is owed; finish if it all went
         // A body forwarded as it arrives (core/body.cpp).
-        [[nodiscard]] bool body_streams(const ClientConn* c, const net::http::Message& m) const noexcept;
+        [[nodiscard]] bool body_streams(const ClientConn* c, const net::http::Message& m) noexcept;
         void pump_body(ClientConn* c) noexcept;       // scan, then stage what is safe upstream
+        void stop_body(ClientConn* c) noexcept;       // no more of it goes up: its slot is free
+        void cut_body(ClientConn* c) noexcept;        // stop it and reset its venue
+        void reset_venue(UpstreamConn* u) noexcept;   // never pooled, and its close is a reset
+        /// The client gets a 408 and the venue a reset; `counter` says which limit it missed.
+        void body_timeout(ClientConn* c, uint64_t& counter, const char* why) noexcept;
+        /// When a body with `f.body_in` bytes in must have its last; INT64_MAX for never.
+        [[nodiscard]] int64_t body_deadline(const ReqState& f) const noexcept;
         void refuse_body(ClientConn* c) noexcept;     // reset the upstream, answer the 400
         void end_body_stream(ClientConn* c, UpstreamConn* u) noexcept; // a response byte arrived
         void drop_discard(ClientConn* c) noexcept;    // bytes of a request that is over
@@ -137,7 +145,8 @@ namespace llmbridge::detail
         [[nodiscard]] bool upstream_request_sent(const UpstreamConn* u) const noexcept;
         /// What `u->out` holds now is the attempt's first send, which t3 waits for.
         void mark_first_send(UpstreamConn* u) noexcept;
-        /// `u` took bytes: t3 once the first send is in, ts_body_sent whenever all is.
+        /// `u` took bytes: the idle clock restarts, t3 once the first send is in, and
+        /// ts_body_sent whenever all is.
         void note_sent(UpstreamConn* u, int64_t now) noexcept;
         bool send_upstream(UpstreamConn* u) noexcept; // false: the write failed, `u` is lost
 
@@ -221,9 +230,17 @@ namespace llmbridge::detail
         int64_t _upstream_idle_ns; // 0 = no idle timeout
         TlsConfig _tls;            // both legs; each flag inits its own context
         bool _timing_headers = false;
-        /// Forward an OpenAI client's body as it arrives, each chunk scanned first.
+        /// Forward a byte-forwarded body as it arrives, an OpenAI client's only with the
+        /// second, each chunk scanned first. Off, a body is held to its last byte.
+        bool _stream_body = true;
         bool _stream_openai_body = true;
         size_t _stream_body_min = 16 * 1024; ///< a body under this arrives too fast to matter
+        size_t _stream_body_max = Gateway::kDefaultStreamBodyMax; ///< at once; 0 = no cap
+        size_t _bodies_streaming = 0; ///< bodies arriving now, each with a venue connection held
+        /// A streamed body's upload deadline (body_deadline); 0 turns either limit off.
+        int64_t _body_timeout_ns = Gateway::kDefaultBodyTimeoutNs;
+        int64_t _body_grace_ns = Gateway::kDefaultBodyGraceNs;
+        uint64_t _body_min_rate = Gateway::kDefaultBodyMinRate;
         Policy* const _policy = nullptr; ///< `const`: swapping it under the loop would race
         bool _wants_prefix_hash = false; ///< Policy::wants_prefix_hash(), read once
         RequestSink* _sink = nullptr;
