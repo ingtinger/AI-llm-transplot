@@ -24,15 +24,19 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
     below a 2G data link), and with `--body-timeout` (off by default) a limit on the
     whole upload from its head. A slow but steady upload keeps earning time, so no
     client whose link is merely slow is cut, however large its body; a trickle runs out
-    of time. A body that misses it gets `408 Request Timeout` with a fixed message and
-    its connection closes once the reply is out; the venue's connection is reset, never
-    pooled, and the bytes that came after the deadline, the body's last included, are
-    never forwarded, so the provider never holds the whole body. Counted in
+    of time. A pause spends that time only up to `--upstream-timeout` (120 s): a longer
+    one is cut as a client stall (below), whatever the body earned. A body that misses
+    the deadline gets `408 Request Timeout` with a fixed message and its connection
+    closes once the reply is out; the venue's connection is reset, never pooled, and
+    the bytes that came after the deadline, the body's last included, are never
+    forwarded, so the provider never holds the whole body. Counted in
     `Stats::streamed_body_timeouts` and logged as `TIMEOUT streamed body too slow`.
   - **A cap on streamed bodies.** A worker streams at most `--stream-body-max` bodies at
     once (256). Past it a body is held to its last byte exactly as before 0.90.0, one
-    descriptor and no venue connection, and still served, counted in
-    `Stats::streamed_body_capped`.
+    descriptor and no venue connection, counted in `Stats::streamed_body_capped`. It is
+    bounded as a held body is: on a connection's first request it must arrive within
+    the 30 s setup deadline, so while the slots are full a slower upload on a fresh
+    connection is closed with no reply.
   - **`--stream-body off`** holds every body, for every client.
 
 ### Fixed
@@ -96,21 +100,22 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 ### Tests
 
 - `ProxyBodyStream.*` on both backends: a trickling body cut at `--body-timeout` with a
-  408, its connection closed, the venue reset and never given the whole body, and not
-  pooled; a body that stops coming cut by the sweep; a body under the minimum rate cut,
-  and a steady slow one above it not; the rest of a cut-short body on the same deadline,
-  a steady rest earning its time and the connection carrying its next request; past
-  `--stream-body-max` a body held and still served, the slot freed for the next;
-  `--stream-body off` holding an OpenAI and an Anthropic client's body with a held
-  body's record; a client stopping mid-body on a pooled connection inside the
-  stale-retry window counted as a client stall, never retried; a venue that stops
-  reading timed out while the client still sends; a client leaving mid-body resetting
-  the venue. `GatewayTls.ATrickledBodyToATlsVenueIsCutAtItsDeadline`.
+  408 typed `timeout_error`, its connection closed, the venue reset and never given the
+  whole body, and not pooled; a body that stops coming cut by the sweep; a body under
+  the minimum rate cut, and a steady slow one above it not; the rest of a cut-short
+  body on the same deadline, a steady rest earning its time and the connection carrying
+  its next request; past `--stream-body-max` a body held and still served, the slot
+  freed for the next; `--stream-body off` holding an OpenAI and an Anthropic client's
+  body with a held body's record; a client stopping mid-body on a pooled connection
+  inside the stale-retry window counted as a client stall, never retried; a venue that
+  stops reading timed out while the client still sends; a client leaving mid-body
+  resetting the venue. `GatewayTls.ATrickledBodyToATlsVenueIsCutAtItsDeadline`.
 - `Core.*` with the `FakeIo` and a clock the test sets: the defaults never cut 2 KiB a
   second over a 16 MB body and cut 512 bytes a second at 20 s; the body in at the head
   earns its time; bytes after the deadline never forwarded; every way a body ends frees
-  its slot; a stall told from a venue that stopped taking, and bytes the kernel holds
-  unacknowledged counted as the venue's; only a send is progress.
+  its slot, and a cap of 0 holds no body; a stall told from a venue that stopped
+  taking, and bytes the kernel holds unacknowledged counted as the venue's; only a send
+  is progress.
 - Each check, each credit, each slot release and each reset fails its tests when
   removed, on both backends wherever the test runs on both.
 - The new flags' parse, bounds and `--help` lines; the example config pins every default.
