@@ -739,8 +739,10 @@ Three bounds and one rule close that.
 
 **How many at once.** `body_streams` admits a body only while the worker streams fewer
 than `--stream-body-max` (256 by default; 0 for no cap). Past it the body is held to its
-last byte exactly as before 0.90.0 and still served, counted in
-`streamed_body_capped`: the cap costs the latency streaming saves, never a request.
+last byte exactly as before 0.90.0, counted in `streamed_body_capped`, and bounded as a
+held body is: on a connection's first request it must arrive within the 30 s setup
+deadline. So while the slots are full, an upload slower than that on a fresh connection
+is closed with no reply, where streamed it would have been served (SECURITY.md).
 `_bodies_streaming` counts a slot from the head to whatever ends the body, through one
 function, `stop_body`: its last byte, a response byte, a refusal, an error reply, a
 timeout, or the client leaving (`forget`).
@@ -748,12 +750,14 @@ timeout, or the client leaving (`forget`).
 **How slowly.** A streamed body gets `--body-grace` (10 s), and one second more for
 every `--body-min-rate` bytes (1024) it has delivered; `--body-timeout`, off by default,
 caps the whole upload from its head (`body_deadline`). The rate is earned, not
-sampled: a client that sent 1 MB and then paused has 17 minutes of credit, while one
-sending a byte now and then is cut once its grace runs out. 1 KiB a second is 8 kbit/s,
-below a 2G data link, so the default cuts no client whose link is merely slow, however
-large its body; a total limit cuts every such client once the body is large enough,
-which is why it is off. A slowloris now pays for its time in bandwidth, and holds at
-most `--stream-body-max` venue connections per worker doing it.
+sampled: a client that sent 1 MB quickly has 17 minutes of credit for the rest, while
+one sending a byte now and then is cut once its grace runs out. A pause spends that
+credit only up to `--upstream-timeout` (120 s): a body that sends nothing for longer is
+a client stall (below) whatever it earned, as it was the venue's 504 before 0.94.0.
+1 KiB a second is 8 kbit/s, below a 2G data link, so the default cuts no client whose
+link is merely slow, however large its body; a total limit cuts every such client once
+the body is large enough, which is why it is off. A slowloris now pays for its time in
+bandwidth, and holds at most `--stream-body-max` venue connections per worker doing it.
 
 The deadline is checked in two places. `sweep_client` cuts a body that sends nothing,
 within one tick of it; `pump_body` checks before a part goes, against the deadline the

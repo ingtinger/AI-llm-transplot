@@ -42,7 +42,7 @@
     "connect_s": 5,
 
     "_body_streamed": "The three below bound a body forwarded as it arrives (runtime.stream_body), which holds a connection to the venue, and a second descriptor, until its last byte. A body that misses them is cut: the client gets 408 and its connection closes, the venue's connection is reset, so it holds part of a body short of its Content-Length and never runs it. A held body is not affected.",
-    "_body_min_rate": "The least average upload, in bytes a second, once the grace is over: a body gets body_grace_s, and one second more for every body_min_rate bytes it delivers. 1024 (8 kbit/s, below even a 2G data link) never cuts a client whose link is merely slow, however large its body, and a pause is covered by the time its earlier bytes earned. A client trickling a byte now and then is cut once its grace runs out. 0 disables.",
+    "_body_min_rate": "The least average upload, in bytes a second, once the grace is over: a body gets body_grace_s, and one second more for every body_min_rate bytes it delivers. 1024 (8 kbit/s, below even a 2G data link) never cuts a client whose link is merely slow, however large its body. A pause is covered by the time its earlier bytes earned, up to timeouts.upstream_s: a body that sends nothing for longer is cut as a client stall, whatever it earned. A client trickling a byte now and then is cut once its grace runs out. 0 disables.",
     "body_min_rate": 1024,
 
     "_body_grace_s": "How long a streamed body may take before the minimum rate applies, covering a connection's slow start and a client that sends its head first.",
@@ -77,7 +77,7 @@
     "_stream_body": "\"on\" (default) forwards a byte-forwarded body of 16 KiB or more to the venue as it arrives, so the venue does not wait for the whole upload. \"off\" holds every body until its last byte, for every client, exactly as before 0.90.0. A translated body, a body under 16 KiB, a compressed one, and every body while a policy is installed are always held.",
     "stream_body": "on",
 
-    "_stream_body_max": "How many bodies one worker forwards as they arrive at once, 0 to 1048576, 0 for no cap. Each holds a connection to the venue, and a second descriptor, until its last byte, so a client uploading slowly holds both for as long as it takes. Past the cap a body is held to its last byte as before 0.90.0, with one descriptor and no venue connection, and is still served: the cap costs the latency streaming saves, never a request.",
+    "_stream_body_max": "How many bodies one worker forwards as they arrive at once, 0 to 1048576, 0 for no cap. Each holds a connection to the venue, and a second descriptor, until its last byte, so a client uploading slowly holds both for as long as it takes. Past the cap a body is held to its last byte as before 0.90.0, with one descriptor and no venue connection, and bounded as a held body is: on a connection's first request it must arrive within the 30 s setup deadline, so while the cap is reached an upload slower than that on a fresh connection is closed.",
     "stream_body_max": 256,
 
     "_stream_openai_body": "\"on\" (default) forwards an OpenAI client's byte-forwarded body as it arrives too, each chunk checked first: a repeated or escaped top-level key, or a byte that is not JSON, stops it, resets the upstream and answers 400. \"off\" holds an OpenAI client's body until its last byte; other clients' bodies follow stream_body alone.",

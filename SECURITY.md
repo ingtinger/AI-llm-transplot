@@ -149,7 +149,8 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   (256); past that a body is held to its last byte, one descriptor and no provider
   connection, and `--stream-body off` holds every one. A client that stops sending
   mid-body is told apart from a provider that stops reading, and neither is retried or
-  failed over. GATEWAY-INTERNALS.md 12b.
+  failed over; a pause longer than `--upstream-timeout` (120 s) is cut as a client
+  stall, whatever time the body's earlier bytes earned. GATEWAY-INTERNALS.md 12b.
 
 ### Known gaps, stated instead of implied
 
@@ -176,8 +177,11 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   connections per worker for 1 KiB a second each; past the cap its bodies are held. A
   held body has no rate floor: it must arrive within the setup deadline on a fresh
   connection, but on a reused one only `--client-idle` bounds it, as before 0.90.0.
-  Raising `--body-min-rate` or lowering the cap makes the attack dearer and cuts
-  slower legitimate clients sooner; a per-client limit needs something in front.
+  So while an attacker fills a worker's slots, a legitimate upload on a fresh
+  connection that takes longer than 30 s is closed with no reply, as every such upload
+  was before 0.90.0. Raising `--body-min-rate` or lowering the cap makes the attack
+  dearer and cuts slower legitimate clients sooner; a per-client limit needs something
+  in front.
 - **No per-client quota or rate limit.** Connection setup is bounded (30 s to frame a
   first request) and an established client that goes quiet is closed after
   `--client-idle`, three days by default, so a descriptor cannot be held forever. That
