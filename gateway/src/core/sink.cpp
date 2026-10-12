@@ -24,11 +24,12 @@ namespace llmbridge::detail
 
     // The header names that carry a credential, which is the set this gateway extracts
     // and re-emits: authorization and x-api-key (Bearer / Anthropic), x-goog-api-key
-    // (Gemini), and api-key (Azure).
+    // (Gemini), api-key (Azure), and the key family.
     static bool is_credential_header(std::string_view lowered) noexcept
     {
         return lowered == "authorization" || lowered == "x-api-key" ||
-               lowered == "x-goog-api-key" || lowered == "api-key";
+               lowered == "x-goog-api-key" || lowered == "api-key" ||
+               lowered.starts_with(kKeyHeaderPrefix);
     }
 
     void Engine::set_request_sink(RequestSink* sink, std::vector<std::string> capture)

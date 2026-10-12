@@ -403,8 +403,9 @@ namespace llmbridge::detail
     /// because the request goes to a different origin than the client addressed; the
     /// Content-Length is ours, from the bytes actually sent; Expect asks the upstream
     /// for an interim reply we cannot relay; Accept-Encoding goes so the provider
-    /// answers in a body we can measure; and the hop-by-hop headers and any the client's
-    /// Connection names are this hop's, so the venue alone decides its own keep-alive.
+    /// answers in a body we can measure; the hop-by-hop headers and any the client's
+    /// Connection names are this hop's, so the venue alone decides its own keep-alive;
+    /// and an x-kottos-key- header holds a provider key no venue may see.
     /// The request line is copied, never tested as a header, and an HTTP/1.0 one goes
     /// as 1.1 so the upstream connection can be pooled.
     const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
@@ -447,7 +448,9 @@ namespace llmbridge::detail
             const bool drop = (h.field == Field::Host && !host_hdr.empty()) ||
                               h.field == Field::ContentLength || h.field == Field::Expect ||
                               h.field == Field::AcceptEncoding || net::http::hop_by_hop(h.field) ||
-                              stripped(h.name, strip) || (h.field == Field::Other && listed(h.name));
+                              stripped(h.name, strip) ||
+                              (h.field == Field::Other &&
+                               (net::http::detail::line_is(h.name, kKeyHeaderPrefix) || listed(h.name)));
             if (!drop) return true;
             const size_t at = static_cast<size_t>(h.name.data() - head.data());
             if (at > run) into.append(head.substr(run, at - run));

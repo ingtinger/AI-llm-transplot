@@ -31,7 +31,16 @@ namespace
 {
     using llmbridge::UpstreamDialect;
     using llmbridge::detail::auth_headers_for;
+    using llmbridge::detail::request_without;
     using llmbridge::detail::translate_failure;
+
+    std::string forward_request(const std::string& hdrs)
+    {
+        const std::string body = R"({"model":"m","messages":[]})";
+        return "POST /v1/chat/completions HTTP/1.1\r\nHost: client\r\n" + hdrs +
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+    size_t head_len(const std::string& m) { return m.find("\r\n\r\n") + 4; }
 } // namespace
 
 // The reason logged and shown for a refused translation names the actual defect.
@@ -238,3 +247,39 @@ TEST(AuthHeaders, StaysWithinAnOrderOfMagnitudeOfOneWalk)
 }
 #endif
 
+// ── The x-kottos-key- family ─────────────────────────────────────────────────
+// A client may send one provider key per x-kottos-key-<domain> header. None of them
+// is ever forwarded: the strip list matches exact names, and a client picks the suffix.
+
+// A plain x-kottos-key is not in the family (no dash), nor is x-kottos-keyring, and the
+// client's own credential is forwarded as before.
+TEST(KeySwap, TheFamilyIsStrippedWhenNothingIsNamed)
+{
+    const std::vector<std::string> strip;
+    const std::string m = forward_request("Authorization: Bearer sk-CLIENT\r\n"
+                                          "x-kottos-key-anthropic: sk-F1\r\nX-KOTTOS-KEY-OPENAI: sk-F2\r\n"
+                                          "x-kottos-key-: sk-F3\r\nx-kottos-keyring: kept\r\n"
+                                          "x-kottos-key: tenant\r\n");
+    std::string into;
+    ASSERT_TRUE(request_without(m, head_len(m), strip, "venue", "", {}, into));
+    EXPECT_EQ(into.find("sk-F"), std::string::npos) << into;
+    EXPECT_NE(into.find("\r\nAuthorization: Bearer sk-CLIENT\r\n"), std::string::npos) << into;
+    EXPECT_NE(into.find("\r\nx-kottos-keyring: kept\r\n"), std::string::npos) << into;
+    EXPECT_NE(into.find("\r\nx-kottos-key: tenant\r\n"), std::string::npos) << into;
+}
+
+// The golden fixture for a request without the family: the rebuild is the bytes it was
+// before key headers existed.
+TEST(KeySwap, WithoutTheFamilyTheRebuildIsUnchanged)
+{
+    const std::vector<std::string> strip;
+    const std::string body = R"({"model":"m","messages":[]})";
+    const std::string m = "POST /v1/chat/completions HTTP/1.1\r\nHost: client\r\n"
+                          "Authorization: Bearer sk\r\nX-A: 1\r\nContent-Length: " +
+                          std::to_string(body.size()) + "\r\n\r\n" + body;
+    std::string into;
+    ASSERT_TRUE(request_without(m, head_len(m), strip, "venue", "", {}, into));
+    EXPECT_EQ(into, "POST /v1/chat/completions HTTP/1.1\r\nHost: venue\r\nContent-Length: " +
+                        std::to_string(body.size()) + "\r\nAuthorization: Bearer sk\r\nX-A: 1\r\n\r\n" +
+                        body);
+}

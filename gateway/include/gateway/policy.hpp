@@ -48,6 +48,9 @@ namespace llmbridge
         return n > 0;
     }
 
+    /// Headers holding provider keys: no name with this prefix, in any case, goes upstream.
+    inline constexpr std::string_view kKeyHeaderPrefix = "x-kottos-key-";
+
     struct Decision
     {
         /// `= false` so `Decision d;` refuses too; `Decision{}` zeroes it either way.

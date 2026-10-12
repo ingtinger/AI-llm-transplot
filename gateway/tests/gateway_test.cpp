@@ -456,6 +456,7 @@ namespace
                     buf.append(tmp, static_cast<size_t>(n));
                     if (_drop_mid_second && conn_index == 0 && done_here == 1)
                     {
+                        { std::lock_guard<std::mutex> lk(_mu); _incomplete.push_back(buf); }
                         ::close(c);
                         return;
                     }
@@ -10785,6 +10786,119 @@ TEST_P(ProxyRoute, ThePoolCapCountsConnectionsNotVenues)
     c.stop();
 }
 
+// ── Provider keys in the x-kottos-key- family ─────────────────────────────────────
+//
+// A request may carry several provider keys, one per x-kottos-key-<domain> header. No
+// family header reaches a venue, on any path, with or without a policy.
+namespace
+{
+    std::string lower_case(std::string s)
+    {
+        for (char& ch : s) ch = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch + 32) : ch;
+        return s;
+    }
+
+    std::string anthropic_request_hdrs(const std::string& content, const std::string& extra)
+    {
+        const std::string body = R"({"model":"m","max_tokens":64,"messages":)"
+                                 R"([{"role":"user","content":")" + content + R"("}]})";
+        return "POST /v1/messages HTTP/1.1\r\nHost: x\r\n" + extra +
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+
+    std::string venue_reply(UpstreamDialect d)
+    {
+        return d == UpstreamDialect::Anthropic ? http_ok(anthropic_resp_body("ok"))
+                                               : http_ok(R"({"id":"x","object":"chat.completion"})");
+    }
+} // namespace
+
+class ProxyKeyHeader : public ProxyRoute
+{
+  protected:
+    /// One request on its own connection, and the response; "" on timeout.
+    std::string exchange(const std::string& req)
+    {
+        Client c;
+        if (!c.connect(_port) || !c.send(req)) return {};
+        return c.recv_response();
+    }
+    /// Joined and dropped, so the next start() builds a fresh gateway.
+    void restart()
+    {
+        shutdown();
+        _shut = false;
+        _gw.reset();
+    }
+};
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyKeyHeader,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
+                         });
+
+// A stock gateway with no policy never forwards a family header, and the client's own key
+// still passes as before. A translated request is rebuilt from a whitelist.
+TEST_P(ProxyKeyHeader, TheFamilyNeverReachesAByteForwardedVenue)
+{
+    TestBackend oai, anth, xlate;
+    oai.set_response(venue_reply(UpstreamDialect::OpenAI));
+    anth.set_response(http_ok(R"({"id":"m","type":"message","content":[]})"));
+    xlate.set_response(venue_reply(UpstreamDialect::Anthropic));
+    oai.start();
+    anth.start();
+    xlate.start();
+    const std::string family =
+        "x-kottos-key-anthropic: sk-F1\r\nX-KOTTOS-KEY-OPENAI: sk-F2\r\nx-kottos-key-: sk-F3\r\n";
+    start({{"127.0.0.1", oai.port(), false, "", UpstreamDialect::OpenAI, ""}}, nullptr);
+    EXPECT_EQ(Client::status_of(exchange(
+                  openai_request_hdrs("hi", "Authorization: Bearer sk-CLIENT\r\n" + family))),
+              200);
+    restart();
+    start({{"127.0.0.1", anth.port(), false, "", UpstreamDialect::Anthropic, ""}}, nullptr);
+    EXPECT_EQ(Client::status_of(exchange(anthropic_request_hdrs("hi", "x-api-key: sk-CLIENT\r\n" + family))),
+              200);
+    restart();
+    start({{"127.0.0.1", xlate.port(), false, "", UpstreamDialect::Anthropic, ""}}, nullptr);
+    EXPECT_EQ(Client::status_of(exchange(
+                  openai_request_hdrs("hi", "Authorization: Bearer sk-CLIENT\r\n" + family))),
+              200);
+    shutdown();
+    for (TestBackend* b : {&oai, &anth, &xlate})
+    {
+        const std::string up = b->last_request();
+        EXPECT_NE(up.find("sk-CLIENT"), std::string::npos) << up;
+        EXPECT_EQ(up.find("sk-F"), std::string::npos) << up;
+        EXPECT_EQ(lower_case(up).find("x-kottos-key"), std::string::npos) << up;
+    }
+    oai.stop();
+    anth.stop();
+    xlate.stop();
+}
+
+// A sink cannot capture a family header, as it cannot capture Authorization: the name is
+// refused when the sink is installed, and the slots after it move up.
+TEST_P(ProxyKeyHeader, AKeyHeaderCanNeverBeCaptured)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, nullptr, &sink,
+          {"x-kottos-key-together", "X-Kottos-Key-Other", "x-kottos-run"});
+    const std::string resp = exchange(openai_request_hdrs(
+        "hi", "x-kottos-key-together: KEY-CAPTURED\r\nx-kottos-key-other: KEY-OTHER\r\n"
+              "x-kottos-run: my-run\r\n"));
+    shutdown();
+    b.stop();
+    EXPECT_EQ(Client::status_of(resp), 200) << resp;
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].cap[0], "my-run") << "a key header was registered for capture";
+    for (size_t i = 0; i < llmbridge::kSinkCaptureMax; ++i)
+        EXPECT_EQ(recs[0].cap[i].find("KEY-"), std::string::npos) << "a key reached the sink, slot " << i;
+}
+
 // ── What a relayed response keeps, and what a forwarded request drops ─────────────
 
 class ProxyRelay : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend>
@@ -11238,6 +11352,37 @@ TEST_P(ProxyBodyStream, AStaleRetryResendsTheWholeBody)
     EXPECT_EQ(up.substr(up.find("\r\n\r\n") + 4), h.first.substr(h.first.find("\r\n\r\n") + 4) + h.rest);
     shutdown();
     EXPECT_EQ(_gw->stats().upstream_retries, 1u);
+}
+
+// No family header leaves with a streamed body: not in the head that goes ahead of it,
+// and not in the rebuild a stale-connection retry sends. A stock gateway, no policy.
+TEST_P(ProxyBodyStream, TheKeyFamilyNeverLeavesWithAStreamedBody)
+{
+    _backend.set_response(http_ok("{}"));
+    _backend.set_drop_first_mid_second(true);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    const std::string hdrs = "Authorization: Bearer sk-CLIENT\r\nX-Kottos-Key-Openai: sk-F1\r\n"
+                             "x-kottos-key-: sk-F2\r\n";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", hdrs)));
+    ASSERT_EQ(c.recv_status(), 200);
+    Halves h = openai_halves(R"(,"temperature":0.5})");
+    h.first.insert(h.first.find("\r\n") + 2, hdrs);
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.accepted() == 2; })) << "no retry on a fresh connection";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    shutdown();
+    EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
+    EXPECT_EQ(_gw->stats().upstream_retries, 1u);
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u) << "the head that went ahead of the body";
+    for (const std::string& up : {_backend.all_requests(), cut[0]})
+    {
+        EXPECT_NE(up.find("\r\nAuthorization: Bearer sk-CLIENT\r\n"), std::string::npos) << up.substr(0, 400);
+        EXPECT_EQ(up.find("sk-F"), std::string::npos) << up.substr(0, 400);
+    }
 }
 
 // The provider answered before the body was in: the rest of it is read and dropped, and
