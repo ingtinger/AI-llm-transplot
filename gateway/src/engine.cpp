@@ -62,7 +62,8 @@ namespace llmbridge::detail
         : _listen_port(listen_port), _upstreams(std::move(upstreams)), _warmup_ns(warmup_ns),
           _io(io), _upstream_idle_ns(upstream_idle_ns), _tls(std::move(tls)),
           _timing_headers(timing_headers), _policy(policy),
-          _wants_prefix_hash(policy != nullptr && policy->wants_prefix_hash())
+          _wants_prefix_hash(policy != nullptr && policy->wants_prefix_hash()),
+          _decides_on_head(policy != nullptr && policy->decides_on_head())
     {
         // Every path below indexes the table without a bounds special case, so an empty
         // one is a programming error caught here and not a crash on the first request.
@@ -240,6 +241,10 @@ namespace llmbridge::detail
             os << "streamed_bodies=" << _stats.streamed_bodies << " refused=" << _stats.streamed_body_refusals
                << " capped=" << _stats.streamed_body_capped << " timed_out=" << _stats.streamed_body_timeouts
                << "\n";
+        if (_stats.policy_head_decisions > 0)
+            os << "policy_head_decisions=" << _stats.policy_head_decisions
+               << " parked=" << _stats.streamed_body_parked << " redone=" << _stats.streamed_body_redone
+               << " confirm_refusals=" << _stats.streamed_body_confirm_refusals << "\n";
         std::fputs(os.str().c_str(), out);
     }
 

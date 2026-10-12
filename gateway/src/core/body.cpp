@@ -21,22 +21,65 @@
 namespace llmbridge::detail
 {
 
-    bool Engine::body_streams(const ClientConn* c, const net::http::Message& m) noexcept
+    bool Engine::body_streamable(const ClientConn* c, const net::http::Message& m) noexcept
     {
-        // A policy reads the body before it routes, so its requests wait for all of it.
-        if (!_stream_body || _policy || m.body_len < _stream_body_min || m.encoded ||
+        // A policy reads the body before it routes, so its requests wait for all of it,
+        // unless it decides on the head (12c).
+        if (!_stream_body || (_policy && !_decides_on_head) || m.body_len < _stream_body_min || m.encoded ||
             c->rbuf.size() >= m.total_len)
             return false;
         if (!net::http::request_line_ok(c->rbuf)) return false; // the framing path refuses it
         const Dialect client = client_dialect_of(std::string_view(c->rbuf.data(), m.header_len));
         if (client == Dialect::OpenAI && !_stream_openai_body) return false;
-        // A byte-forward only: a translation reads the whole body.
-        const TranslationPlan plan = resolve_translation(client, _upstreams[0].dialect, false);
-        if (!plan.ok || plan.translate) return false;
+        // A byte-forward only: a translation reads the whole body. A policy picks the venue
+        // later, so one that could take it is enough to decide on the head.
+        if (_policy ? !any_venue_streams(client) : !venue_streams(client, 0)) return false;
         // Each holds a venue connection to its last byte; past the cap one waits, as before.
         if (_stream_body_max == 0 || _bodies_streaming < _stream_body_max) return true;
         ++_stats.streamed_body_capped;
         return false;
+    }
+
+    bool Engine::venue_streams(Dialect client, int slot) const noexcept
+    {
+        const TranslationPlan plan = resolve_translation(client, venue_at(slot).dialect, false);
+        return plan.ok && !plan.translate;
+    }
+
+    bool Engine::any_venue_streams(Dialect client) const noexcept
+    {
+        for (size_t i = 0; i < _upstreams.size(); ++i)
+            if (venue_streams(client, static_cast<int>(i))) return true;
+        return false;
+    }
+
+    // Admitted before its last byte: forwarded as it arrives, or parked unsent in rbuf to
+    // its last byte (12c), which holds no venue and no slot. An OpenAI client's JSON is
+    // checked as it passes either way; a file upload is not JSON.
+    void Engine::start_body(ClientConn* c, bool forward) noexcept
+    {
+        ReqState& f = c->req.f;
+        f.body_in_rbuf = true;
+        f.body_scanned = json_media_type(f.head.content_type.in(c->rbuf)) &&
+                         client_dialect_of(c->rbuf) == Dialect::OpenAI;
+        if (f.body_scanned)
+        {
+            if (!c->req.scan) c->req.scan = std::make_unique<provider::BodyScan>();
+            c->req.scan->reset();
+        }
+        f.body_in = static_cast<uint32_t>(body_so_far(c).size());
+        if (forward)
+        {
+            f.body_streaming = f.body_streamed = true;
+            ++_stats.streamed_bodies;
+            ++_bodies_streaming;
+            return dispatch(c);
+        }
+        f.body_parked = true;
+        f.phase = Phase::Dispatched; // in flight, so the sweep holds it to the body deadline
+        c->ever_framed = true;
+        ++_stats.streamed_body_parked;
+        LB_DEBUG(ReqId{f.req_seq}, " body parked to its last byte on ", *c);
     }
 
     void Engine::stop_body(ClientConn* c) noexcept
@@ -101,46 +144,75 @@ namespace llmbridge::detail
     void Engine::pump_body(ClientConn* c) noexcept
     {
         const int64_t t = now_ns();
+        ReqState& f = c->req.f;
         // Late before these bytes came: they never go, so the venue never has the body whole.
-        if (t > body_deadline(c->req.f))
-            return body_timeout(c, _stats.streamed_body_timeouts, "streamed body too slow");
-        const bool after_t3 = c->req.f.ts_up_sent != 0;
+        if (t > body_deadline(f)) return body_timeout(c, _stats.streamed_body_timeouts, "streamed body too slow");
+        const bool after_t3 = f.ts_up_sent != 0;
         const std::string_view body = body_so_far(c);
-        c->req.f.body_in = static_cast<uint32_t>(body.size());
+        f.body_in = static_cast<uint32_t>(body.size());
         const bool last = body.size() == c->msg.body_len;
         size_t safe = body.size();
-        if (c->req.f.body_scanned)
+        if (f.body_scanned)
         {
-            if (c->req.scan->feed(body, last) == provider::BodyScan::Verdict::Refused) return refuse_body(c);
+            if (c->req.scan->feed(body, last) == provider::BodyScan::Verdict::Refused)
+                return refuse_body(c, c->req.scan->why());
             safe = c->req.scan->safe();
         }
-        if (last)
-        {
-            stop_body(c);
-            c->req.f.ts_body_end = t;
-            c->req.f.client_upload_ns = span_since(c->ts_first_byte, t);
-            // Setup holds the upload, as a held body's does, so subtracting it still works.
-            if (!c->req.f.client_conn_reused) c->req.f.client_conn_setup_ns = span_since(c->ts_accepted, t);
-            c->ts_first_byte = c->rbuf.size() > c->msg.total_len ? t : 0; // as open_request
-            if (_sink) (void)capture_model(c); // the facts only: every byte already passed
-        }
-        UpstreamConn* u = c->up;
-        if (u && safe > c->req.f.body_sent)
-        {
-            u->out.stage().append(body.substr(c->req.f.body_sent, safe - c->req.f.body_sent));
-            c->req.f.body_sent = static_cast<uint32_t>(safe);
-            // Unconnected, the connect's completion sends it; staged is not progress, sent is.
-            if (u->connected && !send_upstream(u)) return;
-        }
-        if (after_t3) c->req.f.body_work_ns += now_ns() - t;
+        if (last && !end_upload(c, t)) return;
+        // A head decision's last byte waits for its confirm (12c), which end_upload runs.
+        if (f.confirm_pending && safe == c->msg.body_len) --safe;
+        if (!forward_body(c, body, safe)) return;
+        if (after_t3) f.body_work_ns += now_ns() - t;
     }
 
-    // The body failed its scan after part of it went: stop, and reset the upstream so
-    // the provider holds a body short of its Content-Length and never runs it.
-    void Engine::refuse_body(ClientConn* c) noexcept
+    bool Engine::forward_body(ClientConn* c, std::string_view body, size_t safe) noexcept
+    {
+        UpstreamConn* u = c->up;
+        if (!u || safe <= c->req.f.body_sent) return true; // parked, or nothing new is safe
+        u->out.stage().append(body.substr(c->req.f.body_sent, safe - c->req.f.body_sent));
+        c->req.f.body_sent = static_cast<uint32_t>(safe);
+        // Unconnected, the connect's completion sends it; staged is not progress, sent is.
+        return !u->connected || send_upstream(u);
+    }
+
+    bool Engine::end_upload(ClientConn* c, int64_t t) noexcept
+    {
+        ReqState& f = c->req.f;
+        stop_body(c);
+        f.ts_body_end = t;
+        f.client_upload_ns = span_since(c->ts_first_byte, t);
+        // Setup holds the upload, as a held body's does, so subtracting it still works.
+        if (!f.client_conn_reused) f.client_conn_setup_ns = span_since(c->ts_accepted, t);
+        c->ts_first_byte = c->rbuf.size() > c->msg.total_len ? t : 0; // as open_request
+        if (!f.decided_on_head)
+        {
+            if (_sink) (void)capture_model(c); // the facts only: every byte already passed
+            return true;
+        }
+        // What a held body would have been refused for, before its last byte leaves.
+        if (const char* why = capture_model(c))
+        {
+            refuse_body(c, why);
+            return false;
+        }
+        return confirm_body(c, t);
+    }
+
+    // Whole now, and sent as a held body: the upload was the client's, so t0 is its last
+    // byte, and nothing done on an earlier attempt is this one's work.
+    void Engine::dispatch_whole(ClientConn* c, int64_t t) noexcept
+    {
+        c->req.f.body_parked = false;
+        c->req.f.ts_req_recvd = t;
+        c->req.f.body_work_ns = 0;
+        dispatch(c);
+    }
+
+    // The body failed a check after part of it may have gone: stop, and reset the upstream
+    // so the provider holds a body short of its Content-Length and never runs it.
+    void Engine::refuse_body(ClientConn* c, const char* why) noexcept
     {
         ++_stats.streamed_body_refusals;
-        const char* why = c->req.scan->why();
         LB_WARN(ReqId{c->req.f.req_seq}, " streamed body refused (", why, ") after ",
                 static_cast<uint64_t>(c->req.f.body_sent), " bytes went upstream; resetting it");
         cut_body(c);
@@ -164,7 +236,7 @@ namespace llmbridge::detail
         const size_t held = std::min(c->rbuf.size(), c->msg.total_len);
         c->req.discard += c->msg.total_len - held;
         c->rbuf.erase(0, held);
-        c->req.f.body_in_rbuf = false;
+        c->req.f.body_in_rbuf = c->req.f.body_parked = false;
     }
 
     void Engine::drop_discard(ClientConn* c) noexcept

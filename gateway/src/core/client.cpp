@@ -18,22 +18,26 @@
 namespace llmbridge::detail
 {
 
-    Decision Engine::policy_decision(ClientConn* c, const net::http::Message& m) noexcept
+    // Head, plus the model and two streaming flags and nothing else from the body. This
+    // is the line where "metadata only, no prompt text". All three were read by
+    // capture_model, which both backends run first when a policy exists, or, on the head
+    // of a body still arriving, by decide_on_head.
+    RequestFacts Engine::facts_of(const ClientConn* c, bool whole) const noexcept
     {
-        // Head, plus the model and two streaming flags and nothing else from the body.
-        // This is the line where "metadata only, no prompt text". All three were read
-        // by capture_model, which both backends run first when a policy exists.
-        const RequestFacts facts{std::string_view(c->rbuf.data(), m.header_len), m.body_len,
-                                 c->req.f.model.view(),
-                                 c->req.f.prefix_hash, c->req.f.req_seq, c->req.f.asked_stream, c->req.f.asked_usage};
+        return {std::string_view(c->rbuf.data(), c->msg.header_len), c->msg.body_len, c->req.f.model.view(),
+                c->req.f.prefix_hash, c->req.f.req_seq, c->req.f.asked_stream, c->req.f.asked_usage, whole};
+    }
 
-        Decision d = _policy->decide(facts);
-        if (d.allow)
-        {
-            c->req.f.policy_tag = d.tag; // handed back verbatim in FailureFacts
-            return d;
-        }
+    Decision Engine::policy_decision(ClientConn* c, bool whole) noexcept
+    {
+        const Decision d = _policy->decide(facts_of(c, whole));
+        if (!d.allow) return checked_refusal(c, d);
+        c->req.f.policy_tag = d.tag; // handed back verbatim in FailureFacts
+        return d;
+    }
 
+    Decision Engine::checked_refusal(const ClientConn* c, Decision d) noexcept
+    {
         // A status the responder cannot render would emit a misleading reply, so
         // substitute and say so loudly. The refusal still stands: fail closed.
         if (d.deny_status < 400 || d.deny_status > 599)
@@ -50,7 +54,7 @@ namespace llmbridge::detail
                     "); sending the generic one");
             d.message = nullptr;
         }
-        // Never log `facts`: the head carries the client's Authorization.
+        // Never log the facts: the head carries the client's Authorization.
         ++_stats.policy_denied;
         return d;
     }
@@ -59,7 +63,7 @@ namespace llmbridge::detail
     {
         if (c->req.discard) drop_discard(c);
         if (c->doomed) return;
-        if (c->req.f.body_streaming) pump_body(c);
+        if (c->req.f.body_streaming || c->req.f.body_parked) pump_body(c);
         else if (c->req.f.phase == Phase::Idle && !c->rbuf.empty()) try_frame(c);
         if (!c->doomed) gate_client_reads(c);
     }
@@ -107,36 +111,29 @@ namespace llmbridge::detail
         const auto st = net::http::parse_request(c->rbuf, m, HeadReader{c->rbuf, _strip_headers, facts});
         if (st == net::http::FrameStatus::NeedMore)
         {
-            if (m.total_len && !c->client_frame_want)
+            if (!m.total_len) return;
+            if (!c->client_frame_want)
             {
-                c->client_frame_want = m.total_len;
                 c->rbuf.reserve(m.total_len);
                 // No body byte yet: the client is waiting on us, not the network.
                 if (c->rbuf.size() <= m.header_len && facts.expect == 2) send_continue(c);
                 if (c->doomed) return; // the 100 found the client gone
-                // A body that needs no rewrite goes upstream as it arrives.
-                if (body_streams(c, m))
-                {
-                    c->client_frame_want = 0;
-                    open_request(c, m, facts, t0);
-                    if (_sink) sink_capture(c);
-                    c->upstream_slot = 0;
-                    c->req.f.body_streaming = c->req.f.body_in_rbuf = c->req.f.body_streamed = true;
-                    // An OpenAI client's JSON is checked as it passes; a file upload is not JSON.
-                    c->req.f.body_scanned = json_media_type(facts.content_type.in(c->rbuf)) &&
-                                            client_dialect_of(c->rbuf) == Dialect::OpenAI;
-                    if (c->req.f.body_scanned)
-                    {
-                        if (!c->req.scan) c->req.scan = std::make_unique<provider::BodyScan>();
-                        c->req.scan->reset();
-                    }
-                    ++_stats.streamed_bodies;
-                    ++_bodies_streaming;
-                    c->req.f.body_in = static_cast<uint32_t>(body_so_far(c).size());
-                    return dispatch(c);
-                }
             }
-            return;
+            c->client_frame_want = m.total_len; // held to its last byte, unless it goes now
+            // A body that needs no rewrite goes upstream as it arrives.
+            if (!body_streamable(c, m)) return;
+            if (_policy)
+            {
+                // A policy that decides on the head may want its leading bytes first (12c).
+                if (const size_t want = decide_want(m); c->rbuf.size() < want) c->client_frame_want = want;
+                else decide_on_head(c, m, facts, t0);
+                return;
+            }
+            c->client_frame_want = 0;
+            open_request(c, m, facts, t0);
+            if (_sink) sink_capture(c);
+            c->upstream_slot = 0;
+            return start_body(c, /*forward=*/true);
         }
         c->client_frame_want = 0;
         open_request(c, m, facts, t0);
@@ -153,29 +150,137 @@ namespace llmbridge::detail
         c->upstream_slot = 0;
         if (_policy)
         {
-            const Decision d = policy_decision(c, m);
+            const Decision d = policy_decision(c, /*whole=*/true);
             if (!d.allow) return error_respond(c, d.deny_status, d.reason, d.message);
-            // Out of range is the default: a venue that has left the table must not send
-            // the request somewhere arbitrary. Unless a key is named for that venue, which
-            // venue 0 would receive as its own.
-            if (d.upstream_index >= 0 && static_cast<size_t>(d.upstream_index) < _upstreams.size())
-                c->upstream_slot = d.upstream_index;
-            else if (d.upstream_index >= 0 && !d.credential_header.empty())
-                return error_respond(c, 500, "policy named a key for a venue past the table");
-            else if (d.upstream_index >= 0)
-                LB_WARN(ReqId{c->req.f.req_seq}, " policy chose upstream ",
-                        static_cast<int64_t>(d.upstream_index), " of ",
-                        static_cast<int64_t>(_upstreams.size()), "; using 0");
-            // Copied: the views die when decide() returns. Refused rather than cut, which
-            // would route to whatever model the prefix names.
-            if (!c->req.f.model_override.set(d.model) || !c->req.f.tier_override.set(d.service_tier))
-                return error_respond(c, 500, "policy override longer than the gateway holds");
-            // A name outside the family would be echoed by a byte-forward: refused, never guessed.
-            if (!d.credential_header.empty() && !key_header_ok(d.credential_header))
-                return error_respond(c, 400, kWhyKeyUnusable, refuse::kKeyHeaderUnusable);
-            c->req.f.key_header.set(d.credential_header);
+            if (!apply_decision(c, d)) return;
         }
         dispatch(c);
+    }
+
+    // The venue, the overrides and the key a decision names, at decide() or a confirm()
+    // that redoes the request.
+    bool Engine::apply_decision(ClientConn* c, const Decision& d) noexcept
+    {
+        // Out of range is the default: a venue that has left the table must not send the
+        // request somewhere arbitrary. Unless a key is named for that venue, which venue 0
+        // would receive as its own.
+        c->upstream_slot = 0;
+        if (d.upstream_index >= 0 && static_cast<size_t>(d.upstream_index) < _upstreams.size())
+            c->upstream_slot = d.upstream_index;
+        else if (d.upstream_index >= 0 && !d.credential_header.empty())
+            return error_respond(c, 500, "policy named a key for a venue past the table"), false;
+        else if (d.upstream_index >= 0)
+            LB_WARN(ReqId{c->req.f.req_seq}, " policy chose upstream ", static_cast<int64_t>(d.upstream_index),
+                    " of ", static_cast<int64_t>(_upstreams.size()), "; using 0");
+        // Copied: the views die when decide() returns. Refused rather than cut, which
+        // would route to whatever model the prefix names.
+        if (!c->req.f.model_override.set(d.model) || !c->req.f.tier_override.set(d.service_tier))
+            return error_respond(c, 500, "policy override longer than the gateway holds"), false;
+        // A name outside the family would be echoed by a byte-forward: refused, never guessed.
+        if (!d.credential_header.empty() && !key_header_ok(d.credential_header))
+            return error_respond(c, 400, kWhyKeyUnusable, refuse::kKeyHeaderUnusable), false;
+        c->req.f.key_header.set(d.credential_header);
+        c->req.f.policy_tag = d.tag;
+        return true;
+    }
+
+    size_t Engine::decide_want(const net::http::Message& m) const noexcept
+    {
+        return m.header_len + (_wants_prefix_hash ? std::min(m.body_len, kPrefixHashBytes) : 0);
+    }
+
+    // A large body's policy decision on its head (GATEWAY-INTERNALS.md 12c): refused at
+    // once, or admitted to stream or to park, its last byte withheld until confirm().
+    void Engine::decide_on_head(ClientConn* c, const net::http::Message& m, const HeadFacts& facts,
+                                int64_t t0) noexcept
+    {
+        c->client_frame_want = 0;
+        open_request(c, m, facts, t0);
+        if (_sink) sink_capture(c);
+        ReqState& f = c->req.f;
+        f.decided_on_head = f.confirm_pending = f.body_in_rbuf = true;
+        ++_stats.policy_head_decisions;
+        LB_DEBUG(ReqId{f.req_seq}, " ", request_line(c->rbuf), " on ", *c, " decided on its head");
+        // A model only once it has closed in the bytes so far, as capture_model bounds it;
+        // the hash over the bytes a held body's covers, which try_frame waited for.
+        const std::string_view body = body_so_far(c);
+        if (const std::string_view model = provider::model_of(body); model.size() <= sizeof f.model.b)
+            f.model.set(model);
+        if (_wants_prefix_hash) f.prefix_hash = prefix_hash_of(body.substr(0, std::min(m.body_len, kPrefixHashBytes)));
+        const Decision d = policy_decision(c, /*whole=*/false);
+        if (!d.allow)
+        {
+            // Nothing went anywhere: the rest of the body is read and dropped, and the
+            // connection carries the client's next request.
+            end_body_stream(c, nullptr);
+            return error_respond(c, d.deny_status, d.reason, d.message, /*keep=*/true);
+        }
+        if (!apply_decision(c, d)) return;
+        f.held = d.hold;
+        const bool as_is = f.model_override.empty() && f.tier_override.empty();
+        start_body(c, !d.hold && as_is && venue_streams(client_dialect_of(c->rbuf), c->upstream_slot));
+    }
+
+    // The decision in force, as confirm() is handed it: the venue serving now, never -1.
+    Decision Engine::decision_in_effect(const ClientConn* c) const noexcept
+    {
+        Decision d{};
+        d.allow = true;
+        d.upstream_index = c->upstream_slot;
+        d.model = c->req.f.model_override.view();
+        d.service_tier = c->req.f.tier_override.view();
+        d.reason = "";
+        d.tag = c->req.f.policy_tag;
+        d.credential_header = c->req.f.key_header.view();
+        d.hold = c->req.f.held;
+        return d;
+    }
+
+    // The whole body's facts against the decision taken on its head, before its last byte
+    // leaves: keep, refuse or redo (policy.hpp).
+    bool Engine::confirm_body(ClientConn* c, int64_t t) noexcept
+    {
+        ReqState& f = c->req.f;
+        f.confirm_pending = false;
+        const Decision d = _policy->confirm(facts_of(c, /*whole=*/true), decision_in_effect(c));
+        if (!d.allow)
+        {
+            f.confirm_outcome = ConfirmOutcome::Refused;
+            ++_stats.streamed_body_confirm_refusals;
+            const Decision r = checked_refusal(c, d);
+            LB_WARN(ReqId{f.req_seq}, " confirm refused (", r.reason, ") after ",
+                    static_cast<uint64_t>(f.body_sent), " bytes went upstream");
+            cut_body(c);
+            end_body_stream(c, nullptr);
+            error_respond(c, r.deny_status, r.reason, r.message);
+            return false;
+        }
+        // The venue apply_decision would pick: out of range is the first, unless a key is named.
+        const bool in_table = d.upstream_index >= 0 && static_cast<size_t>(d.upstream_index) < _upstreams.size();
+        const int slot = in_table ? d.upstream_index : (d.upstream_index >= 0 && !d.credential_header.empty() ? -1 : 0);
+        const bool same = slot == c->upstream_slot && d.model == f.model_override.view() &&
+                          d.service_tier == f.tier_override.view() && d.credential_header == f.key_header.view();
+        f.policy_tag = d.tag; // a tag alone changing is still a keep
+        if (same)
+        {
+            f.confirm_outcome = ConfirmOutcome::Kept;
+            if (!f.body_parked) return true;
+        }
+        else
+        {
+            // The venue holds part of a body it will never get the rest of: reset.
+            f.confirm_outcome = ConfirmOutcome::Redone;
+            if (c->up)
+            {
+                ++_stats.streamed_body_redone;
+                LB_WARN(ReqId{f.req_seq}, " confirm redid the request after ",
+                        static_cast<uint64_t>(f.body_sent), " bytes went upstream; resetting it");
+            }
+            cut_body(c);
+            if (!apply_decision(c, d)) return false;
+        }
+        dispatch_whole(c, t);
+        return false;
     }
 
     void Engine::open_request(ClientConn* c, const net::http::Message& m, const HeadFacts& f,
@@ -247,14 +352,16 @@ namespace llmbridge::detail
                 rewritten = _xlate;
                 c->req.f.asked_tier.set(had); // `had` points into rbuf, reused before the sink
             }
-            // A streamed body goes as far as it is known good, under the length declared.
+            // A streamed body goes as far as it is known good, under the length declared,
+            // and a head decision's last byte not before its confirm.
             std::string_view fwd = rewritten.empty() ? body : rewritten;
             if (c->req.f.body_streaming)
             {
                 if (c->req.f.body_scanned &&
                     c->req.scan->feed(body, body.size() == c->msg.body_len) == provider::BodyScan::Verdict::Refused)
-                    return refuse_body(c);
+                    return refuse_body(c, c->req.scan->why());
                 fwd = body.substr(0, c->req.f.body_scanned ? c->req.scan->safe() : body.size());
+                if (c->req.f.confirm_pending && fwd.size() == c->msg.body_len) fwd.remove_suffix(1);
                 c->req.f.body_sent = static_cast<uint32_t>(fwd.size());
             }
             if (const char* bad = build_forward(std::string_view(c->rbuf.data(), c->msg.header_len),
@@ -265,6 +372,7 @@ namespace llmbridge::detail
         }
 
         c->req.f.phase = Phase::Dispatched; // from here until a response byte, failover may redo it
+        c->req.f.body_parts = c->req.f.body_streaming;
         UpstreamConn* u = acquire_upstream(c->upstream_slot);
         if (!u)
         {
@@ -283,8 +391,8 @@ namespace llmbridge::detail
         // buffer back as the next scratch.
         u->out.stage().swap(_rebuild);
         // The original bytes, kept when a failover could use them: the rebuilt request
-        // is in this venue's dialect.
-        if (_policy && _upstreams.size() > 1 && c->req.saved.empty())
+        // is in this venue's dialect. A body kept in rbuf is resent from there.
+        if (_policy && _upstreams.size() > 1 && !c->req.f.body_in_rbuf && c->req.saved.empty())
         {
             const size_t extra = c->rbuf.size() - c->msg.total_len;
             c->req.saved.swap(c->rbuf);
@@ -315,7 +423,7 @@ namespace llmbridge::detail
         // with nothing owed, is no request: counting one wiped the real one's state.
         if (c->req.f.phase != Phase::Replying) return;
         // An error reply is counted in errors; its stamps are unset, so not in a histogram.
-        if (!c->close_after_resp)
+        if (!c->close_after_resp && !c->req.f.reply_kept)
         {
             const int64_t ts_resp_sent = now_ns(); // t6
             if (ts_resp_sent - _t_start >= _warmup_ns)
@@ -359,6 +467,7 @@ namespace llmbridge::detail
     {
         if (c->req.f.body_streaming && c->up) reset_venue(c->up);
         stop_body(c);
+        c->req.f.body_parked = false;
         UpstreamConn* u = unpair(c); // the other leg never keeps a pointer to a freed one
         _clients->remove(c);
         LB_DEBUG("close ", *c, " clients=", _clients->size());
@@ -395,8 +504,8 @@ namespace llmbridge::detail
         if (!upstream_failed(client, code, why)) error_respond(client, code, why);
     }
 
-    void Engine::error_respond(ClientConn* client, int code, const char* why,
-                                const char* detail) noexcept
+    void Engine::error_respond(ClientConn* client, int code, const char* why, const char* detail,
+                               bool keep) noexcept
     {
         if (!client || client->doomed) return;
         // A client-caused refusal is DEBUG; anything we or the provider caused is WARN.
@@ -414,9 +523,12 @@ namespace llmbridge::detail
         // We're replying to the client ourselves, so drop any in-flight upstream.
         if (client->req.f.body_streaming) cut_body(client);
         else if (UpstreamConn* u = unpair(client)) _ops->close(*u);
-        append_error(client->out.stage(), code, detail);
+        client->req.f.body_parked = false;
+        append_error(client->out.stage(), code, detail, keep && client->msg.keep_alive);
         client->req.f.phase = Phase::Replying;
-        client->close_after_resp = true; // closes once the reply flushes
+        // Closes once the reply flushes; kept, once the rest of the body is dropped.
+        client->req.f.reply_kept = keep;
+        client->close_after_resp = !keep;
         ++_stats.errors;
         respond(client);
     }

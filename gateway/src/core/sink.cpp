@@ -92,13 +92,15 @@ namespace llmbridge::detail
         // A longer name is left out, not cut: a prefix could name another model.
         if (top.model.size() <= sizeof c->req.f.model.b) c->req.f.model.set(top.model);
         if (_wants_prefix_hash && !body.empty())
-        {
-            const size_t n = body.size() < kPrefixHashBytes ? body.size() : kPrefixHashBytes;
-            // noexcept end to end and no allocation, so there is nothing to catch: the
-            // path is exception-free by construction
-            c->req.f.prefix_hash = net::Sha256::truncated(net::Sha256::hash(body.substr(0, n)));
-        }
+            c->req.f.prefix_hash = prefix_hash_of(body.substr(0, body.size() < kPrefixHashBytes ? body.size() : kPrefixHashBytes));
         return nullptr;
+    }
+
+    uint64_t Engine::prefix_hash_of(std::string_view lead) noexcept
+    {
+        // noexcept end to end and no allocation, so there is nothing to catch: the path
+        // is exception-free by construction
+        return net::Sha256::truncated(net::Sha256::hash(lead));
     }
 
     void Engine::sink_emit(ClientConn* c, int status, bool streamed) noexcept
@@ -130,7 +132,7 @@ namespace llmbridge::detail
         r.upstream_min_rtt_us = c->req.f.upstream_min_rtt_us;
         r.attempts = c->req.f.failover_attempts;
         r.streamed = streamed;
-        r.error_reply = !streamed && c->close_after_resp;
+        r.error_reply = !streamed && (c->close_after_resp || c->req.f.reply_kept);
         r.truncated = streamed && c->close_after_resp;
         r.translated = c->req.f.translate_body;
         r.backend = _active_backend;
@@ -163,6 +165,8 @@ namespace llmbridge::detail
         r.ts_body_sent = c->req.f.ts_body_sent;
         r.body_work_ns = c->req.f.body_work_ns;
         r.body_streamed = c->req.f.body_streamed;
+        r.decided_on_head = c->req.f.decided_on_head;
+        r.confirm_outcome = c->req.f.confirm_outcome;
         _sink->on_request(r);
     }
 

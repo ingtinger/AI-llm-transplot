@@ -64,7 +64,7 @@ namespace llmbridge::detail
         {
             if (i >= _clients->size()) continue;
             ClientConn* c = (*_clients)[i];
-            const bool busy = c->up != nullptr || c->req.f.streaming;
+            const bool busy = c->up != nullptr || c->req.f.streaming || c->req.f.body_parked;
             in_flight += busy;
             sweep_client(c, now, busy);
         }
@@ -114,7 +114,7 @@ namespace llmbridge::detail
             _ops->close(*c);
             return;
         }
-        if (c->req.f.body_streaming && now > body_deadline(c->req.f))
+        if ((c->req.f.body_streaming || c->req.f.body_parked) && now > body_deadline(c->req.f))
             return body_timeout(c, _stats.streamed_body_timeouts, "streamed body too slow");
         // A fresh connect that never became wire-ready. Separate from the idle timeout,
         // which starts at the request write, never on a socket still retrying SYNs.

@@ -34,11 +34,11 @@ namespace llmbridge
         FixedStr() noexcept {} // b[] stays unwritten: a reset stores only n
         char b[N];
         uint8_t n = 0;
-        /// Keeps at most N bytes; false when `v` did not fit.
+        /// Keeps at most N bytes; false when `v` did not fit. `v` may be this one's own view.
         bool set(std::string_view v) noexcept
         {
             n = static_cast<uint8_t>(v.size() < N ? v.size() : N);
-            if (n) std::memcpy(b, v.data(), n);
+            if (n) std::memmove(b, v.data(), n);
             return v.size() <= N;
         }
         [[nodiscard]] std::string_view view() const noexcept { return {b, n}; }
@@ -179,6 +179,17 @@ namespace llmbridge
         bool body_in_rbuf = false;
         bool body_scanned = false;
         bool body_streamed = false;
+        /// A policy that decides on the head (GATEWAY-INTERNALS.md 12c): decided before the
+        /// body was whole, its last byte withheld until confirm(), parked unsent in rbuf to
+        /// its last byte, the decision's hold, and what confirm made of it. `body_parts`:
+        /// the attempt went in parts, so a resend rebuilds it from rbuf.
+        bool decided_on_head = false;
+        bool confirm_pending = false;
+        bool body_parked = false;
+        bool held = false;
+        bool body_parts = false;
+        bool reply_kept = false; ///< our error reply keeps the connection; the rest is dropped
+        ConfirmOutcome confirm_outcome = ConfirmOutcome::None;
     };
     static_assert(std::is_trivially_copyable_v<ReqState>);
     static_assert(std::is_trivially_destructible_v<ReqState>);

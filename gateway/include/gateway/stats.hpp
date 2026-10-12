@@ -69,5 +69,12 @@ namespace llmbridge
         uint64_t streamed_body_capped = 0;
         /// Streamed bodies cut for arriving too slowly: --body-timeout or --body-min-rate.
         uint64_t streamed_body_timeouts = 0;
+        /// A policy that decides on the head (GATEWAY-INTERNALS.md 12c): requests decided
+        /// before their body was whole; bodies parked unsent to their last byte; bodies a
+        /// venue held part of when confirm() redid them; and confirm() refusals.
+        uint64_t policy_head_decisions = 0;
+        uint64_t streamed_body_parked = 0;
+        uint64_t streamed_body_redone = 0;
+        uint64_t streamed_body_confirm_refusals = 0;
     };
 } // namespace llmbridge

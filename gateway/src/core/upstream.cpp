@@ -153,17 +153,22 @@ namespace llmbridge::detail
         // request was translated for this dialect and carries its credential.
         UpstreamConn* uf = new_upstream(u->venue);
         if (!uf) return false;
-        // A streamed body was staged in pieces, so it is rebuilt from the client's buffer;
-        // never with a named key, since a policy's requests are not streamed (body_streams).
-        if (client->req.f.body_in_rbuf &&
-            build_forward(std::string_view(client->rbuf.data(), client->msg.header_len),
-                          client->msg.header_len, client->req.f.head, _strip_headers,
-                          upstream_of(u).host_hdr, upstream_of(u).base_path,
-                          body_so_far(client).substr(0, client->req.f.body_sent), uf->out.stage(),
-                          client->msg.body_len))
+        // A streamed body was staged in pieces, so it is rebuilt from the client's buffer,
+        // with the key a policy that decided on its head named, as dispatch sent it.
+        if (client->req.f.body_parts)
         {
-            delete uf;
-            return false;
+            const std::string_view head(client->rbuf.data(), client->msg.header_len);
+            NamedKey key;
+            if ((!client->req.f.key_header.empty() &&
+                 named_key(head, client->req.f.head, client->req.f.key_header.view(), upstream_of(u).dialect, key)) ||
+                build_forward(head, client->msg.header_len, client->req.f.head, _strip_headers,
+                              upstream_of(u).host_hdr, upstream_of(u).base_path,
+                              body_so_far(client).substr(0, client->req.f.body_sent), uf->out.stage(),
+                              client->msg.body_len, key))
+            {
+                delete uf;
+                return false;
+            }
         }
         uf->retried = true; // this request's one allowed retry is now spent
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -181,7 +186,7 @@ namespace llmbridge::detail
         client->req.f.upstream_ip = uf->up_addr.sin_addr.s_addr;
         client->req.f.ts_up_sent = client->req.f.ts_body_sent = 0; // this attempt's own send
         // Plaintext, re-pushed through the new session; a send still reading it gets a copy.
-        if (!client->req.f.body_in_rbuf) uf->out.stage() = u->out.take();
+        if (!client->req.f.body_parts) uf->out.stage() = u->out.take();
         _upconns->add(uf);
         ++_stats.upstream_conns_opened;
         ++_stats.upstream_retries;
