@@ -430,7 +430,7 @@ namespace llmbridge::provider
         {
             out.clear();
             bool ok = false;
-            const json::Value v = json::parse(openai_body, ok);
+            const json::Value v = parse_request_body(openai_body, ok);
             if (!ok) return false;
             RequestOut o{out};
             if (!messages_request(v, bedrock, o)) return false;

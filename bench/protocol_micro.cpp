@@ -225,7 +225,7 @@ namespace
                     if (!provider::openai_to_anthropic_request(body, out)) std::abort();
                 });
                 measure_ms("L translate+override, one parse " + tag, n, [&] {
-                    const provider::json::Value v = provider::json::parse(body, ok);
+                    const provider::json::Value v = provider::parse_request_body(body, ok); // as the gateway does
                     provider::RequestOut o{out, body, "claude-haiku-4-5"};
                     if (!ok || !provider::spec(provider::Venue::Anthropic).request(v, o)) std::abort();
                 });

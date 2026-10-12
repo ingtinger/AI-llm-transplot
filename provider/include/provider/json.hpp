@@ -25,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -47,6 +48,7 @@ namespace llmbridge::provider::json
     inline constexpr size_t kMaxNodes = size_t{1} << 20;
 
     inline Value parse(std::string_view text, bool& ok, Keys keys = Keys::Unique);
+    inline Value parse(std::string_view text, bool& ok, Keys keys, std::span<const std::string_view> opaque);
 
     namespace detail
     {
@@ -299,7 +301,7 @@ namespace llmbridge::provider::json
         [[nodiscard]] std::string_view num_or(std::string_view key, std::string_view def = "") const;
 
     private:
-        friend Value parse(std::string_view, bool&, Keys);
+        friend Value parse(std::string_view, bool&, Keys, std::span<const std::string_view>);
         // Set on the root only, and only by parse(). Every node below it points into
         // this arena, so the root outliving them is the whole contract of the DOM.
         detail::Arena* _arena = nullptr;
@@ -395,6 +397,7 @@ namespace llmbridge::provider::json
             std::vector<Value> values;
             std::vector<Member> members;
             std::vector<std::string_view> keys;
+            std::vector<std::string_view> opaque_keys;
             bool busy = false;
         };
 
@@ -417,6 +420,8 @@ namespace llmbridge::provider::json
             bool ok = true;
             size_t escapes = 0; // strings so far that held a backslash, keys or values
             int depth = 0; // current object/array nesting; bounded by kMaxDepth
+            std::span<const std::string_view> opaque{}; // member names kept as spans only
+            std::vector<std::string_view>* okeys = nullptr; // their objects' keys, a stack
 
             // Children are parsed onto these stacks and copied into the arena in one
             // exactly-sized run when the closing bracket arrives, because the count is
@@ -435,22 +440,21 @@ namespace llmbridge::provider::json
             // lands on a bit already set and a fresh key rarely does, so the exact
             // check runs on few objects. Done at the close, over keys already in
             // cache, because state kept live across the recursion cost more.
-            [[nodiscard]] bool keys_fresh(size_t mark, bool escaped)
+            template <class KeyAt>
+            [[nodiscard]] bool keys_fresh(KeyAt key_at, size_t n, bool escaped)
             {
-                const Member* m = mstack.data() + mark;
-                const size_t n = mstack.size() - mark;
                 if (n < 2) return true;
-                if (escaped) return keys_unique(mark);
+                if (escaped) return keys_unique(key_at, n);
                 uint64_t seen = 0;
                 for (size_t k = 0; k < n; ++k)
                 {
-                    const std::string_view key = m[k].key;
+                    const std::string_view key = key_at(k);
                     size_t h = key.size() * 7;
                     if (!key.empty())
                         h += static_cast<unsigned char>(key.front()) * 3u +
                              static_cast<unsigned char>(key.back());
                     const uint64_t bit = uint64_t{1} << (h & 63);
-                    if (seen & bit) return keys_unique(mark);
+                    if (seen & bit) return keys_unique(key_at, n);
                     seen |= bit;
                 }
                 return true;
@@ -458,18 +462,17 @@ namespace llmbridge::provider::json
 
             // Exact: unescaped only when a key carries a backslash, which a real
             // client almost never sends; pairwise while small, sorted past that.
-            [[gnu::noinline]] bool keys_unique(size_t mark)
+            template <class KeyAt>
+            [[gnu::noinline]] bool keys_unique(KeyAt key_at, size_t n)
             {
-                const Member* m = mstack.data() + mark;
-                const size_t n = mstack.size() - mark;
                 bool escaped = false;
                 for (size_t k = 0; k < n; ++k)
-                    escaped = escaped || m[k].key.find('\\') != std::string_view::npos;
+                    escaped = escaped || key_at(k).find('\\') != std::string_view::npos;
                 if (escaped)
                 {
                     std::vector<std::string> u;
                     u.reserve(n);
-                    for (size_t k = 0; k < n; ++k) u.push_back(unescape_string(m[k].key));
+                    for (size_t k = 0; k < n; ++k) u.push_back(unescape_string(key_at(k)));
                     std::sort(u.begin(), u.end());
                     return std::adjacent_find(u.begin(), u.end()) == u.end();
                 }
@@ -477,11 +480,11 @@ namespace llmbridge::provider::json
                 {
                     for (size_t a = 1; a < n; ++a)
                         for (size_t b = 0; b < a; ++b)
-                            if (m[a].key == m[b].key) return false;
+                            if (key_at(a) == key_at(b)) return false;
                     return true;
                 }
                 kbuf.clear();
-                for (size_t k = 0; k < n; ++k) kbuf.push_back(m[k].key);
+                for (size_t k = 0; k < n; ++k) kbuf.push_back(key_at(k));
                 std::sort(kbuf.begin(), kbuf.end());
                 return std::adjacent_find(kbuf.begin(), kbuf.end()) == kbuf.end();
             }
@@ -562,6 +565,101 @@ namespace llmbridge::provider::json
                 return s.substr(start);
             }
 
+            bool is_opaque(std::string_view key) const noexcept
+            {
+                for (const std::string_view o : opaque)
+                    if (key == o) return true;
+                return false;
+            }
+
+            // An opaque member's object or array: checked as parse_value() checks it,
+            // and kept as its type and span, with no children built.
+            Value parse_opaque()
+            {
+                ws();
+                if (i >= s.size() || (s[i] != '{' && s[i] != '[')) return parse_value();
+                const size_t start = i;
+                Value v;
+                v.type = s[i] == '{' ? Value::Type::Object : Value::Type::Array;
+                skip_value();
+                v.sv = s.substr(start, i - start);
+                return v;
+            }
+
+            void skip_value()
+            {
+                if (++nodes > kMaxNodes) { ok = false; return; }
+                ws();
+                if (i >= s.size()) { ok = false; return; }
+                const char c = s[i];
+                if (c == '"') { (void)parse_string(); return; }
+                if (c != '{' && c != '[') { (void)parse_value_scalar(c); return; }
+                if (depth >= kMaxDepth) { ok = false; return; }
+                ++depth;
+                if (c == '{') skip_object();
+                else skip_array();
+                --depth;
+            }
+
+            Value parse_value_scalar(char c)
+            {
+                if (c == 't' || c == 'f') return parse_bool();
+                if (c == 'n')
+                {
+                    if (s.compare(i, 4, "null") == 0) i += 4;
+                    else ok = false;
+                    return Value{}; // Null
+                }
+                return parse_number();
+            }
+
+            void skip_array()
+            {
+                ++i; // [
+                ws();
+                if (i < s.size() && s[i] == ']') { ++i; return; }
+                while (ok)
+                {
+                    skip_value();
+                    ws();
+                    if (i < s.size() && s[i] == ',') { ++i; continue; }
+                    if (i < s.size() && s[i] == ']') { ++i; return; }
+                    ok = false;
+                }
+            }
+
+            void skip_object()
+            {
+                ++i; // {
+                ws();
+                if (i < s.size() && s[i] == '}') { ++i; return; }
+                std::vector<std::string_view>& ks = *okeys;
+                const size_t mark = ks.size();
+                const size_t escapes_before = escapes;
+                while (ok)
+                {
+                    ws();
+                    if (i >= s.size() || s[i] != '"') break;
+                    ks.push_back(parse_string());
+                    ws();
+                    if (i >= s.size() || s[i] != ':') break;
+                    ++i; // :
+                    skip_value();
+                    ws();
+                    if (i < s.size() && s[i] == ',') { ++i; continue; }
+                    if (i >= s.size() || s[i] != '}') break;
+                    ++i;
+                    const std::string_view* k = ks.data() + mark;
+                    if (keys == Keys::Unique &&
+                        !keys_fresh([k](size_t j) { return k[j]; }, ks.size() - mark, escapes != escapes_before))
+                        ok = false;
+                    ks.resize(mark);
+                    return;
+                }
+                ok = false;
+                ks.resize(mark);
+            }
+
             Value parse_value()
             {
                 if (++nodes > kMaxNodes) { ok = false; return {}; }
@@ -579,14 +677,7 @@ namespace llmbridge::provider::json
                     v.sv = s.substr(start, i - start); // includes the braces/brackets
                     return v;
                 }
-                if (c == 't' || c == 'f') return parse_bool();
-                if (c == 'n')
-                {
-                    if (s.compare(i, 4, "null") == 0) i += 4;
-                    else ok = false;
-                    return Value{}; // Null
-                }
-                return parse_number();
+                return parse_value_scalar(c);
             }
 
             Value parse_bool()
@@ -679,13 +770,16 @@ namespace llmbridge::provider::json
                     ws();
                     if (i >= s.size() || s[i] != ':') { ok = false; v.obj = commit_members(mark); return v; }
                     ++i; // :
-                    mstack.push_back(Member{key, parse_value()});
+                    mstack.push_back(Member{key, is_opaque(key) ? parse_opaque() : parse_value()});
                     ws();
                     if (i < s.size() && s[i] == ',') { ++i; continue; }
                     if (i < s.size() && s[i] == '}')
                     {
                         ++i;
-                        if (keys == Keys::Unique && !keys_fresh(mark, escapes != escapes_before))
+                        const Member* m = mstack.data() + mark;
+                        if (keys == Keys::Unique &&
+                            !keys_fresh([m](size_t k) { return m[k].key; }, mstack.size() - mark,
+                                        escapes != escapes_before))
                             ok = false;
                         v.obj = commit_members(mark);
                         return v;
@@ -709,6 +803,16 @@ namespace llmbridge::provider::json
     /// whatever was parsed so far (callers should check ok).
     inline Value parse(std::string_view text, bool& ok, Keys keys)
     {
+        return parse(text, ok, keys, {});
+    }
+
+    /// As parse(), except that the object or array value of a member named in
+    /// `opaque`, at any depth, is checked as parse() checks it (syntax, nesting,
+    /// kMaxNodes, repeated keys) but not built: its Value has the type and the span
+    /// (`sv`) and no children. For a reader that forwards such a value byte for byte,
+    /// such as a tool's `parameters` schema.
+    inline Value parse(std::string_view text, bool& ok, Keys keys, std::span<const std::string_view> opaque)
+    {
         // The arena is handed to the root even when the parse fails, because a failed
         // parse still returns whatever it built and those nodes live in here.
         ++detail::parse_count();
@@ -717,12 +821,14 @@ namespace llmbridge::provider::json
         const bool reentrant = sc.busy;
         std::vector<Value> own_values;
         std::vector<Member> own_members;
-        std::vector<std::string_view> own_keys;
+        std::vector<std::string_view> own_keys, own_opaque_keys;
         sc.busy = true;
         detail::Parser p{text, *arena,
                          reentrant ? own_values : sc.values,
                          reentrant ? own_members : sc.members,
                          reentrant ? own_keys : sc.keys, keys};
+        p.opaque = opaque;
+        p.okeys = reentrant ? &own_opaque_keys : &sc.opaque_keys;
         Value v = p.parse_value();
         p.ws();
         ok = p.ok && p.i == text.size();
@@ -733,11 +839,14 @@ namespace llmbridge::provider::json
             sc.values.clear();
             sc.members.clear();
             sc.keys.clear();
+            sc.opaque_keys.clear();
             const size_t keep = detail::retain_bytes().load(std::memory_order_relaxed);
             if (sc.values.capacity() * sizeof(Value) > keep) std::vector<Value>().swap(sc.values);
             if (sc.members.capacity() * sizeof(Member) > keep) std::vector<Member>().swap(sc.members);
             if (sc.keys.capacity() * sizeof(std::string_view) > keep)
                 std::vector<std::string_view>().swap(sc.keys);
+            if (sc.opaque_keys.capacity() * sizeof(std::string_view) > keep)
+                std::vector<std::string_view>().swap(sc.opaque_keys);
             sc.busy = false;
         }
         v._arena = arena;

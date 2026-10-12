@@ -49,6 +49,16 @@ namespace llmbridge::provider
         bool include_usage = false;  ///< `stream_options.include_usage`, as read
     };
 
+    /// Request members a translator forwards byte for byte and never reads into (a
+    /// tool's `parameters` schema), so a body is parsed without building them.
+    inline constexpr std::string_view kOpaqueRequestMembers[] = {"parameters"};
+
+    /// The client's OpenAI body, parsed for a request translator.
+    inline json::Value parse_request_body(std::string_view body, bool& ok)
+    {
+        return json::parse(body, ok, json::Keys::Unique, kOpaqueRequestMembers);
+    }
+
     struct FinishRule
     {
         std::string_view from;
