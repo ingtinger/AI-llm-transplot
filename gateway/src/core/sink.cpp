@@ -167,6 +167,7 @@ namespace llmbridge::detail
         r.body_streamed = c->req.f.body_streamed;
         r.decided_on_head = c->req.f.decided_on_head;
         r.confirm_outcome = c->req.f.confirm_outcome;
+        r.model_substituted = c->req.f.model_substituted;
         _sink->on_request(r);
     }
 

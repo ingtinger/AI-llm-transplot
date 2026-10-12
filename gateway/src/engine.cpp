@@ -244,7 +244,9 @@ namespace llmbridge::detail
         if (_stats.policy_head_decisions > 0)
             os << "policy_head_decisions=" << _stats.policy_head_decisions
                << " parked=" << _stats.streamed_body_parked << " redone=" << _stats.streamed_body_redone
-               << " confirm_refusals=" << _stats.streamed_body_confirm_refusals << "\n";
+               << " confirm_refusals=" << _stats.streamed_body_confirm_refusals
+               << " model_substituted=" << _stats.streamed_model_substituted
+               << " model_padded=" << _stats.streamed_model_padded << "\n";
         std::fputs(os.str().c_str(), out);
     }
 

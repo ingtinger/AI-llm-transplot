@@ -25,7 +25,8 @@ namespace llmbridge::detail
     RequestFacts Engine::facts_of(const ClientConn* c, bool whole) const noexcept
     {
         return {std::string_view(c->rbuf.data(), c->msg.header_len), c->msg.body_len, c->req.f.model.view(),
-                c->req.f.prefix_hash, c->req.f.req_seq, c->req.f.asked_stream, c->req.f.asked_usage, whole};
+                c->req.f.prefix_hash, c->req.f.req_seq, c->req.f.asked_stream, c->req.f.asked_usage, whole,
+                whole && c->req.f.splice && splice_hit(c)};
     }
 
     Decision Engine::policy_decision(ClientConn* c, bool whole) noexcept
@@ -176,6 +177,11 @@ namespace llmbridge::detail
         // would route to whatever model the prefix names.
         if (!c->req.f.model_override.set(d.model) || !c->req.f.tier_override.set(d.service_tier))
             return error_respond(c, 500, "policy override longer than the gateway holds"), false;
+        // Spliced into a stream unescaped, its length declared ahead: refused, never fixed up.
+        if (!substitution_ok(d.substitute_model, d.substitute_for))
+            return error_respond(c, 500, "policy model substitution unusable"), false;
+        c->req.f.subst_model.set(d.substitute_model);
+        c->req.f.subst_for.set(d.substitute_for);
         // A name outside the family would be echoed by a byte-forward: refused, never guessed.
         if (!d.credential_header.empty() && !key_header_ok(d.credential_header))
             return error_respond(c, 400, kWhyKeyUnusable, refuse::kKeyHeaderUnusable), false;
@@ -233,6 +239,8 @@ namespace llmbridge::detail
         d.tag = c->req.f.policy_tag;
         d.credential_header = c->req.f.key_header.view();
         d.hold = c->req.f.held;
+        d.substitute_model = c->req.f.subst_model.view();
+        d.substitute_for = c->req.f.subst_for.view();
         return d;
     }
 
@@ -242,7 +250,8 @@ namespace llmbridge::detail
     {
         ReqState& f = c->req.f;
         f.confirm_pending = false;
-        const Decision d = _policy->confirm(facts_of(c, /*whole=*/true), decision_in_effect(c));
+        const RequestFacts whole = facts_of(c, /*whole=*/true);
+        const Decision d = _policy->confirm(whole, decision_in_effect(c));
         if (!d.allow)
         {
             f.confirm_outcome = ConfirmOutcome::Refused;
@@ -258,12 +267,27 @@ namespace llmbridge::detail
         // The venue apply_decision would pick: out of range is the first, unless a key is named.
         const bool in_table = d.upstream_index >= 0 && static_cast<size_t>(d.upstream_index) < _upstreams.size();
         const int slot = in_table ? d.upstream_index : (d.upstream_index >= 0 && !d.credential_header.empty() ? -1 : 0);
-        const bool same = slot == c->upstream_slot && d.model == f.model_override.view() &&
+        // The model the venue gets, as an override or a substitution: either spelling of the
+        // same one is a keep, so a splice already done stands (12d). In force, a parked body's
+        // is still to be rewritten; a streamed one's went spliced or as it was.
+        const auto served = [&](std::string_view model, std::string_view sub, std::string_view sub_for) {
+            return !model.empty() ? model : !sub.empty() && f.model.view() == sub_for ? sub : std::string_view{};
+        };
+        std::string_view now = f.model_override.view();
+        if (f.splice) now = whole.model_substituted ? f.subst_model.view() : std::string_view{};
+        else if (f.body_parked) now = served(now, f.subst_model.view(), f.subst_for.view());
+        const bool same = slot == c->upstream_slot && served(d.model, d.substitute_model, d.substitute_for) == now &&
                           d.service_tier == f.tier_override.view() && d.credential_header == f.key_header.view();
         f.policy_tag = d.tag; // a tag alone changing is still a keep
         if (same)
         {
             f.confirm_outcome = ConfirmOutcome::Kept;
+            if (f.splice)
+            {
+                f.model_substituted = whole.model_substituted;
+                if (whole.model_substituted) ++_stats.streamed_model_substituted;
+                else if (f.subst_model.n > f.subst_for.n) ++_stats.streamed_model_padded;
+            }
             if (!f.body_parked) return true;
         }
         else
@@ -308,6 +332,7 @@ namespace llmbridge::detail
         // Resolved per attempt: a failover may land on a venue of another dialect. The
         // client dialect is read off the request line, back in rbuf for a failover.
         const Upstream& up = upstream_of(c);
+        if (!c->req.f.body_streaming) resolve_substitution(c);
         {
             const TranslationPlan plan = resolve_dialect(c, up);
             if (!plan.ok) return error_respond(c, 400, plan.why);
@@ -354,20 +379,23 @@ namespace llmbridge::detail
             }
             // A streamed body goes as far as it is known good, under the length declared,
             // and a head decision's last byte not before its confirm.
-            std::string_view fwd = rewritten.empty() ? body : rewritten;
             if (c->req.f.body_streaming)
             {
                 if (c->req.f.body_scanned &&
                     c->req.scan->feed(body, body.size() == c->msg.body_len) == provider::BodyScan::Verdict::Refused)
                     return refuse_body(c, c->req.scan->why());
-                fwd = body.substr(0, c->req.f.body_scanned ? c->req.scan->safe() : body.size());
-                if (c->req.f.confirm_pending && fwd.size() == c->msg.body_len) fwd.remove_suffix(1);
-                c->req.f.body_sent = static_cast<uint32_t>(fwd.size());
+                size_t safe = c->req.f.body_scanned ? c->req.scan->safe() : body.size();
+                if (c->req.f.confirm_pending && safe == c->msg.body_len) --safe;
+                c->req.f.body_sent = static_cast<uint32_t>(safe);
+                // A substitution needs the model tracked from the first byte (12d).
+                c->req.f.splice = c->req.f.subst_tracked && !c->req.f.subst_model.empty();
+                if (const char* bad = forward_parts(c, up, key, _rebuild)) return error_respond(c, 400, bad);
             }
-            if (const char* bad = build_forward(std::string_view(c->rbuf.data(), c->msg.header_len),
-                                                c->msg.header_len, c->req.f.head, _strip_headers,
-                                                up.host_hdr, up.base_path, fwd, _rebuild,
-                                                rewritten.empty() ? c->msg.body_len : rewritten.size(), key))
+            else if (const char* bad = build_forward(std::string_view(c->rbuf.data(), c->msg.header_len),
+                                                     c->msg.header_len, c->req.f.head, _strip_headers,
+                                                     up.host_hdr, up.base_path, rewritten.empty() ? body : rewritten,
+                                                     _rebuild, rewritten.empty() ? c->msg.body_len : rewritten.size(),
+                                                     key))
                 return error_respond(c, 400, bad);
         }
 

@@ -190,6 +190,15 @@ namespace llmbridge
         bool body_parts = false;
         bool reply_kept = false; ///< our error reply keeps the connection; the rest is dropped
         ConfirmOutcome confirm_outcome = ConfirmOutcome::None;
+        /// A conditional model substitution (GATEWAY-INTERNALS.md 12d), the decision's or the
+        /// retry's. `subst_tracked`: BodyScan has tracked the model from the first byte, so a
+        /// streamed attempt can splice; `splice`: this attempt does; `model_substituted`: the
+        /// venue got the replacement, spliced or rewritten whole.
+        FixedStr<kMaxSubstituteModel> subst_model;
+        FixedStr<kMaxSubstituteFor> subst_for;
+        bool subst_tracked = false;
+        bool splice = false;
+        bool model_substituted = false;
     };
     static_assert(std::is_trivially_copyable_v<ReqState>);
     static_assert(std::is_trivially_destructible_v<ReqState>);

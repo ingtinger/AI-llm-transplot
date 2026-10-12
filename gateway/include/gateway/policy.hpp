@@ -34,6 +34,11 @@ namespace llmbridge
         /// `stream` and `include_usage` are false; `prefix_hash` is over the same bytes as
         /// a held body's, the gateway waiting for them. confirm() gets the whole body's.
         bool body_whole = true;
+        /// At confirm() only: the body is streaming to the venue with its top-level `model`,
+        /// the plain string Decision::substitute_for (`model` above), already replaced by
+        /// Decision::substitute_model. The decision in force has been carried out: returning
+        /// it keeps the request, with no redo. False for a parked body, rewritten after.
+        bool model_substituted = false;
     };
 
     inline constexpr size_t kMaxDenyMessage = 256;
@@ -51,6 +56,25 @@ namespace llmbridge
                 return false;
         }
         return n > 0;
+    }
+
+    inline constexpr size_t kMaxSubstituteModel = 255;
+    inline constexpr size_t kMaxSubstituteFor = 64;
+
+    /// The rule for Decision::substitute_model (at most kMaxSubstituteModel bytes) and
+    /// Decision::substitute_for (kMaxSubstituteFor), public so a policy can static_assert its
+    /// own: the gateway writes either between quotes in a JSON body unescaped, and declares
+    /// a streamed body's length from their sizes, so each is 1 or more bytes of printable
+    /// ASCII with no `"` or `\`.
+    [[nodiscard]] constexpr bool substitute_ok(std::string_view m, size_t max) noexcept
+    {
+        if (m.empty() || m.size() > max) return false;
+        for (const char ch : m)
+        {
+            const auto c = static_cast<unsigned char>(ch);
+            if (c < 0x20 || c > 0x7E || c == '"' || c == '\\') return false;
+        }
+        return true;
     }
 
     /// Headers holding provider keys: no name with this prefix, in any case, goes upstream.
@@ -107,6 +131,16 @@ namespace llmbridge
         /// A decision on the head only: allowed, but nothing goes upstream before the
         /// body's last byte. Ignored on a whole body and from confirm().
         bool hold = false;
+
+        /// A conditional model substitution, the one a head decision can make without the
+        /// model: when the body's top-level `model` is the plain JSON string `substitute_for`
+        /// (its raw bytes, no escape), it goes as `substitute_model` instead; any other model,
+        /// or none, goes as the client sent it. Both or neither, each substitute_ok (else a
+        /// 500); `model` set wins over it. On a body streamed as it arrives the gateway
+        /// splices it into the stream, so the body need not park: GATEWAY-INTERNALS.md 12d.
+        /// Copied, like `model`. kottos sets `"auto"` and the model it routes "auto" to.
+        std::string_view substitute_model{};
+        std::string_view substitute_for{};
     };
 
     /// A venue did not answer (refused connect, failed write, EOF before the response, idle
@@ -133,6 +167,11 @@ namespace llmbridge
         /// As Decision::credential_header, for the venue named here. Left empty after any
         /// attempt that named one, the decision or a retry, the request is not retried.
         std::string_view credential_header{};
+        /// As Decision's, for the new venue; empty substitutes nothing. On a body still
+        /// streaming it is spliced only when the head decision named one too (the gateway
+        /// then tracked the model from the first byte); else the body parks, as for `model`.
+        std::string_view substitute_model{};
+        std::string_view substitute_for{};
     };
 
     /// Non-owning, fixed at Gateway construction, called on its loop thread once per framed
@@ -165,7 +204,9 @@ namespace llmbridge
         /// the body, short of its Content-Length, and the client gets its status and
         /// message. Any other allowed decision redoes the request: the venue is reset and
         /// the whole body goes as a held one under the new venue, model, service_tier,
-        /// credential_header and tag. A change of tag alone is a keep, the tag updated.
+        /// credential_header and tag. A change of tag alone is a keep, the tag updated, and so
+        /// is a decision that sends the venue the same model the one in force does, as a
+        /// substitution or an override (`whole.model_substituted` says the splice is done).
         /// The request was counted at decide(): do not count it again here.
         virtual Decision confirm(const RequestFacts& whole, const Decision& early) noexcept
         {
