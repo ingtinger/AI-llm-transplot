@@ -11532,6 +11532,33 @@ TEST_P(ProxyKeyHeader, AFailoverMayNameAKeyAfterAnUnnamedDecision)
     b.stop();
 }
 
+// Once a retry has named a key, the next retry must name one too: the rule is any earlier
+// attempt, not only the decision. Unnamed, the third venue would get the client's own key.
+TEST_P(ProxyKeyHeader, AfterANamedRetryAnUnnamedOneGivesUp)
+{
+    TestBackend a, b, c;
+    a.set_response(venue_reply(UpstreamDialect::OpenAI));
+    a.set_close_unanswered(true);
+    b.set_response(venue_reply(UpstreamDialect::OpenAI));
+    b.set_close_unanswered(true);
+    c.set_response(venue_reply(UpstreamDialect::OpenAI));
+    for (TestBackend* t : {&a, &b, &c}) t->start();
+    KeyedPolicy pol({{0, nullptr}}, {{1, "x-kottos-key-bravo"}, {2, nullptr}});
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", c.port(), false, "", UpstreamDialect::OpenAI, ""}},
+          &pol);
+    const std::string resp = exchange(openai_request_hdrs(
+        "hi", "Authorization: Bearer sk-AUTH-FOR-A\r\nx-kottos-key-bravo: KEY-BRAVO\r\n"));
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 502) << resp;
+    EXPECT_EQ(pol.failures.load(), 2);
+    EXPECT_EQ(a.requests_seen(), 1);
+    EXPECT_TRUE(only_the_named_key(b.last_request(), "KEY-BRAVO"));
+    EXPECT_EQ(c.requests_seen(), 0) << c.last_request();
+    for (TestBackend* t : {&a, &b, &c}) t->stop();
+}
+
 // ── What a relayed response keeps, and what a forwarded request drops ─────────────
 
 class ProxyRelay : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend>

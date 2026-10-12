@@ -290,7 +290,8 @@ TEST(AuthHeaders, StaysWithinAnOrderOfMagnitudeOfOneWalk)
     EXPECT_LT(ns_per_call, 2000.0) << "ns/call=" << ns_per_call;
 }
 
-// The same bound with a key named: it is read in the one walk, not a second.
+// The same bound with a key named: the named path costs about what the unnamed one does.
+// It cannot see a second walk; TheNamedKeyIsReadFromTheFramingWalkAlone does.
 TEST(KeyHeader, ANamedKeyStaysWithinTheSameBound)
 {
     const std::vector<std::string> strip;

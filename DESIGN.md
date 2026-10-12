@@ -293,17 +293,20 @@ continuously fuzzed:
   - **One walk of a request head.** `parse_request` takes a visitor, and the gateway's
     (`HeadReader`) reads the credentials (`Authorization`, `x-api-key`, `api-key`,
     `x-goog-api-key`, `anthropic-version`; the first of each, a stripped one unseen),
-    `Expect` and every `Connection` value in the framing walk, as offsets into the
-    head. The translated request is written from them straight into the scratch; the
-    Bearer scheme matches in any case.
+    up to eight `x-kottos-key-*` lines a policy could name, stripped or not ("Naming
+    the key for a venue"), `Expect` and every `Connection` value in the framing walk,
+    as offsets into the head. The translated request is written from them straight
+    into the scratch; the Bearer scheme matches in any case.
   - **What a byte-forward drops.** The hop-by-hop headers (`Connection`, `Keep-Alive`,
     `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`) and any header a `Connection` line
     names belong to the client's hop; forwarded, `Connection: close` kept the venue's
     connection out of the pool and `Upgrade` invited a 101 the gateway cannot relay.
-    `Host`, `Content-Length`, `Expect` and `Accept-Encoding` are dropped too, and an
-    HTTP/1.0 request line goes as HTTP/1.1. Whether the venue's connection is pooled
-    is the venue's response alone. A head with more than four `Connection` lines is
-    refused rather than forwarded with a listed header kept.
+    `Host`, `Content-Length`, `Expect` and `Accept-Encoding` are dropped too, every
+    `x-kottos-key-*` header in any case, and with a key named the client's
+    `Authorization`, `x-api-key`, `api-key` and `x-goog-api-key` ("Naming the key for
+    a venue"); an HTTP/1.0 request line goes as HTTP/1.1. Whether the venue's
+    connection is pooled is the venue's response alone. A head with more than four
+    `Connection` lines is refused rather than forwarded with a listed header kept.
   - **What a relayed response keeps** (`net/http_write.hpp`). A reply the gateway
     re-frames (a translated provider error, a chunked byte-forward, a stream's head)
     keeps the upstream's `Retry-After`, `retry-after-ms`, rate-limit headers
@@ -611,11 +614,13 @@ A request may carry one provider key per `x-kottos-key-<domain>` header, so one 
 list venues that take different keys. The policy names the header holding the key for
 the venue it picked, and a failover names the next venue's in
 `Retry::credential_header`. The value goes out as the venue's own key header, by its
-`VenueSpec` auth kind: `x-api-key` for Anthropic (with the client's `anthropic-version`,
-or 2023-06-01), `Authorization: Bearer` for OpenAI-compatible venues and Cohere,
-`x-goog-api-key` for Gemini, `api-key` for Azure. It is the only credential the venue
-receives: a byte-forward drops the client's `Authorization`, `x-api-key`,
-`x-goog-api-key` and `api-key`.
+`VenueSpec` auth kind: `x-api-key` for Anthropic, `Authorization: Bearer` for
+OpenAI-compatible venues and Cohere, `x-goog-api-key` for Gemini, `api-key` for Azure.
+A request translated for Anthropic carries the client's `anthropic-version`, or
+2023-06-01; a byte-forward keeps the client's head, so its `anthropic-version` goes as
+sent, and none is added. The named key is the only credential the venue receives: a
+byte-forward drops the client's `Authorization`, `x-api-key`, `x-goog-api-key` and
+`api-key`.
 
 The name is not known while the head is framed, so the framing walk records every family
 line a policy could name (`key_header_ok`) with its trimmed value, as offsets into the
@@ -635,9 +640,9 @@ when the venue is Bedrock, which signs with a key pair and has no header for a b
 key. A decision naming a key with an index past the end of the table gets a 500, before
 any upstream is contacted. Unnamed, such an index means the first venue; named, the
 first venue would receive a key meant for another provider as its own. -1, the default,
-means the first venue either way. A failover that names no header after a decision that
-named one gives up, and the client sees the failure; one that names a header the client
-never sent gets the 400.
+means the first venue either way. A failover that names no header after any earlier
+attempt that named one, the decision or a retry, gives up, and the client sees the
+failure; one that names a header the client never sent gets the 400.
 
 The family itself never leaves. Every header whose name starts with `x-kottos-key-`, in
 any case, is dropped from every byte-forwarded request, with or without a policy: at

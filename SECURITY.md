@@ -123,10 +123,12 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   the provider.
 - **Provider keys in the `x-kottos-key-` family never leave as sent.** No header with
   that prefix, in any case, reaches an upstream on any path, with or without a policy,
-  and a sink cannot capture one. A key a policy names (`Decision::credential_header`)
+  and a sink cannot capture one, nor any credential header however its name is spelt
+  (`Authorization:` included). A key a policy names (`Decision::credential_header`)
   goes out as the venue's own key header and is the only credential it receives; one
   that is absent, repeated or malformed is a `400` before any upstream is contacted,
-  never a fallback to `Authorization`, and a failover carries the next venue's key,
+  never a fallback to `Authorization`; one named for a venue past the gateway's table is
+  a `500`, never sent to the first venue; and a failover carries the next venue's key,
   never the first one's.
 - **Malformed input fails closed**: a malformed credential returns `400` without
   contacting the upstream at all.
@@ -162,8 +164,8 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   client may send.
 - **A key in the request target is forwarded.** A Gemini client byte-forwarding to a
   Gemini venue may carry its own key as `?key=`; a named key header goes beside it, not
-  instead, and the start line logged at debug level carries it too. No venue in use
-  takes that form.
+  instead, so the venue receives two keys and Google decides which applies. The start
+  line logged at debug level carries it too.
 
 ## Security best practices for users
 

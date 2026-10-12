@@ -382,7 +382,7 @@ namespace llmbridge::detail
             return {};
         }
         // The next venue's key comes from the header the retry names, never the failed
-        // one's; none after a named decision would mean the client's Authorization.
+        // one's; none, once any attempt has named one, would send another venue's key.
         if (r.credential_header.empty() ? !client->req.f.key_header.empty() : !key_header_ok(r.credential_header))
         {
             LB_WARN(ReqId{client->req.f.req_seq}, " failover named no usable credential header; giving up");

@@ -121,8 +121,8 @@ namespace llmbridge
         /// the failed venue's. Valid until on_failure returns.
         std::string_view model{};
         std::string_view service_tier{};
-        /// As Decision::credential_header, for the venue named here. Left empty after a
-        /// decision that named one, the request is not retried.
+        /// As Decision::credential_header, for the venue named here. Left empty after any
+        /// attempt that named one, the decision or a retry, the request is not retried.
         std::string_view credential_header{};
     };
 
