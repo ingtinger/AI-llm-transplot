@@ -8,6 +8,73 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.90.0]. 2026-10-11
+
+### Added
+
+- **A large request body reaches its venue as it arrives.** A byte-forwarded body of
+  16 KiB or more that is not all here when its head is framed is sent on in the pieces
+  it arrives in, so the venue no longer waits for the whole upload before its first
+  byte. At 100 Mbit/s a 10 MB body's first byte reached the venue 0.15 ms after
+  the client began instead of 843 ms, and a 1 MB body's 0.32 ms instead of
+  80 ms, and the reply came 15 ms sooner at 10 MB (BENCHMARKS.md). A translated
+  body, and every body while a policy is installed, still waits for its last byte:
+  both read the whole body. GATEWAY-INTERNALS.md 12.
+- **`--stream-openai-body on|off` (config: `runtime.stream_openai_body`, default on).**
+  An OpenAI client's streamed body is checked before each piece goes: JSON syntax,
+  nesting, and the top-level and `stream_options` keys a held body is refused for. A
+  key is held back until its closing quote arrives, so a repeated `model` never leaves
+  the gateway, even in the body's last read. On a refusal the gateway stops sending,
+  resets the upstream connection (the venue holds a body short of its
+  `Content-Length`, which it never runs) and answers the client the 400 a held body
+  gets. Off, the body is held to its last byte exactly as before.
+- **`--retain-mb` (config: `runtime.retain_mb`, 0 to 16, default 4).** The JSON parse
+  storage a worker keeps between bodies, which was fixed at 4 MiB. At 16 a 10 MB chat
+  transcript translates with no allocation after warm-up (5 at 4). The cost is up to
+  twice that in resident memory per worker, arena and scratch each: 12 MB more was
+  measured after 10 MB of tool schemas.
+- `provider::BodyScan` (`provider/body_scan.hpp`, installed): an incremental JSON
+  check for a body that arrives in pieces. `json::set_retain_bytes()` and
+  `Gateway::set_retain_bytes()`, `Gateway::set_stream_openai_body()`.
+- Stats: `streamed_bodies`, `streamed_body_refusals`.
+- Benchmarks of 1, 4 and 10 MB bodies in three realistic shapes (a chat transcript,
+  many tool schemas, base64 images): `bigbody` (`bench/bigbody.cpp`) sends one through a running
+  gateway at a set rate and times the venue's first and last byte and the reply
+  (`bench/run_large_body.sh`, or `LARGE=1 bench/run_bench.sh`); `protocol_micro
+  --large` times the translators, the scan and the parse on them and counts their
+  allocations and JSON values.
+
+### Changed
+
+- **Behaviour change:** a non-OpenAI client's byte-forwarded body of 16 KiB or more
+  (an Anthropic client to an Anthropic venue, say) is forwarded as it arrives, without
+  the check, which is not optional: the gateway reads nothing in it. A venue that
+  answers before the body is all sent gets its connection closed instead of pooled,
+  and the rest of the body is read and dropped so the client's next request frames.
+- **Behaviour change:** for a streamed body, t0 is the head's framing and t3 the
+  last piece sent, so the rest of the upload counts as upstream wait, not gateway
+  overhead (LATENCY.md).
+- The JSON parser keeps four parked arenas per thread instead of one, so a parse
+  inside a parse (a tool call's arguments) takes one back too.
+- `json::kMaxNodes` stays at 2^20, measured against the 10 MB shapes: a transcript is
+  50 K values, images 57; only a body of nothing but tool schemas, at 790 K, comes
+  near it.
+
+### Tests
+
+- `ProxyBodyStream.*` on both backends: the venue gets the body before its last byte,
+  and not with the option off; a repeated key in a middle or the last read and an
+  invalid byte after streaming began are never forwarded, the mock venue recording
+  that it never received a complete body, and the client gets its 400; a stale pooled
+  connection's retry resends the whole body; an early response leaves the client
+  connection in step; a body not declared JSON is forwarded unchecked. With the check,
+  the discard or the retry's rebuild removed, the matching tests fail.
+- `BodyScan.*` against the held parse on every split of hand-written and random
+  bodies; `fuzz_body_stream` checks the scan against the parse on arbitrary splits.
+- `AllocCeiling.LargeTranslatedRequestWithBuffersKept`: a 10 MB translated request
+  at `--retain-mb 16` allocates nothing on either backend.
+
+
 ## [0.89.0]. 2026-10-11
 
 ### Fixed
