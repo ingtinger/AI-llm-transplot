@@ -205,6 +205,87 @@ namespace
         uint16_t _port = 0;
     };
 
+    /// Answers each connection's request with `reply` and closes it, corked: the reply's
+    /// last bytes and the close leave in one segment, so the gateway reads both in one
+    /// event, as from a venue that closes right behind its answer.
+    class CorkedCloseBackend
+    {
+      public:
+        explicit CorkedCloseBackend(std::string reply) : _reply(std::move(reply))
+        {
+            _lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+            int one = 1;
+            ::setsockopt(_lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            ::bind(_lfd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+            socklen_t len = sizeof(a);
+            ::getsockname(_lfd, reinterpret_cast<sockaddr*>(&a), &len);
+            _port = ntohs(a.sin_port);
+            ::listen(_lfd, 16);
+            _th = std::thread([this] { serve(); });
+        }
+        ~CorkedCloseBackend()
+        {
+            ::shutdown(_lfd, SHUT_RDWR); // unblocks accept
+            if (_th.joinable()) _th.join();
+            ::close(_lfd);
+        }
+        CorkedCloseBackend(const CorkedCloseBackend&) = delete;
+        CorkedCloseBackend& operator=(const CorkedCloseBackend&) = delete;
+        uint16_t port() const noexcept { return _port; }
+
+      private:
+        void serve()
+        {
+            for (;;)
+            {
+                const int c = ::accept(_lfd, nullptr, nullptr);
+                if (c < 0) return;
+                // The whole request first: a close with bytes unread is a reset, not a FIN.
+                std::string req;
+                size_t want = std::string::npos;
+                char buf[4096];
+                while (want == std::string::npos || req.size() < want)
+                {
+                    const ssize_t n = ::read(c, buf, sizeof buf);
+                    if (n <= 0) break;
+                    req.append(buf, static_cast<size_t>(n));
+                    const size_t end = req.find("\r\n\r\n");
+                    if (want != std::string::npos || end == std::string::npos) continue;
+                    std::string lower = req.substr(0, end);
+                    for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    const size_t cl = lower.find("content-length:");
+                    want = end + 4 + (cl == std::string::npos ? 0 : std::stoul(lower.substr(cl + 15)));
+                }
+                int one = 1;
+                ::setsockopt(c, IPPROTO_TCP, TCP_CORK, &one, sizeof(one));
+                (void)!::write(c, _reply.data(), _reply.size());
+                ::close(c);
+            }
+        }
+        std::string _reply;
+        int _lfd = -1;
+        uint16_t _port = 0;
+        std::thread _th;
+    };
+
+    /// A complete 200 that closes its connection, exactly `total` bytes on the wire.
+    std::string close_reply_of_size(size_t total)
+    {
+        const std::string pre = "{\"pad\":\"", post = "\"}";
+        size_t body = 0;
+        std::string head;
+        for (int i = 0; i < 3; ++i) // the length's own digits settle at once
+        {
+            head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
+                   std::to_string(body) + "\r\n\r\n";
+            body = total - head.size();
+        }
+        return head + pre + std::string(body - pre.size() - post.size(), 'a') + post;
+    }
+
     uint16_t free_port()
     {
         int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -5746,6 +5827,28 @@ TEST_P(ProxyRoute, AVenueThatClosesMidResponseIsReportedButNotRetried)
     EXPECT_EQ(good.seen(), 0) << "a request the venue may have run went to another";
     bad.stop();
     good.stop();
+}
+
+// The venue closes right behind a complete answer and one read takes both: a reply of
+// exactly the gateway's 16 KiB read, its close in the same segment. The answer is the
+// client's. epoll framed it only on a later read, found the close first, and answered 502,
+// a failure the policy would have counted against a venue that answered.
+TEST_P(ProxyRoute, AnAnswerReadTogetherWithTheVenuesCloseIsServed)
+{
+    const std::string reply = close_reply_of_size(16384);
+    ASSERT_EQ(reply.size(), 16384u);
+    CorkedCloseBackend b(reply);
+    FailoverPolicy pol(0, {});
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response(3000);
+    EXPECT_EQ(Client::status_of(r), 200) << r.substr(0, 200);
+    EXPECT_NE(r.find("\"pad\""), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.failures.load(), 0) << "a venue that answered was reported failed";
 }
 
 // Naming the venue that just failed is the one answer that cannot help, and is how a

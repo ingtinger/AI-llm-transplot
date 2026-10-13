@@ -405,6 +405,7 @@ namespace llmbridge::detail
 
     void EpollIo::on_upstream_readable(UpstreamConn* u) noexcept
     {
+        const size_t had = u->rbuf.size();
 #ifdef LLMBRIDGE_HAVE_TLS
         const bool read_ok = u->tls ? tls_drain_read(u) : drain_read(u);
 #else
@@ -412,6 +413,15 @@ namespace llmbridge::detail
 #endif
         note_response_bytes(u);
         if (read_ok) return _e.on_upstream_bytes(u);
+        // The venue closed right behind bytes this same drain read: they are framed first,
+        // as a close arriving in a later event would have left them, so a complete answer is
+        // the client's and not a failure. A stream frames what is left at its own EOF.
+        if (u->rbuf.size() > had && u->client && !u->client->req.f.streaming)
+        {
+            u->peer_eof = true; // never pooled, whatever these bytes finish
+            _e.on_upstream_bytes(u);
+            if (u->doomed || !u->client) return;
+        }
 #ifdef LLMBRIDGE_HAVE_TLS
         _e.on_upstream_eof(u, u->tls && u->tls->want() == net::tls::Want::Error);
 #else
