@@ -146,7 +146,13 @@ namespace llmbridge::detail
                 stalled ? " TIMEOUT client stalled " : " TIMEOUT upstream silent ", *c,
                 " after_ns=", now - c->req.f.ts_progress, " limit_ns=", _upstream_idle_ns,
                 " streaming=", c->req.f.streaming);
-        if (!c->req.f.streaming) { fail_request(c, 504, "upstream idle timeout"); return; }
+        // A client that stopped reading is not the venue's failure: no policy hears of it.
+        if (!c->req.f.streaming)
+        {
+            if (stalled) error_respond(c, 504, "upstream idle timeout");
+            else fail_request(c, 504, "upstream idle timeout");
+            return;
+        }
         stream_truncate(c); // the head is out; truncate honestly, with no [DONE]
         abort_pair(c);
     }

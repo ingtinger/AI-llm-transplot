@@ -391,23 +391,26 @@ namespace llmbridge::detail
 
     Retry Engine::failover_target(ClientConn* client, int status, const char* why) noexcept
     {
-        // Every precondition here is about safety, not policy. Re-sending a request the
-        // client has already begun receiving would duplicate output; re-sending one we
-        // no longer hold is impossible; and an unbounded chain turns one dead provider
-        // into a latency multiplier.
-        if (!_policy || _upstreams.size() < 2) return {};
-        if (!client || client->doomed) return {};
-        // No response byte may have arrived, or the venue may have acted on the request,
-        // and nothing may be owed to the client, or a re-send duplicates output.
-        if (!client->req.can_redispatch() || !client->out.idle()) return {};
-        if (client->req.saved.empty() && !client->req.f.body_in_rbuf) return {};
-        if (client->req.f.body_parked) return {}; // no venue has it: nothing failed
-        if (client->req.f.failover_attempts >= kMaxFailoverAttempts - 1) return {};
-
-        const FailureFacts f{client->upstream_slot, status, why, client->req.f.failover_attempts,
-                             client->req.f.policy_tag};
+        if (!_policy || !client || client->doomed) return {};
+        ReqState& rf = client->req.f;
+        // A venue that had the request failed, and the client has been sent nothing: a
+        // reply begun is no failure of this kind, and a parked body no venue holds.
+        if (rf.body_parked || (rf.phase != Phase::Dispatched && rf.phase != Phase::Responding) ||
+            !client->out.idle())
+            return {};
+        // The policy hears of every such failure, so one that counts them sees them all; it
+        // routes only those that are safe to redo. Every precondition here is about safety,
+        // not policy: a response byte in means the venue may have acted, so a re-send could
+        // duplicate it; re-sending one we no longer hold is impossible; and an unbounded
+        // chain turns one dead provider into a latency multiplier.
+        const bool retryable = _upstreams.size() >= 2 && client->req.can_redispatch() &&
+                               (!client->req.saved.empty() || rf.body_in_rbuf) &&
+                               rf.failover_attempts < kMaxFailoverAttempts - 1;
+        const FailureFacts f{.upstream_index = client->upstream_slot, .status = status, .reason = why,
+                             .attempt = rf.failover_attempts, .tag = rf.policy_tag, .seq = rf.req_seq,
+                             .retryable = retryable};
         const Retry r = _policy->on_failure(f);
-        if (!r.retry) return {};
+        if (!retryable || !r.retry) return {};
         if (r.upstream_index < 0 || static_cast<size_t>(r.upstream_index) >= _upstreams.size())
         {
             LB_WARN(ReqId{client->req.f.req_seq}, " failover to out-of-range upstream ",
@@ -431,7 +434,6 @@ namespace llmbridge::detail
         }
         // The new venue's overrides, never the failed one's: its model name is wrong for
         // another venue. Copied now, since the views die once on_failure has returned.
-        ReqState& rf = client->req.f;
         if (!rf.model_override.set(r.model) || !rf.tier_override.set(r.service_tier) ||
             !rf.speed_override.set(r.speed) || !rf.geo_override.set(r.inference_geo) ||
             (!r.anthropic_beta.empty() && !beta_token_ok(r.anthropic_beta)) ||

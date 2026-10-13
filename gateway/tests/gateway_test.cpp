@@ -5483,6 +5483,7 @@ namespace
         llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
         {
             failures.fetch_add(1, std::memory_order_relaxed);
+            if (!f.retryable) unretryable.fetch_add(1, std::memory_order_relaxed);
             last_reason.store(f.reason, std::memory_order_relaxed);
             last_failed.store(f.upstream_index, std::memory_order_relaxed);
             if (f.attempt >= static_cast<int>(_order.size())) return {};
@@ -5492,6 +5493,7 @@ namespace
         // Atomic: production shares one policy across every worker, so these are
         // written from several loop threads at once. TSan reports the alternative.
         std::atomic<int> failures{0};
+        std::atomic<int> unretryable{0}; ///< reported with FailureFacts::retryable false
         std::atomic<int> last_failed{-1};
         std::atomic<const char*> last_reason{""};
 
@@ -5653,6 +5655,54 @@ TEST_P(ProxyRoute, TheFailoverChainIsBounded)
     c.close();
     shutdown();
     EXPECT_LE(_gw->stats().upstream_failovers, 2u) << "the chain was not bounded";
+}
+
+// The budget spent, the third venue's failure still reaches the policy: nothing more is
+// tried, and a policy counting failures toward ejection sees every one.
+TEST_P(ProxyRoute, TheThirdVenueOfAChainIsReportedButNotRetried)
+{
+    const DeadPort s1, s2, s3;
+    FailoverPolicy pol(0, {1, 2});
+    start({{"127.0.0.1", s1.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", s2.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", s3.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_EQ(c.recv_status(), 502);
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.failures.load(), 3);
+    EXPECT_EQ(pol.unretryable.load(), 1);
+    EXPECT_EQ(pol.last_failed.load(), 2);
+    EXPECT_EQ(_gw->stats().upstream_failovers, 2u);
+}
+
+// A venue that cut its response short may have acted on the request: reported, so its
+// health counts it, and never redone elsewhere.
+TEST_P(ProxyRoute, AVenueThatClosesMidResponseIsReportedButNotRetried)
+{
+    TestBackend bad;
+    bad.set_close_mid_response(true);
+    bad.start();
+    NamedBackend good;
+    good.start("bravo");
+    FailoverPolicy pol(0, {1});
+    start({{"127.0.0.1", bad.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_EQ(c.recv_status(), 502);
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.failures.load(), 1);
+    EXPECT_EQ(pol.unretryable.load(), 1);
+    EXPECT_EQ(pol.last_failed.load(), 0);
+    EXPECT_EQ(_gw->stats().upstream_failovers, 0u);
+    EXPECT_EQ(good.seen(), 0) << "a request the venue may have run went to another";
+    bad.stop();
+    good.stop();
 }
 
 // Naming the venue that just failed is the one answer that cannot help, and is how a
