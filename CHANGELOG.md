@@ -72,6 +72,9 @@ by its name alone is resolved off the loop instead of refused until a restart. D
   that answered. The bytes are framed first now. io_uring was not affected.
 - **A lookup the resolver thread could not finish is asked again.** Out of memory on that
   thread left the venue marked in flight forever, so its name was never looked up again.
+- **An empty string_view in a log line adds nothing**, where it passed a null pointer to
+  `memcpy`, which is undefined even for zero bytes; UBSan reports it on any field a caller
+  leaves empty.
 
 ### Tests
 
