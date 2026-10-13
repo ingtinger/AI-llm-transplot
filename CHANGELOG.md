@@ -8,6 +8,115 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.98.0]. 2026-10-13
+
+A body decided on its head no longer parks when its decision sets `service_tier`, `speed`
+or `inference_geo`: the members are spliced into the body as it streams, with any model
+substitution, so mixes of flex and standard tiers, fast mode and US-only inference
+stream. GATEWAY-INTERNALS.md 12e, DESIGN.md "The policy seam".
+
+### Added
+
+- **`service_tier`, `speed` and `inference_geo` spliced into a streamed body.** On a head
+  decision with no `model` override and no `hold`, a JSON body to a venue that
+  byte-forwards streams with them inserted right after the root's `{`, in the text the held
+  `apply_overrides` writes for absent keys (`"service_tier":"flex","speed":"fast"`, that
+  order), then `,`, or a space when the object is empty or its first member is one the
+  splice blanks. The declared Content-Length is the client's plus the members' and their
+  separator, plus a substitution's growth (0.96.0): one stream, both deltas.
+  - **The client's own member.** One by the same name goes as spaces, from the separator
+    before it (the client's comma, or the one after our members) through its value, so the
+    policy's value wins and the venue never reads two, whether the member is first, in the
+    middle or last, with any whitespace. No placement needs a redo. The venue gets the held
+    rewrite's members and values, the client's member blanked rather than replaced where
+    it stood; with none of the client's own in a non-empty object, the held rewrite byte
+    for byte.
+  - **What the scan holds.** BodyScan, reset with a members mask
+    (`reset(all_keys, track_model, members)`, `BodyScan::kServiceTier`, `kSpeed`,
+    `kInferenceGeo`), holds what follows the root's `{` until the first key or the empty
+    object's `}`, and each top-level member from the separator before it until its key
+    closes, a member the mask names until its value closes, then tells its span
+    (`open_at`, `has_member`, `members`, `member_count`). It refuses a root that is not an
+    object, a non-string value under a member it replaces and a repeat of one, which the
+    held rewrite refuses too: a 400, the venue reset short of the body.
+  - A value the splice cannot write as it is (a control byte, DEL, quote or backslash)
+    parks the body, which the held rewrite then refuses, as before.
+  - `detail::MemberSplice` and `detail::Splice` (request.hpp) build the venue's bytes.
+- **`RequestFacts::service_tier_spliced`, `speed_spliced` and `inference_geo_spliced`**,
+  appended: at `confirm()`, the streaming body went with that member spliced in.
+- **`RequestRecord::service_tier_spliced`, `speed_spliced` and `inference_geo_spliced`**,
+  appended: at a confirm that kept the body. `asked_tier` is the client's own tier the
+  splice blanked, as a held rewrite records the one it replaced.
+- **`Stats::streamed_override_spliced`** (kept splices) and **`streamed_override_redone`**
+  (confirms that redid a spliced body a venue held part of, also in
+  `streamed_body_redone`), appended. The exit profile and the SIGUSR1 dump print them.
+
+### Changed
+
+- **`confirm()` judges a keep on what the venue gets.** On a spliced body a decision that
+  names no tier (or speed, or geo) keeps when the client's own equals the one spliced; one
+  that changes a value, or drops it where the client sent another, redoes the request.
+- **A failover while the body streams** resends it from its first byte with the `Retry`'s
+  own `service_tier`, `speed` and `inference_geo` spliced, when the head decision set
+  each of them too; a `Retry` naming one the head decision did not parks the body, as for
+  `model`. A stale connection's retry rebuilds the spliced head and bytes.
+- A body parked by a failover no longer reports a splice at its confirm: the
+  substitution flag of the abandoned attempt is cleared (`model_substituted` read true
+  for a parked body whose head decision had substituted).
+- Translated venues, bodies not sent as JSON, a `model` override and `hold` still park.
+- A policy without the opt-in, a body held to its last byte, and a head decision with no
+  member override are unchanged: the same bytes, headers, records and stats. The sink
+  corpus records match 0.97.0's. Instructions per request (callgrind, 3000 requests, one
+  worker) are within 0.03% of 0.97.0's, on epoll 17,353 against 17,356 and on io_uring
+  17,408 against 17,413, once the splice moved to its own file, splice.cpp: in
+  request.cpp it changed how the byte-forward rebuild was compiled, +1.2%. The
+  allocation ceilings are unchanged.
+
+### Tests
+
+- `BodyScan.*`: a replaced member held with the separator before it, first, in the
+  middle and last, with whitespace, in every piece size; the root's `{` waiting for the
+  first key and an empty object's `}`; every member in body order with a model tracked
+  between them; a non-object root, a non-string value, a repeat and an escaped key refused.
+- `ProxyHeadDecide.*`, both backends, with a policy that opts in: the openai-python shape
+  with "auto" and a flex tier streaming with both spliced, the venue body the held
+  rewrite byte for byte under the declared length, no park and no redo; `speed` and
+  `inference_geo` into the anthropic-python shape at an Anthropic venue with the beta
+  token; an empty object with whitespace before its `{`; a client `service_tier` first, in
+  the middle and last, with and without whitespace, blanked, the held rewrite's members
+  and values, `asked_tier` the client's; a client tier equal to the policy's going once,
+  and a confirm naming none keeping; a confirm dropping or changing the tier redoing the
+  request; a failover splicing the retry's tier and substitution; a failover naming a
+  member the head did not parking; a failover after the whole spliced body sending it
+  rewritten whole, the record saying no splice; a stale retry re-splicing; a non-string client
+  member refused before it leaves; a value the splice cannot write parking; a `speed`
+  override on a body not sent as JSON parking (`ASpeedOverrideParksTheBody`, now that a
+  JSON body streams).
+- `fuzz_body_stream` splices members too, with the first byte's bits 7 and 3 (bits 1 and
+  2 pick one of four sets, alongside any model pair): the bytes sent are the declared
+  length, valid JSON with no repeated member or model, exactly our members after the `{`
+  and each replaced member blanked from its separator, and the held rewrite's members and
+  values; with none of the client's own, the held rewrite but for our spaces. Seeds for
+  the SDK shape, a client member first, in the middle, last with whitespace and alone, an
+  empty object, an Anthropic body, a non-string member and a non-object root.
+- Each behaviour fails its test when removed, on both backends: the comma held with the
+  member after it, the `{` held, a member held to its value, each refusal, the empty
+  object's release, the separator, the blanking, the insertion, streaming at the head and
+  its JSON and plain-value checks, the failover's subset check, the held rewrite skipped
+  while streaming, the splice flag, the declared growth, the keep judged on what the venue
+  gets, both counters, `asked_tier`, the confirm's facts, the sink fields, the failover
+  park clearing the splice, the failover re-splice, the scan's tracking, the reset on a
+  whole rewrite and the stale retry's re-splice. The `{` and the member holds show in
+  `BodyScan`'s tests only, since a gateway test's reads seldom split there;
+  `fuzz_body_stream` finds a comma where a space belongs within seconds.
+
+### Known gaps
+
+- The held rewrite parses with unique keys at every depth and refuses a body repeating a
+  key inside a nested object; spliced, as substituted since 0.96.0, that body streams.
+- `speed` and `inference_geo` still reach a byte-forwarded body only (0.97.0).
+
+
 ## [0.97.0]. 2026-10-12
 
 A policy can set two more Anthropic request options the way it sets `service_tier`:
@@ -195,11 +304,6 @@ GATEWAY-INTERNALS.md 12c, DESIGN.md "Deciding on the head of a body".
 
 ### Known gaps
 
-- A body whose decision needs it rewritten parks, so it gains nothing from deciding on the
-  head. Two follow-ups would let it stream: splicing a model rewrite (`auto` among them)
-  into the stream for a body that names its model first, and inserting `service_tier` at
-  the start of the stream (redoing the request if the client sent its own), so that mixes
-  of flex and standard tiers can stream.
 - A venue sees part of a prompt the policy may then refuse or move, though never a request
   it can run (SECURITY.md). A policy that must not answers `hold`.
 - A non-OpenAI client's top-level keys are still not checked for repeats, held or arriving
