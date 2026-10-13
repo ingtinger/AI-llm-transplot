@@ -158,7 +158,7 @@ namespace llmbridge::detail
                     LB_WARN("venue ", static_cast<int64_t>(d.slot), " resolving ", up.host, " failed (",
                             d.err.empty() ? std::string_view("no address") : std::string_view(d.err), "); ",
                             had ? "keeping " : "it has no address yet",
-                            had ? std::string_view(up.ip) : std::string_view());
+                            had ? std::string_view(up.ip) : std::string_view(""));
                 continue;
             }
             _rr_backoff_ns[i] = 0;
