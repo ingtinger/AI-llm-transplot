@@ -179,11 +179,13 @@ written once and runs on both.
 | `set_read` | `EPOLLIN` off or on | cancel the multishot recv; re-arm it on resume |
 | `close` | `Engine::forget`, then `::close` | `Engine::forget`, then cancel; freed at `inflight == 0` |
 
-`connect` returns 0, or the errno that stopped it with nothing open, and
-`connect_error_is_local` sorts that errno: out of descriptors, local ports or memory, or a
-full submission queue is this host's, answered 503 with no failover and nothing told to
-the policy; anything else is the venue's, which moves it to its next address, asks for its
-name again (section 8) and fails over, as the same answer arriving later as an event does.
+`connect` returns 0, or the errno that stopped it with nothing open (an epoll set that
+would not take the socket included), and `connect_error_is_local` sorts that errno: out of
+descriptors or memory, or a full submission queue or epoll set is this host's, answered 503
+with no failover and nothing told to the policy; anything else is the venue's, which moves
+it to its next address, asks for its name again (section 8) and fails over. An error in a
+connect's completion goes through `on_connect_error`, the same rule on both backends, and a
+stale resend whose fresh connect fails for this host's reason is a 503 too.
 A send that completes at once is a return value (`Sent::Done`), never a callback, so
 no handler runs re-entered. `IoCaps` says how the backend bounds a stream for a slow
 client: both pause its upstream, each at its own threshold, and io_uring keeps a cap

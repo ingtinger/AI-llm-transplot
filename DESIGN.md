@@ -696,9 +696,11 @@ keeping health counts every one, and the gateway gives up whatever it returns.
 carry, so a policy keys its own per-request state, such as the venues already tried, on it.
 
 A venue that did answer, unparseably, never reaches the hook: retrying would mask an
-incompatibility as a blip. Neither does a failure of this host (out of descriptors, local
-ports or memory, or a full io_uring queue): another venue would need the same, and this
-one is not to blame, so the client gets a 503 and nothing fails over. Bounds, none of them
+incompatibility as a blip. Neither does a failure of this host (out of descriptors or
+memory, or a full io_uring queue or epoll set), whether the connect says so at once or in
+its completion: another venue would need the same, and this one is not to blame, so the
+client gets a 503 and nothing fails over. No free local port is not one of them: Linux
+picks a port per destination, so another venue may still have one. Bounds, none of them
 policy: three venues per request, the failed venue may not be renamed, and nothing is
 re-sent once a byte reached the client.
 
