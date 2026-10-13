@@ -42,10 +42,13 @@ by its name alone is resolved off the loop instead of refused until a restart. D
   logs a failover should check `retryable` first. Still never reported: a reply already
   begun (a stream's head, an interim `100 Continue` owed), a parked body no venue holds.
 - **Behaviour change: a connect that fails for want of a local resource is a 503.** Out
-  of descriptors, local ports or memory (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`,
-  `EAGAIN`, `EADDRNOTAVAIL`) or a full io_uring submission queue: the client gets 503,
-  nothing fails over and the policy hears nothing. It was a 502, and on a failover attempt
-  the policy counted it against a venue that was not at fault.
+  of descriptors or memory (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `EAGAIN`), or a full
+  io_uring submission queue or epoll set (`ENOSPC`), whether `connect()` says so at once or
+  its completion does (`Engine::on_connect_error`, one rule for both backends), and for a
+  stale keep-alive's resend too: the client gets 503, nothing fails over and the policy
+  hears nothing. It was a 502, and the policy counted it against a venue that was not at
+  fault. No free local port (`EADDRNOTAVAIL`) stays the venue's: Linux picks a port per
+  destination, so another venue may still have one.
 - **A client the idle sweep finds stalled is answered 504 directly**, never through the
   policy: one owing only TLS records used to reach `on_failure` and could be failed over.
 - **Re-resolution is rate-limited.** One venue's name is looked up at most once a second;
@@ -72,19 +75,26 @@ by its name alone is resolved off the loop instead of refused until a restart. D
   that answered. The bytes are framed first now. io_uring was not affected.
 - **A lookup the resolver thread could not finish is asked again.** Out of memory on that
   thread left the venue marked in flight forever, so its name was never looked up again.
+- **epoll: a socket the epoll set would not take is not a connect started.** The failed
+  `EPOLL_CTL_ADD` was ignored, so the connect never completed and the request waited out
+  the connect deadline, then blamed the venue.
+- **A resolver thread that could not be started or queued is asked again a second later**,
+  not at every sweep with a warning each time.
 - **An empty string_view in a log line adds nothing**, where it passed a null pointer to
   `memcpy`, which is undefined even for zero bytes; UBSan reports it on any field a caller
   leaves empty.
 
 ### Tests
 
-- `CoreFailover.*`: a first attempt failing over (synchronous connect error, no address),
-  the local errors answered 503 on a first attempt and on a failover, the sequencer and
-  tag carried, the third venue and a one-venue table reported unretryable, a failure after
+- `CoreFailover.*`: a first attempt failing over (synchronous connect error, no address,
+  no free local port), the local errors answered 503 on a first attempt, on a failover, in
+  a connect's completion and on a stale resend, the sequencer (past 0) and tag carried, the
+  third venue and a one-venue table reported unretryable, a failure after
   a response byte reported unretryable, nothing reported for a reply begun or a parked
   body, and a client stalled on TLS records answered without the policy.
 - `CoreResolve.*`: a name-only venue resolved off the loop then dialled, every venue with
-  a name and no address asked for, the backoff doubling and resetting, the Host following
+  a name and no address asked for, the backoff doubling and resetting, the sweep asking
+  again and installing the answer, the Host following
   the address, and the engine never waiting on a lookup in flight.
 - `ProxyRoute`, both backends: `AFirstVenueWhoseConnectFailsAtOnceFailsOver` (failed on
   epoll before), `AFirstVenueWithNoAddressFailsOver`, `TheThirdVenueOfAChainIsReportedButNotRetried`,
@@ -92,14 +102,17 @@ by its name alone is resolved off the loop instead of refused until a restart. D
   `AVenueGivenOnlyANameIsResolvedWithNoRequestAtAll` and
   `AnAnswerReadTogetherWithTheVenuesCloseIsServed` (failed on epoll before).
 - Each behaviour fails its test when removed: the first-attempt save, the local
-  classification, the unretryable report, the stalled-client branch, the acquire's ask,
-  the start and sweep asks, the backoff, and the Host recomputed with the address.
+  classification (at once and in a completion), the unretryable report, the sequencer, the
+  stalled-client branch, the acquire's ask, the start and sweep asks, the backoff, the Host
+  recomputed with the address, and the epoll close behind an answer.
 
 ### Known gaps
 
 - An IPv6-only name never resolves (the resolver asks for IPv4); with the backoff it costs
   one lookup every 30 s and one log line per outage.
 - Each worker's engine has its own resolver, so N workers each look up an unresolved name.
+- One resolver thread per engine looks names up one at a time: a lookup that hangs while
+  DNS is down delays the next venue's by the resolver's timeouts.
 - A venue that fails after the SSE head reached the client is outside the seam: the
   request record says the stream was truncated, and no hook is called.
 
