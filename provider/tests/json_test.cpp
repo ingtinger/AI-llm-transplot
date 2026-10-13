@@ -1058,3 +1058,138 @@ TEST(BodyScan, WithoutAllKeysOnlyTheModelMayNotRepeat)
         EXPECT_LE(b.safe(), s.rfind(R"("model")")) << "cut at " << cut;
     }
 }
+
+// With members, each top-level member is held with the separator before it (the byte
+// after the root's `{`, else its comma) until its key closes, and one the mask names
+// until its value closes, then told: GATEWAY-INTERNALS.md 12e.
+TEST(BodyScan, HoldsAMemberItReplacesWithTheSeparatorBeforeIt)
+{
+    struct Shape
+    {
+        std::string body;
+        size_t at; // where the member's span starts
+    };
+    const std::string m = R"("service_tier":"auto")";
+    const std::vector<Shape> shapes = {
+        {"{" + m + R"(,"messages":[{"role":"user"}],"model":"x"})", 1},
+        {R"({"messages":[],)" + m + R"(,"model":"x"})", 14},
+        {R"({"messages":[],"model":"x",)" + m + "}", 26},
+        {"\n {  " + m + " , \"a\" : 1 }", 3},
+        {R"({ "a" : [ ] ,  "service_tier" : "auto" , "b":2})", 12},
+    };
+    for (const Shape& shape : shapes)
+    {
+        const std::string& s = shape.body;
+        const size_t value_at = s.find(R"("auto")");
+        const size_t end = value_at + 6;
+        for (const size_t step : {size_t{1}, size_t{2}, size_t{5}, s.size()})
+        {
+            BodyScan b;
+            b.reset(/*all_keys=*/true, /*track_model=*/false, BodyScan::kServiceTier);
+            size_t have = 0;
+            BodyScan::Verdict verdict = BodyScan::Verdict::More;
+            do
+            {
+                have = std::min(s.size(), have + step);
+                verdict = b.feed(std::string_view(s).substr(0, have), have == s.size());
+                ASSERT_NE(verdict, BodyScan::Verdict::Refused) << s;
+                if (b.member_count() == 0)
+                {
+                    EXPECT_LE(b.safe(), shape.at) << s << " cut at " << have;
+                }
+            } while (have < s.size());
+            EXPECT_EQ(verdict, BodyScan::Verdict::Done) << s;
+            ASSERT_EQ(b.member_count(), 1u) << s;
+            EXPECT_EQ(b.members()[0].at, shape.at) << s;
+            EXPECT_EQ(b.members()[0].value_at, value_at) << s;
+            EXPECT_EQ(b.members()[0].end, end) << s;
+            EXPECT_EQ(b.members()[0].bit, BodyScan::kServiceTier);
+            EXPECT_EQ(b.open_at(), s.find('{') + 1);
+            EXPECT_TRUE(b.has_member());
+            EXPECT_EQ(b.safe(), s.size());
+        }
+    }
+}
+
+// The root's `{` is followed by our members, so what follows it waits until it is known:
+// the first key, or the `}` of an empty object.
+TEST(BodyScan, TheOpenBraceWaitsForTheFirstMember)
+{
+    BodyScan b;
+    b.reset(true, false, BodyScan::kSpeed);
+    const std::string s = R"(  {"messages":[],"speed":"x"})";
+    EXPECT_EQ(b.feed(std::string_view(s).substr(0, 8), false), BodyScan::Verdict::More);
+    EXPECT_EQ(b.open_at(), 3u);
+    EXPECT_EQ(b.safe(), 3u) << "the brace goes, its member waits";
+    EXPECT_FALSE(b.has_member());
+    EXPECT_EQ(b.feed(std::string_view(s).substr(0, 15), false), BodyScan::Verdict::More);
+    EXPECT_TRUE(b.has_member());
+    EXPECT_EQ(b.safe(), 15u) << "a member we keep goes once its key is known";
+    EXPECT_EQ(b.feed(std::string_view(s).substr(0, 23), false), BodyScan::Verdict::More);
+    EXPECT_EQ(b.safe(), 16u) << "the comma waits with the member after it";
+    EXPECT_EQ(b.feed(std::string_view(s).substr(0, 27), false), BodyScan::Verdict::More);
+    EXPECT_EQ(b.safe(), 16u) << "until its value closes";
+    EXPECT_EQ(b.feed(s, true), BodyScan::Verdict::Done);
+    ASSERT_EQ(b.member_count(), 1u);
+    EXPECT_EQ(b.members()[0].at, 16u);
+
+    const std::string empty = " \n{ \t\n }\n";
+    for (size_t cut = 3; cut < 8; ++cut)
+    {
+        BodyScan e;
+        e.reset(true, false, BodyScan::kServiceTier | BodyScan::kInferenceGeo);
+        EXPECT_EQ(e.feed(std::string_view(empty).substr(0, cut), false), BodyScan::Verdict::More);
+        EXPECT_EQ(e.safe(), 3u) << "cut at " << cut;
+    }
+    BodyScan e;
+    e.reset(true, false, BodyScan::kServiceTier);
+    EXPECT_EQ(e.feed(empty, true), BodyScan::Verdict::Done);
+    EXPECT_FALSE(e.has_member());
+    EXPECT_EQ(e.member_count(), 0u);
+    EXPECT_EQ(e.open_at(), 3u);
+    EXPECT_EQ(e.safe(), empty.size());
+}
+
+// Every member at once, in body order, with a model tracked between them; a member the
+// mask does not name, or one nested deeper, is any other key.
+TEST(BodyScan, TellsEveryMemberTheMaskNamesInOrder)
+{
+    const std::string s = R"({"inference_geo":"eu","model":"auto","x":{"speed":"y"},"service_tier":"p","speed":"s"})";
+    BodyScan b;
+    b.reset(false, true, BodyScan::kServiceTier | BodyScan::kInferenceGeo);
+    for (size_t have = 1; have <= s.size(); ++have)
+        ASSERT_NE(b.feed(std::string_view(s).substr(0, have), have == s.size()), BodyScan::Verdict::Refused);
+    ASSERT_EQ(b.member_count(), 2u);
+    EXPECT_EQ(b.members()[0].bit, BodyScan::kInferenceGeo);
+    EXPECT_EQ(b.members()[0].at, 1u);
+    EXPECT_EQ(b.members()[1].bit, BodyScan::kServiceTier);
+    EXPECT_EQ(b.members()[1].at, s.find(R"(,"service_tier")"));
+    EXPECT_EQ(b.model_at(), s.find(R"("auto")"));
+    EXPECT_EQ(b.safe(), s.size());
+}
+
+// What the held rewrite refuses is refused before any of it would go: a root that is not
+// an object, a member we replace that is not a string. Another dialect's body may not
+// repeat one either, so the venue never reads the client's copy.
+TEST(BodyScan, MembersRefuseWhatTheHeldRewriteRefuses)
+{
+    const auto verdict = [](const std::string& s, bool all_keys = true, uint8_t members = BodyScan::kSpeed) {
+        BodyScan b;
+        b.reset(all_keys, false, members);
+        const BodyScan::Verdict v = b.feed(s, true);
+        return v == BodyScan::Verdict::Refused ? std::string(b.why()) : std::string("ok");
+    };
+    EXPECT_EQ(verdict(R"(["speed"])"), "body is not a JSON object");
+    EXPECT_EQ(verdict(R"(  "speed")"), "body is not a JSON object");
+    EXPECT_EQ(verdict("17"), "body is not a JSON object");
+    EXPECT_EQ(verdict(R"({"speed":1})"), "top-level override value not a string");
+    EXPECT_EQ(verdict(R"({"a":1,"speed":{"x":"y"}})"), "top-level override value not a string");
+    EXPECT_EQ(verdict(R"({"speed":null})"), "top-level override value not a string");
+    EXPECT_EQ(verdict(R"({"speed":1})", true, BodyScan::kServiceTier), "ok") << "not one we replace";
+    EXPECT_EQ(verdict(R"({"x":{"speed":1}})"), "ok") << "not top-level";
+    EXPECT_EQ(verdict(R"({"speed":"a","speed":"b"})", false), "repeated top-level key");
+    EXPECT_EQ(verdict(R"({"a":1,"a":2,"speed":"b"})", false), "ok");
+    EXPECT_EQ(verdict(R"({"speed":"a","speed":"b"})", true), "repeated top-level key");
+    EXPECT_EQ(verdict(R"({"sp\u0065ed":"a"})", false), "escaped top-level key");
+    EXPECT_EQ(verdict(R"(["speed"])", true, 0), "ok") << "without members any JSON goes";
+}
