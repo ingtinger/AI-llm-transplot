@@ -20,8 +20,8 @@
 //
 // With bit 3 set too, service_tier, speed and inference_geo overrides (one of four sets,
 // bits 1 and 2) are spliced into the same stream (GATEWAY-INTERNALS.md 12e): when the scan
-// takes the body whole, the bytes sent are the declared length, valid JSON with no top-level
-// key the client could repeat, exactly the root's `{`, our members, a separator, and the
+// takes the body whole, the bytes sent are the declared length, valid JSON with one model and
+// one of each member we set, exactly the root's `{`, our members, a separator, and the
 // client's bytes with each member we replace blanked from the separator before it; and they
 // equal the held rewrite (apply_overrides) but for whitespace and member order.
 
@@ -234,14 +234,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     assert(parsed);
     if (!overrides) return 0;
 
-    // Never two of a member, nor of the model: the venue reads the one the policy set.
+    // Never two of the model, nor of a member the policy set: the venue reads the one the
+    // policy set. Another dialect's body may repeat a member we leave alone, both the client's.
     bool object = false;
     const auto sent_members = members_of(got, object);
     assert(object);
-    const std::string_view keys[] = {"service_tier", "speed", "inference_geo", "model"};
-    for (const std::string_view k : keys)
-        assert(std::count_if(sent_members.begin(), sent_members.end(),
-                             [k](const auto& m) { return m.first == k; }) <= 1);
+    const std::pair<std::string_view, uint8_t> keys[] = {{"service_tier", provider::BodyScan::kServiceTier},
+                                                         {"speed", provider::BodyScan::kSpeed},
+                                                         {"inference_geo", provider::BodyScan::kInferenceGeo},
+                                                         {"model", 0}};
+    for (const auto& [k, bit] : keys)
+        if (all_keys || bit == 0 || (splice.members.mask() & bit))
+            assert(std::count_if(sent_members.begin(), sent_members.end(),
+                                 [k](const auto& m) { return m.first == k; }) <= 1);
     if (all_keys) assert(provider::top_level_facts(got).keys == provider::KeyCheck::Ok);
     // The held rewrite has the same members with the same values. It refuses a body that
     // repeats a key at any depth (json::parse's unique keys), which streams.
