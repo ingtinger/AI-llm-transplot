@@ -452,15 +452,7 @@ namespace llmbridge::detail
 
     void UringIo::on_connect(UpstreamConn* u, int res) noexcept
     {
-        if (res < 0)
-        {
-            _e.note_connect_failure(u->venue, std::strerror(-res));
-            ClientConn* client = unpair(u);
-            close(*u);
-            if (client) _e.fail_request(client, 502, "upstream connect refused");
-            else ++_e._stats.errors;
-            return;
-        }
+        if (res < 0) return _e.on_connect_error(u, -res);
         u->connected = true;
         // t2 for a plaintext upstream; tls_feed() stamps it when a handshake completes.
         if (!_e.upstream_is_tls(u))

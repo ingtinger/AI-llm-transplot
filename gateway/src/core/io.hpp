@@ -43,13 +43,14 @@ namespace llmbridge::detail
         size_t stream_cap = 0;
     };
 
-    /// Did a connect fail for want of something on this host (descriptors, local ports,
-    /// memory, a full submission queue)? No other venue would do better, and the venue
-    /// is not to blame. Anything else (no route, a refusal) is the venue's.
+    /// Did a connect fail for want of something on this host (descriptors, memory, a full
+    /// submission queue or epoll set)? No other venue would do better, and the venue is
+    /// not to blame. Anything else is the venue's: no route, a refusal, and no free local
+    /// port, since Linux picks one per destination and another venue may still have one.
     [[nodiscard]] constexpr bool connect_error_is_local(int err) noexcept
     {
         return err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM || err == EAGAIN ||
-               err == EADDRNOTAVAIL;
+               err == ENOSPC;
     }
 
     /// A backend never calls back into shared code from inside one of these: a send

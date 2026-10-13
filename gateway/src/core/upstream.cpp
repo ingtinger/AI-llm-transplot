@@ -164,6 +164,19 @@ namespace llmbridge::detail
         return u;
     }
 
+    void Engine::on_connect_error(UpstreamConn* u, int err) noexcept
+    {
+        // This host's (connect_error_is_local) is answered as an acquire answers it: a 503,
+        // nothing failed over, nothing told to the policy. Anything else is the venue's.
+        const bool local = connect_error_is_local(err);
+        if (!local) note_connect_failure(u->venue, std::strerror(err));
+        ClientConn* client = unpair(u);
+        _ops->close(*u);
+        if (!client) ++_stats.errors;
+        else if (local) error_respond(client, 503, "no upstream (gateway out of resources)");
+        else fail_request(client, 502, "upstream connect refused");
+    }
+
     bool Engine::retry_upstream(UpstreamConn* u) noexcept
     {
         // A pooled reuse, not yet retried, that failed before any response byte: the
@@ -202,8 +215,14 @@ namespace llmbridge::detail
         if (const int err = _ops->connect(*uf))
         {
             delete uf;
-            if (!connect_error_is_local(err)) note_connect_failure(u->venue, std::strerror(err));
-            return false;
+            if (!connect_error_is_local(err))
+            {
+                note_connect_failure(u->venue, std::strerror(err));
+                return false;
+            }
+            // This host's: answered 503 here, never reported as the stale venue's EOF.
+            error_respond(client, 503, "no upstream (gateway out of resources)");
+            return true;
         }
         client->req.f.upstream_ip = uf->up_addr.sin_addr.s_addr;
         client->req.f.ts_up_sent = client->req.f.ts_body_sent = 0; // this attempt's own send

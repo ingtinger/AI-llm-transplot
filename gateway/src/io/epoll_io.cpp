@@ -276,7 +276,15 @@ namespace llmbridge::detail
         epoll_event ev{};
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.u64 = tag(&u);
-        ::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev);
+        // Unregistered, it would never hear its connect complete: nothing is open after all.
+        if (::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev) != 0)
+        {
+            const int err = errno;
+            ::close(fd);
+            u.fd = -1;
+            u.write_armed = false;
+            return err;
+        }
         return 0;
     }
 
@@ -358,16 +366,7 @@ namespace llmbridge::detail
         const uint64_t sent = u->sent_bytes;
         if (!u->connected)
         {
-            const int err = net::connect_result(u->fd);
-            if (err != 0)
-            {
-                _e.note_connect_failure(u->venue, std::strerror(err));
-                ClientConn* client = unpair(u);
-                close(*u);
-                if (client) _e.fail_request(client, 502, "upstream connect refused");
-                else ++_e._stats.errors;
-                return;
-            }
+            if (const int err = net::connect_result(u->fd); err != 0) return _e.on_connect_error(u, err);
             u->connected = true;
             // t2 for a plaintext upstream; tls_feed() stamps it when a handshake completes.
             if (!_e.upstream_is_tls(u))

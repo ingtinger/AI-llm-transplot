@@ -75,7 +75,8 @@ namespace llmbridge::detail
         const auto i = static_cast<size_t>(slot);
         if (_rr_inflight[i] || _upstreams[i].host.empty()) return;
         // Asked lately: a name is never looked up at the rate requests fail.
-        if (now_ns() < _rr_next_ns[i]) return;
+        const int64_t now = now_ns();
+        if (now < _rr_next_ns[i]) return;
         try
         {
             std::lock_guard<std::mutex> g(_rr->mutex);
@@ -84,6 +85,8 @@ namespace llmbridge::detail
         }
         catch (...)
         {
+            // No thread or no memory: asked again after the floor, not at every sweep.
+            _rr_next_ns[i] = now + kReresolveMinNs;
             LB_WARN("venue ", static_cast<int64_t>(slot), " re-resolution could not be queued");
             return;
         }
