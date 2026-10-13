@@ -28,7 +28,7 @@ namespace llmbridge::detail
         int run(); // until Engine::_stop
 
         Sent send(ConnBase& c) noexcept override;
-        bool connect(UpstreamConn& u) noexcept override;
+        int connect(UpstreamConn& u) noexcept override;
         void set_read(ConnBase& c, bool on) noexcept override;
         void close(ConnBase& c) noexcept override;
 

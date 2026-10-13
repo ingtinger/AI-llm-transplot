@@ -5566,6 +5566,52 @@ TEST_P(ProxyRoute, AFailoverWhoseConnectFailsAtOnceServesTheRequestOnce)
     good.stop();
 }
 
+// The same address as the first choice. epoll learns ENETUNREACH inside connect(),
+// before the request had been kept for a failover, and answered 502; io_uring learns
+// it from a completion and failed over. Both fail over now.
+TEST_P(ProxyRoute, AFirstVenueWhoseConnectFailsAtOnceFailsOver)
+{
+    NamedBackend good;
+    good.start("bravo");
+    FailoverPolicy pol(0, {1});
+    start({{"255.255.255.255", 9, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos) << "the first venue's failure was not failed over";
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.failures.load(), 1);
+    EXPECT_EQ(pol.last_failed.load(), 0);
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(good.seen(), 1);
+    good.stop();
+}
+
+// A venue with no address (its name has not resolved) is passed over as one that
+// cannot be reached, never a 502 the policy is not asked about.
+TEST_P(ProxyRoute, AFirstVenueWithNoAddressFailsOver)
+{
+    NamedBackend good;
+    good.start("bravo");
+    FailoverPolicy pol(0, {1});
+    start({{"", 9, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.failures.load(), 1);
+    EXPECT_STREQ(pol.last_reason.load(), "no upstream (venue unresolved)");
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    good.stop();
+}
+
 // The default. A policy that does not override on_failure must behave exactly as the
 // gateway did before the hook existed: the client sees the error.
 TEST_P(ProxyRoute, WithoutAPolicyOpinionTheClientSeesTheFailure)

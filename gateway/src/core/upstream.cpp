@@ -105,8 +105,11 @@ namespace llmbridge::detail
         return u;
     }
 
-    UpstreamConn* Engine::acquire_upstream(int slot) noexcept
+    UpstreamConn* Engine::acquire_upstream(int slot, AcquireFail* why) noexcept
     {
+        AcquireFail ignored = AcquireFail::None;
+        AcquireFail& fail = why ? *why : ignored;
+        fail = AcquireFail::None;
         // Only this venue's pool: a connection to one provider cannot serve a request
         // bound for another, and handing one over would send the request, and its
         // credential, to the wrong company.
@@ -119,18 +122,32 @@ namespace llmbridge::detail
             return u;
         }
         UpstreamConn* u = new_upstream(slot);
-        if (!u) return nullptr;
+        if (!u)
+        {
+            fail = AcquireFail::Unresolved;
+            return nullptr;
+        }
         adopt_warm(u);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (upstream_of(u).tls && !tls_attach_upstream(u))
         {
             delete u;
+            fail = AcquireFail::Venue;
             return nullptr;
         }
 #endif
-        if (!_ops->connect(*u))
+        if (const int err = _ops->connect(*u))
         {
             delete u;
+            if (connect_error_is_local(err))
+            {
+                fail = AcquireFail::Local;
+                return nullptr;
+            }
+            // Known at once, as epoll learns an unreachable network: the venue moves on as
+            // it would for the same answer arriving later.
+            fail = AcquireFail::Venue;
+            note_connect_failure(slot, std::strerror(err));
             return nullptr;
         }
         _upconns->add(u);
@@ -176,9 +193,10 @@ namespace llmbridge::detail
             return false;
         }
 #endif
-        if (!_ops->connect(*uf))
+        if (const int err = _ops->connect(*uf))
         {
             delete uf;
+            if (!connect_error_is_local(err)) note_connect_failure(u->venue, std::strerror(err));
             return false;
         }
         client->req.f.upstream_ip = uf->up_addr.sin_addr.s_addr;

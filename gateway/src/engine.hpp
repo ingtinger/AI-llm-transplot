@@ -149,8 +149,19 @@ namespace llmbridge::detail
         ConnBase* forget(UpstreamConn* u) noexcept;
 
         // The upstream side (core/upstream.cpp).
+        /// Why an acquire found no connection: the venue's address has not resolved, the
+        /// venue failed (a TLS session, a connect error known at once), or this host ran
+        /// out of something no other venue would supply (connect_error_is_local).
+        enum class AcquireFail : uint8_t
+        {
+            None,
+            Unresolved,
+            Venue,
+            Local,
+        };
         [[nodiscard]] UpstreamConn* new_upstream(int slot) noexcept; // its address parsed, not open
-        UpstreamConn* acquire_upstream(int slot) noexcept;         // pooled, else a fresh connect
+        UpstreamConn* acquire_upstream(int slot, AcquireFail* why = nullptr) noexcept; // pooled, else a fresh connect
+        void take_request(ClientConn* c) noexcept; // out of rbuf, into `saved` when a failover may resend it
         bool retry_upstream(UpstreamConn* u) noexcept;             // once, on a fresh connection
         void release_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept;
         [[nodiscard]] bool pool_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept;

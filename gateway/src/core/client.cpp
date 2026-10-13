@@ -354,6 +354,24 @@ namespace llmbridge::detail
         c->ts_first_byte = c->rbuf.size() > m.total_len ? t0 : 0;
     }
 
+    void Engine::take_request(ClientConn* c) noexcept
+    {
+        if (c->req.f.body_in_rbuf) return; // resent from there
+        // A failover attempt runs on a copy put back in rbuf; drop it, or the next
+        // failover inserts a second one. With no failover possible, nothing is kept.
+        if (!c->req.saved.empty() || !_policy || _upstreams.size() < 2)
+        {
+            c->rbuf.erase(0, c->msg.total_len);
+            return;
+        }
+        // The original bytes, for a failover: the rebuilt request is in this venue's
+        // dialect. What was pipelined behind stays in rbuf.
+        const size_t extra = c->rbuf.size() - c->msg.total_len;
+        c->req.saved.swap(c->rbuf);
+        c->rbuf.assign(c->req.saved, c->msg.total_len, extra);
+        c->req.saved.resize(c->msg.total_len);
+    }
+
     void Engine::dispatch(ClientConn* c) noexcept
     {
         // Resolved per attempt: a failover may land on a venue of another dialect. The
@@ -434,15 +452,24 @@ namespace llmbridge::detail
 
         c->req.f.phase = Phase::Dispatched; // from here until a response byte, failover may redo it
         c->req.f.body_parts = c->req.f.body_streaming;
-        UpstreamConn* u = acquire_upstream(c->upstream_slot);
+        AcquireFail fail = AcquireFail::None;
+        UpstreamConn* u = acquire_upstream(c->upstream_slot, &fail);
         if (!u)
         {
             secure_clear(_rebuild); // a credential must not wait in the scratch
-            // A failover attempt runs on a copy put back in rbuf; drop it, or the next
-            // failover inserts a second one.
-            if (!c->req.saved.empty()) c->rbuf.erase(0, c->msg.total_len);
-            if (!upstream_failed(c, 502, "no upstream (connect failed)"))
-                error_respond(c, 502, "no upstream (connect failed)");
+            // This host is short of something: another venue would need it too, and this
+            // one is not to blame, so nothing fails over and the policy hears nothing.
+            if (fail == AcquireFail::Local)
+            {
+                if (!c->req.saved.empty()) c->rbuf.erase(0, c->msg.total_len);
+                return error_respond(c, 503, "no upstream (gateway out of resources)");
+            }
+            // Taken as a request that reached its venue is, so a first attempt fails over
+            // like any other: the failover finds its bytes in `saved`.
+            take_request(c);
+            const char* why = fail == AcquireFail::Unresolved ? "no upstream (venue unresolved)"
+                                                               : "no upstream (connect failed)";
+            if (!upstream_failed(c, 502, why)) error_respond(c, 502, why);
             return;
         }
 
@@ -451,16 +478,7 @@ namespace llmbridge::detail
         // The swap hands the request over and takes the upstream's scrubbed, allocated
         // buffer back as the next scratch.
         u->out.stage().swap(_rebuild);
-        // The original bytes, kept when a failover could use them: the rebuilt request
-        // is in this venue's dialect. A body kept in rbuf is resent from there.
-        if (_policy && _upstreams.size() > 1 && !c->req.f.body_in_rbuf && c->req.saved.empty())
-        {
-            const size_t extra = c->rbuf.size() - c->msg.total_len;
-            c->req.saved.swap(c->rbuf);
-            c->rbuf.assign(c->req.saved, c->msg.total_len, extra);
-            c->req.saved.resize(c->msg.total_len);
-        }
-        else if (!c->req.f.body_in_rbuf) c->rbuf.erase(0, c->msg.total_len);
+        take_request(c);
         pair(c, u);
         c->ever_framed = true;            // past the setup deadline for good
         c->ts_client_activity = now_ns(); // and the idle clock restarts here

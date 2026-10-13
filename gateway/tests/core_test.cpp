@@ -122,23 +122,33 @@ namespace
         explicit FakeIo(GatewayCoreTest& t) noexcept : _t(t) {}
         std::vector<std::string> calls;
         Sent next_send = Sent::Done;
-        bool connect_ok = true;
+        bool connect_ok = true;          ///< false: every connect is refused with connect_errno
+        int connect_errno = ENETUNREACH;
+        std::vector<int> refusals;       ///< the next connects refused, in order, before one starts
+        std::string client_wire;         ///< every byte a client was sent
 
         Sent send(ConnBase& c) noexcept override
         {
             calls.push_back(c.kind == ConnKind::Client ? "send client" : "send upstream");
             if (next_send != Sent::Done) return next_send;
             const size_t n = c.out.wire().size();
+            if (c.kind == ConnKind::Client) client_wire.append(c.out.wire().data(), n);
             c.out.sent(n);
             c.sent_bytes += n;
             return Sent::Done;
         }
-        bool connect(UpstreamConn& u) noexcept override
+        int connect(UpstreamConn& u) noexcept override
         {
             calls.push_back("connect");
-            if (!connect_ok) return false;
+            if (!connect_ok) return connect_errno;
+            if (!refusals.empty())
+            {
+                const int err = refusals.front();
+                refusals.erase(refusals.begin());
+                return err;
+            }
             u.fd = ::eventfd(0, EFD_CLOEXEC);
-            return true;
+            return 0;
         }
         void set_read(ConnBase& c, bool on) noexcept override
         {
@@ -348,6 +358,117 @@ namespace
 
         c->req.f.phase = Phase::Responding;
         EXPECT_FALSE(t.failover(c)) << "the venue may have acted";
+    }
+
+    /// Sends every request to venue 0, fails each failure over to venue 1, and keeps
+    /// what it was told.
+    class FirstThenSecond final : public llmbridge::Policy
+    {
+      public:
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = 0};
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            seen.push_back(f);
+            return {.retry = true, .upstream_index = 1};
+        }
+        std::vector<llmbridge::FailureFacts> seen;
+    };
+
+    /// Two venues, `first` and a dialable second, behind a FirstThenSecond policy.
+    struct TwoVenues
+    {
+        explicit TwoVenues(std::string first_ip)
+            : gw(0, std::vector<llmbridge::Upstream>{{.ip = std::move(first_ip), .port = 9},
+                                                     {.ip = "127.0.0.1", .port = 10}},
+                 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {}, false, &policy, {})
+        {
+            t.attach(io, true);
+        }
+        /// The status line's code of what the client was sent, 0 for nothing.
+        int client_status() const
+        {
+            const std::string& w = io.client_wire;
+            return w.size() >= 12 ? std::stoi(w.substr(9, 3)) : 0;
+        }
+        FirstThenSecond policy;
+        Gateway gw;
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+    };
+
+    const std::string kChat = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
+
+    // A first attempt whose connect fails at once, as epoll learns an unreachable network
+    // inside connect(), had kept nothing for a failover to resend: a 502 where the same
+    // answer arriving later, as io_uring learns it, failed over.
+    TEST(CoreFailover, AFirstAttemptWhoseConnectFailsAtOnceFailsOver)
+    {
+        TwoVenues v("127.0.0.1");
+        v.io.refusals = {ENETUNREACH};
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat + "GET /next"; // the start of a pipelined request, behind it
+        v.t.bytes(c);
+        ASSERT_NE(c->up, nullptr);
+        EXPECT_EQ(c->up->venue, 1);
+        ASSERT_EQ(v.policy.seen.size(), 1u);
+        EXPECT_EQ(v.policy.seen[0].upstream_index, 0);
+        EXPECT_STREQ(v.policy.seen[0].reason, "no upstream (connect failed)");
+        EXPECT_EQ(c->up->out.bytes().rfind("POST /v1/chat/completions", 0), 0u);
+        EXPECT_EQ(c->rbuf, "GET /next") << "what was pipelined stays, once";
+        EXPECT_EQ(v.io.calls, (std::vector<std::string>{"connect", "connect"}));
+        EXPECT_EQ(v.t.stats().upstream_failovers, 1u);
+    }
+
+    // A venue whose name has not resolved has no address to dial; it is passed over as
+    // any venue that cannot be reached is.
+    TEST(CoreFailover, AFirstChoiceWithNoAddressFailsOver)
+    {
+        TwoVenues v("");
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat;
+        v.t.bytes(c);
+        ASSERT_NE(c->up, nullptr);
+        EXPECT_EQ(c->up->venue, 1);
+        ASSERT_EQ(v.policy.seen.size(), 1u);
+        EXPECT_STREQ(v.policy.seen[0].reason, "no upstream (venue unresolved)");
+        EXPECT_EQ(v.io.calls, (std::vector<std::string>{"connect"})) << "venue 0 was never dialled";
+        EXPECT_TRUE(c->rbuf.empty());
+    }
+
+    // This host out of descriptors, local ports or memory is no venue's fault, and every
+    // other venue would need the same: a 503, and the policy hears nothing.
+    TEST(CoreFailover, AConnectThatFailsForWantOfALocalResourceFailsNothingOver)
+    {
+        for (const int err : {EMFILE, ENFILE, ENOBUFS, ENOMEM, EAGAIN, EADDRNOTAVAIL})
+        {
+            TwoVenues v("127.0.0.1");
+            v.io.refusals = {err};
+            ClientConn* c = v.t.client();
+            c->rbuf = kChat;
+            v.t.bytes(c);
+            EXPECT_TRUE(v.policy.seen.empty()) << err;
+            EXPECT_EQ(v.t.stats().upstream_failovers, 0u) << err;
+            EXPECT_EQ(v.client_status(), 503) << err;
+            EXPECT_TRUE(c->doomed) << err;
+        }
+    }
+
+    // On a failover attempt too: the copy put back for it is dropped, never left to run
+    // as a second request.
+    TEST(CoreFailover, ALocalFailureOnAFailoverAttemptAnswers503Once)
+    {
+        TwoVenues v("127.0.0.1");
+        // The first refusal is the venue's and fails over; the second is this host's.
+        v.io.refusals = {ENETUNREACH, EMFILE};
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat;
+        v.t.bytes(c);
+        ASSERT_EQ(v.policy.seen.size(), 1u);
+        EXPECT_EQ(v.client_status(), 503);
+        EXPECT_TRUE(c->rbuf.empty()) << "the failover's copy of the request was left behind";
     }
 
     TEST_F(Core, AStreamStagesItsHeadAndPumps)

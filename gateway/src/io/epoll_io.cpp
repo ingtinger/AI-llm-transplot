@@ -256,17 +256,20 @@ namespace llmbridge::detail
 
     // One EPOLL_CTL_ADD, read and write interest together: the connect's completion is
     // the first writable event.
-    bool EpollIo::connect(UpstreamConn& u) noexcept
+    int EpollIo::connect(UpstreamConn& u) noexcept
     {
         const int fd = net::make_client_socket();
-        if (fd < 0) return false;
+        if (fd < 0) return errno;
         if (_e._upstream_sndbuf > 0)
             ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_e._upstream_sndbuf, sizeof(_e._upstream_sndbuf));
+        // An error known at once (no route, no local port) is the connect's answer now,
+        // where a refusal arrives as the first writable event.
         if (::connect(fd, reinterpret_cast<const sockaddr*>(&u.up_addr), sizeof(u.up_addr)) < 0 &&
             errno != EINPROGRESS)
         {
+            const int err = errno;
             ::close(fd);
-            return false;
+            return err;
         }
         u.fd = fd;
         u.write_armed = true;
@@ -274,7 +277,7 @@ namespace llmbridge::detail
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.u64 = tag(&u);
         ::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev);
-        return true;
+        return 0;
     }
 
     Sent EpollIo::send(ConnBase& c) noexcept
