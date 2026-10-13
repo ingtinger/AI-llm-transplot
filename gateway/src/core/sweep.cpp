@@ -57,6 +57,9 @@ namespace llmbridge::detail
             _pool->reap(now - _pool_idle_ns, [this](UpstreamConn* u) { _ops->close(*u); });
 
         apply_reresolved();
+        // A venue whose name has no address yet is asked for again as its backoff allows,
+        // traffic or not: a policy may have stopped sending it any.
+        resolve_unaddressed();
 
         // Backwards, so the swap a close makes in the registry moves an already-visited
         // client into this slot. A teardown removes at most its own client.

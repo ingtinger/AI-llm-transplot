@@ -93,10 +93,16 @@ namespace llmbridge::detail
     UpstreamConn* Engine::new_upstream(int slot) noexcept
     {
         // The venue's address now, never a cached one: the ip may have rotated. One
-        // that does not parse fails the acquire, on both backends.
+        // that does not parse fails the acquire, on both backends, and a name with no
+        // address yet is asked for off the loop.
         const Upstream& up = _upstreams[static_cast<size_t>(slot)];
         sockaddr_in addr{};
-        if (!net::resolve_ipv4(up.ip.c_str(), up.port, addr)) return nullptr;
+        if (!net::resolve_ipv4(up.ip.c_str(), up.port, addr))
+        {
+            ++_stats.upstream_unresolved;
+            request_reresolve(slot);
+            return nullptr;
+        }
         auto* u = new UpstreamConn();
         u->venue = slot;
         u->ts_opened = now_ns();

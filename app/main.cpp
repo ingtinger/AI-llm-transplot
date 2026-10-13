@@ -147,10 +147,9 @@ static int run(int argc, char** argv)
     }
 #endif
 
-    // Parse + resolve --upstream. Resolution happens once, here, on the setup path:
-    // the workers get a dotted-quad and never touch the resolver. (Re-resolution on
-    // TTL expiry is future work: providers rotate IPs, but a long-lived gateway
-    // pinning one A record is exactly what the pooled connections do anyway.)
+    // Parse + resolve --upstream, here on the setup path, and refuse a name that does not
+    // resolve: with no policy there is no failover, so a venue with no address would fail
+    // every request. A worker re-resolves the name off its loop after a failed connect.
     const llmbridge::net::UpstreamSpec up = llmbridge::net::parse_upstream(upstream_arg);
     if (!up.ok())
     {

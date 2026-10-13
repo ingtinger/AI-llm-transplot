@@ -5299,6 +5299,49 @@ TEST_P(ProxyRoute, AFailedConnectReresolvesTheVenueName)
     EXPECT_GE(_gw->stats().upstream_reresolved, 1u);
 }
 
+// A venue given by name alone, its name not resolved at boot (an embedder that leaves the
+// lookup to the gateway): resolved off the loop, then served, Host naming the address.
+TEST_P(ProxyRoute, AVenueGivenOnlyANameServesOnceItResolves)
+{
+    NamedBackend a;
+    a.start("alpha");
+    llmbridge::Upstream up;
+    up.port = a.port();
+    up.host = "localhost";
+    start({up}, nullptr);
+
+    int status = 0;
+    for (int i = 0; i < 60 && status != 200; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_port));
+        ASSERT_TRUE(c.send(make_request()));
+        status = c.recv_status();
+        c.close();
+        if (status != 200) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_EQ(status, 200) << "the venue never got an address";
+    shutdown();
+    EXPECT_GE(_gw->stats().upstream_reresolved, 1u);
+    const std::string want = "Host: 127.0.0.1:" + std::to_string(a.port()) + "\r\n";
+    EXPECT_NE(a.last().find(want), std::string::npos) << a.last();
+    a.stop();
+}
+
+// Not waiting on traffic: a policy may route nothing to a venue it has given up on, so
+// the gateway asks for the name itself, at start and from the sweep.
+TEST_P(ProxyRoute, AVenueGivenOnlyANameIsResolvedWithNoRequestAtAll)
+{
+    llmbridge::Upstream up;
+    up.port = 9;
+    up.host = "localhost";
+    start({up}, nullptr);
+    std::this_thread::sleep_for(std::chrono::milliseconds(600)); // a lookup, and a sweep to install it
+    shutdown();
+    EXPECT_GE(_gw->stats().upstream_reresolved, 1u);
+    EXPECT_EQ(_gw->stats().upstream_unresolved, 0u) << "nothing asked for it";
+}
+
 // The feature. Two venues, and the policy decides which one serves each request.
 TEST_P(ProxyRoute, ThePolicyChoosesWhichVenueServes)
 {

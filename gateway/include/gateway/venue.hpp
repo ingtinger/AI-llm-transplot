@@ -42,7 +42,8 @@ namespace llmbridge
     struct Upstream
     {
         /// The address in use. The gateway moves to the next entry of `ips` after a
-        /// failed connect and, when `host` is set, re-resolves it off the loop.
+        /// failed connect and, when `host` is set, re-resolves it off the loop. Empty with
+        /// `host` set: none yet, resolved off the loop from run(), and refused until then.
         std::string ip{};
         uint16_t port = 0;
         bool tls = false;     ///< originate TLS to this venue
@@ -53,7 +54,7 @@ namespace llmbridge
         /// slash; net::parse_upstream enforces that.
         std::string base_path{};
 
-        std::string host_hdr{}; ///< derived at construction; see host_header_for()
+        std::string host_hdr{}; ///< derived at construction, and with `ip`; host_header_for()
 
         /// Query for this venue, without the '?'. Only a mode that builds its own
         /// target may carry one; the constructor refuses it on a byte-forwarding venue.

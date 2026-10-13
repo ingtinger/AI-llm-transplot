@@ -26,8 +26,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace llmbridge
@@ -101,6 +104,21 @@ namespace llmbridge
         size_t pooled() const { return g.pooled_upstream_count(); }
         size_t bodies_streaming() const { return e._bodies_streaming; }
         void sweep(ClientConn* c, int64_t now) { e.sweep_client(c, now, /*busy=*/true); }
+        void resolve_unaddressed() { e.resolve_unaddressed(); }
+        /// The resolver thread answered, within `limit`; apply_resolved() installs it, as
+        /// the sweep would. `ready` is set under the mutex apply_reresolved takes.
+        bool wait_resolved(std::chrono::milliseconds limit = std::chrono::milliseconds(5000))
+        {
+            const auto end = std::chrono::steady_clock::now() + limit;
+            while (!e._rr->ready.load(std::memory_order_acquire))
+            {
+                if (std::chrono::steady_clock::now() > end) return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return true;
+        }
+        void apply_resolved() { e.apply_reresolved(); }
+        llmbridge::Upstream& venue(int i) { return e._upstreams[static_cast<size_t>(i)]; }
     };
 } // namespace llmbridge
 
@@ -596,6 +614,152 @@ namespace
         EXPECT_EQ(v.client_status(), 504);
     }
 #endif
+
+    /// One venue given only by name, `localhost`, which /etc/hosts answers, on port 9.
+    std::vector<llmbridge::Upstream> named_only() { return {{.ip = "", .port = 9, .host = "localhost"}}; }
+
+    /// A lookup that fails `g_fail_first` times, then answers 127.0.0.1.
+    std::atomic<int> g_lookups{0};
+    std::atomic<int> g_fail_first{0};
+    std::vector<std::string> flaky_lookup(const std::string&, std::string* err)
+    {
+        if (g_lookups.fetch_add(1) < g_fail_first.load())
+        {
+            if (err) *err = "test: no such name";
+            return {};
+        }
+        return {"127.0.0.1"};
+    }
+
+    /// A lookup that hangs, as one does while DNS is down, until released.
+    std::atomic<bool> g_in_lookup{false};
+    std::atomic<bool> g_release{false};
+    std::vector<std::string> hanging_lookup(const std::string&, std::string*)
+    {
+        g_in_lookup.store(true);
+        while (!g_release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return {"127.0.0.1"};
+    }
+
+    // A venue given by name alone has no address until its name resolves: refused, and
+    // asked for off the loop once however often it is refused, then dialled at the answer.
+    TEST(CoreResolve, AVenueGivenOnlyANameIsResolvedOffTheLoopAndThenDialled)
+    {
+        Gateway gw(0, named_only(), 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {},
+                   false, nullptr, {});
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        EXPECT_EQ(t.acquire(0), nullptr);
+        EXPECT_EQ(t.acquire(0), nullptr);
+        EXPECT_TRUE(io.calls.empty()) << "there was nothing to dial";
+        EXPECT_EQ(t.e._rr_inflight[0], 1) << "one lookup, however many refusals";
+        EXPECT_EQ(t.stats().upstream_unresolved, 2u);
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_EQ(t.venue(0).ip.rfind("127.", 0), 0u) << t.venue(0).ip;
+        EXPECT_EQ(t.venue(0).host_hdr, t.venue(0).ip + ":9") << "the Host of the address it now dials";
+        EXPECT_EQ(t.e._rr_inflight[0], 0);
+        EXPECT_EQ(t.stats().upstream_reresolved, 1u);
+        ASSERT_NE(t.acquire(0), nullptr);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"connect"}));
+    }
+
+    // run() and the sweep ask for every venue that has a name and no address, and only those.
+    TEST(CoreResolve, EveryVenueWithANameAndNoAddressIsAskedFor)
+    {
+        std::vector<llmbridge::Upstream> ups{{.ip = "", .port = 9, .host = "localhost"},
+                                             {.ip = "127.0.0.1", .port = 10, .host = "localhost"},
+                                             {.ip = "", .port = 11}};
+        Gateway gw(0, ups, 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {}, false,
+                   nullptr, {});
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        t.resolve_unaddressed();
+        EXPECT_EQ(t.e._rr_inflight, (std::vector<uint8_t>{1, 0, 0}));
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_EQ(t.venue(0).ip.rfind("127.", 0), 0u);
+        EXPECT_EQ(t.venue(1).ip, "127.0.0.1");
+        EXPECT_TRUE(t.venue(2).ip.empty()) << "no name, nothing to ask for";
+    }
+
+    // A name that does not resolve is asked for again, later each time, and never at the
+    // rate requests are refused for want of it.
+    TEST(CoreResolve, ANameThatFailsToResolveBacksOffAndIsAskedAgain)
+    {
+        using llmbridge::detail::kReresolveMinNs;
+        g_lookups = 0;
+        g_fail_first = 2;
+        Gateway gw(0, named_only(), 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {},
+                   false, nullptr, {});
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        t.e._rr->resolve = &flaky_lookup; // before the first lookup starts the thread
+
+        EXPECT_EQ(t.acquire(0), nullptr);
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_TRUE(t.venue(0).ip.empty());
+        EXPECT_EQ(t.e._rr_backoff_ns[0], kReresolveMinNs);
+        EXPECT_EQ(t.acquire(0), nullptr);
+        EXPECT_EQ(t.e._rr_inflight[0], 0) << "asked again within its backoff";
+        EXPECT_EQ(g_lookups.load(), 1);
+
+        t.e._rr_next_ns[0] = 0; // the backoff has passed
+        t.resolve_unaddressed(); // as the sweep asks
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_EQ(t.e._rr_backoff_ns[0], 2 * kReresolveMinNs) << "twice as long after a second failure";
+
+        t.e._rr_next_ns[0] = 0;
+        t.resolve_unaddressed();
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_EQ(t.venue(0).ip, "127.0.0.1");
+        EXPECT_EQ(t.e._rr_backoff_ns[0], 0);
+        EXPECT_EQ(g_lookups.load(), 3);
+    }
+
+    // A failed connect moves a venue given by addresses to its next one, and the Host it
+    // names moves with it.
+    TEST(CoreResolve, TheHostHeaderFollowsTheAddressInUse)
+    {
+        std::vector<llmbridge::Upstream> ups{{.ip = "127.0.0.2", .port = 9, .ips = {"127.0.0.2", "127.0.0.1"}}};
+        Gateway gw(0, ups, 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {}, false,
+                   nullptr, {});
+        GatewayCoreTest t{gw};
+        EXPECT_EQ(t.venue(0).host_hdr, "127.0.0.2:9");
+        t.e.note_connect_failure(0, "refused");
+        EXPECT_EQ(t.venue(0).ip, "127.0.0.1");
+        EXPECT_EQ(t.venue(0).host_hdr, "127.0.0.1:9");
+    }
+
+    // Shut down while DNS is down: the lookup in flight is left to finish on its own
+    // reference to the resolver's state, never waited out.
+    TEST(CoreResolve, TheEngineNeverWaitsOnALookupInFlight)
+    {
+        g_in_lookup = false;
+        g_release = false;
+        auto gw = std::make_unique<Gateway>(0, named_only(), 0, llmbridge::IoBackend::Epoll,
+                                            Gateway::kDefaultUpstreamIdleNs, llmbridge::TlsConfig{}, false,
+                                            nullptr, std::vector<std::string>{});
+        GatewayCoreTest t{*gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        t.e._rr->resolve = &hanging_lookup;
+        EXPECT_EQ(t.acquire(0), nullptr);
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!g_in_lookup.load() && std::chrono::steady_clock::now() < limit)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ASSERT_TRUE(g_in_lookup.load());
+        const auto t0 = std::chrono::steady_clock::now();
+        gw.reset();
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(1));
+        g_release = true; // the detached lookup finishes against the state it shares
+    }
 
     TEST_F(Core, AStreamStagesItsHeadAndPumps)
     {

@@ -29,6 +29,10 @@ namespace llmbridge::detail
     // A stale pooled connection fails within a round trip of reuse; later, the
     // provider may have run the request, and a resend would bill it twice.
     constexpr int64_t kStaleRetryWindowNs = 1'000'000'000;
+    // One venue's name is looked up at most once a second, and a name that keeps failing
+    // waits twice as long each time, up to half a minute: never at request rate.
+    constexpr int64_t kReresolveMinNs = 1'000'000'000;
+    constexpr int64_t kReresolveMaxNs = 30'000'000'000;
 
     using llmbridge::net::secure_clear; // GATEWAY-INTERNALS.md §9
 
