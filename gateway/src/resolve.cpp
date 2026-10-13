@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 
 #include <algorithm>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -27,6 +28,18 @@
 
 namespace llmbridge::detail
 {
+    namespace
+    {
+        // Twice as long each time, to kReresolveMaxNs, so a dead name costs a lookup a half
+        // minute at worst. True for the first of an outage, the one worth a line.
+        bool back_off(int64_t& backoff_ns, int64_t& next_ns, int64_t now) noexcept
+        {
+            const int64_t was = backoff_ns;
+            backoff_ns = was == 0 ? kReresolveMinNs : std::min(2 * was, kReresolveMaxNs);
+            next_ns = now + backoff_ns;
+            return was == 0;
+        }
+    } // namespace
 
     bool Engine::has_address(const Upstream& up) noexcept
     {
@@ -83,11 +96,13 @@ namespace llmbridge::detail
             if (!_rr_thread.joinable()) _rr_thread = std::thread([rr = _rr] { reresolve_loop(rr); });
             _rr->pending.emplace_back(slot, _upstreams[i].host);
         }
-        catch (...)
+        catch (const std::exception& e)
         {
-            // No thread or no memory: asked again after the floor, not at every sweep.
-            _rr_next_ns[i] = now + kReresolveMinNs;
-            LB_WARN("venue ", static_cast<int64_t>(slot), " re-resolution could not be queued");
+            // No thread or no memory: asked again as a failed lookup would be.
+            if (back_off(_rr_backoff_ns[i], _rr_next_ns[i], now))
+                LB_WARN("venue ", static_cast<int64_t>(slot), " re-resolution could not be queued (",
+                        e.what(), "); ", has_address(_upstreams[i]) ? "keeping " : "it has no address yet",
+                        has_address(_upstreams[i]) ? std::string_view(_upstreams[i].ip) : std::string_view(""));
             return;
         }
         _rr_inflight[i] = 1;
@@ -152,12 +167,8 @@ namespace llmbridge::detail
             const bool had = has_address(up);
             if (d.ips.empty())
             {
-                // Twice as long each time, so a dead name costs a lookup a half minute at
-                // worst, and one line per outage: the retries say nothing new.
-                const int64_t was = _rr_backoff_ns[i];
-                _rr_backoff_ns[i] = was == 0 ? kReresolveMinNs : std::min(2 * was, kReresolveMaxNs);
-                _rr_next_ns[i] = now + _rr_backoff_ns[i];
-                if (was == 0)
+                // One line per outage: the retries say nothing new.
+                if (back_off(_rr_backoff_ns[i], _rr_next_ns[i], now))
                     LB_WARN("venue ", static_cast<int64_t>(d.slot), " resolving ", up.host, " failed (",
                             d.err.empty() ? std::string_view("no address") : std::string_view(d.err), "); ",
                             had ? "keeping " : "it has no address yet",
@@ -172,9 +183,13 @@ namespace llmbridge::detail
             // the fresh list still has it, else start the fresh list from the top.
             if (std::find(up.ips.begin(), up.ips.end(), up.ip) == up.ips.end()) readdress(up, up.ips.front());
             ++_stats.upstream_reresolved;
-            LB_INFO("venue ", static_cast<int64_t>(d.slot), " resolved ", up.host, ": ",
-                    static_cast<int64_t>(up.ips.size()), " addresses",
-                    changed ? "" : " (unchanged)", ", using ", up.ip, had ? "" : " (it had none)");
+            // A venue refusing connects is looked up again each second, finding the same.
+            if (!changed && had)
+                LB_DEBUG("venue ", static_cast<int64_t>(d.slot), " resolved ", up.host, " (unchanged), using ", up.ip);
+            else
+                LB_INFO("venue ", static_cast<int64_t>(d.slot), " resolved ", up.host, ": ",
+                        static_cast<int64_t>(up.ips.size()), " addresses", changed ? "" : " (unchanged)",
+                        ", using ", up.ip, had ? "" : " (it had none)");
         }
         _rr_batch.clear();
     }

@@ -182,7 +182,8 @@ written once and runs on both.
 `connect` returns 0, or the errno that stopped it with nothing open (an epoll set that
 would not take the socket included), and `connect_error_is_local` sorts that errno: out of
 descriptors or memory, or a full submission queue or epoll set is this host's, answered 503
-with no failover and nothing told to the policy; anything else is the venue's, which moves
+with no failover and nothing told to the policy, its reason naming the errno
+(`local_connect_why`) and counted in `upstream_local_failures`; anything else is the venue's, which moves
 it to its next address, asks for its name again (section 8) and fails over. An error in a
 connect's completion goes through `on_connect_error`, the same rule on both backends, and a
 stale resend whose fresh connect fails for this host's reason is a 503 too.
@@ -524,9 +525,11 @@ entry per venue, so a push never allocates; `apply_reresolved` installs answers 
 sweep, on the loop. Per venue, one job in flight (`_rr_inflight`), and none before
 `_rr_next_ns`: a second after an answer, or a backoff that doubles with each failed lookup
 up to `kReresolveMaxNs`. A venue given by name with no address yet is asked for by `run()`
-and by every sweep the backoff allows, and refused meanwhile (`upstream_unresolved`). The
-engine's destructor joins an idle resolver and detaches a busy one, whose lookup finishes
-on the shared state: shutdown never takes the resolver's timeouts.
+and by every sweep the backoff allows, and refused meanwhile (`upstream_unresolved`). A
+lookup that fails, or a job that cannot be queued, backs off the same way and logs once per
+outage; one that finds the addresses already held is DEBUG. The engine's destructor joins
+an idle resolver and detaches a busy one, saying so, whose lookup finishes on the shared
+state: shutdown never takes the resolver's timeouts.
 
 
 ### 8b. Sizing `kMaxIdleUpstreams`, and why it is 8192

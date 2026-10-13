@@ -798,8 +798,9 @@ connection the moment the last one closes, and to either side of the proxy.
 `Request#N` is the same sequencer value that `x-llmbridge-seq` reports, assigned once
 when the request frames, so a log line and a response header cannot disagree.
 
-**Levels carry a rule.** 4xx is the client's fault and is DEBUG; 5xx, timeouts and
-truncations are ours or the provider's and are WARN. Every configured limit logs at
+**Levels carry a rule.** Every reply the gateway writes itself is WARN, a client's 4xx
+included: one line per refusal, an authentication refusal naming its peer, a 5xx past
+dispatch naming its venue. Timeouts and truncations are WARN. Every configured limit logs at
 WARN when hit, including limits handled gracefully, because at the default floor a
 DEBUG line does not exist in the binary: grading by consequence would have made epoll
 back-pressure invisible in production while the io_uring stream drop stayed visible,

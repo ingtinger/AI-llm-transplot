@@ -153,6 +153,10 @@ namespace llmbridge::detail
             LB_INFO("  upstream[", static_cast<int64_t>(i), "] ", unresolved ? u.host : u.ip, ":", u.port,
                     unresolved ? " (not resolved yet)" : "", u.tls ? " tls" : " plaintext",
                     " dialect=", dialect_name(u.dialect));
+            // Nothing will ever give it one: no name to look up.
+            if (!has_address(u) && u.host.empty())
+                LB_WARN("  upstream[", static_cast<int64_t>(i), "] address '", u.ip,
+                        "' is not an IPv4 address and it has no host to resolve; every request to it is refused");
         }
 
         // Resolve the event-loop backend: io_uring for Uring/Auto when the kernel
@@ -177,15 +181,23 @@ namespace llmbridge::detail
         // A lookup in flight can take the resolver's timeouts while DNS is down; it is left
         // to finish on its own reference to the state, so shutdown never waits on it.
         bool busy = false;
+        size_t queued = 0;
         {
             std::lock_guard<std::mutex> g(_rr->mutex);
             _rr->stop = true;
             busy = _rr->busy;
+            queued = _rr->pending.size();
         }
         _rr->cv.notify_all();
         if (_rr_thread.joinable())
         {
-            if (busy) _rr_thread.detach();
+            if (busy)
+            {
+                LB_INFO("resolver: a name lookup is still running at shutdown; its thread is left to "
+                        "finish on its own, not waited for, lookups dropped=",
+                        static_cast<int64_t>(queued));
+                _rr_thread.detach();
+            }
             else _rr_thread.join();
         }
         // Every connection is in one registry, pooled and in-flight upstreams included,
@@ -254,7 +266,8 @@ namespace llmbridge::detail
            << " upstream_timeouts=" << _stats.upstream_timeouts
            << " connect_timeouts=" << _stats.connect_timeouts
            << " upstream_reresolved=" << _stats.upstream_reresolved
-           << " upstream_unresolved=" << _stats.upstream_unresolved << "\n";
+           << " upstream_unresolved=" << _stats.upstream_unresolved
+           << " upstream_local_failures=" << _stats.upstream_local_failures << "\n";
         if (_stats.streamed_bodies + _stats.streamed_body_capped > 0)
             os << "streamed_bodies=" << _stats.streamed_bodies << " refused=" << _stats.streamed_body_refusals
                << " capped=" << _stats.streamed_body_capped << " timed_out=" << _stats.streamed_body_timeouts

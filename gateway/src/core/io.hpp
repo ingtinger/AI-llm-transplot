@@ -53,6 +53,22 @@ namespace llmbridge::detail
                err == ENOSPC;
     }
 
+    /// The 503's reason for a local connect error, naming what ran out: each is raised
+    /// in a different place.
+    [[nodiscard]] constexpr const char* local_connect_why(int err) noexcept
+    {
+        switch (err)
+        {
+        case EMFILE: return "no upstream (gateway out of resources: EMFILE, the process descriptor limit)";
+        case ENFILE: return "no upstream (gateway out of resources: ENFILE, the system descriptor limit)";
+        case ENOBUFS: return "no upstream (gateway out of resources: ENOBUFS, socket buffers)";
+        case ENOMEM: return "no upstream (gateway out of resources: ENOMEM)";
+        case ENOSPC: return "no upstream (gateway out of resources: ENOSPC, the epoll watch limit)";
+        case EAGAIN: return "no upstream (gateway out of resources: EAGAIN, a full submission queue or routing cache)";
+        default: return "no upstream (gateway out of resources)";
+        }
+    }
+
     /// A backend never calls back into shared code from inside one of these: a send
     /// that completes at once is a return value, so no handler runs re-entered.
     class IoOps

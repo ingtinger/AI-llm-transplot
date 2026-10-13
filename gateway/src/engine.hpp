@@ -161,7 +161,7 @@ namespace llmbridge::detail
             Local,
         };
         [[nodiscard]] UpstreamConn* new_upstream(int slot) noexcept; // its address parsed, not open
-        UpstreamConn* acquire_upstream(int slot, AcquireFail* why = nullptr) noexcept; // pooled, else a fresh connect
+        UpstreamConn* acquire_upstream(int slot, AcquireFail* why = nullptr, int* local_err = nullptr) noexcept; // pooled, else a fresh connect
         void take_request(ClientConn* c) noexcept; // out of rbuf, into `saved` when a failover may resend it
         bool retry_upstream(UpstreamConn* u) noexcept; // once, on a fresh connection; true: handled
         void on_connect_error(UpstreamConn* u, int err) noexcept; // a connect's completion said no

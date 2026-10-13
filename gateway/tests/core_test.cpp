@@ -15,6 +15,7 @@
 #include "core/registry.hpp"
 #include "engine.hpp"
 #include "gateway/gateway.hpp"
+#include "net/log.hpp"
 #include "net/socket_util.hpp"
 
 #include <gtest/gtest.h>
@@ -139,6 +140,26 @@ namespace
     using llmbridge::GatewayCoreTest;
     using llmbridge::Phase;
     using llmbridge::detail::Sent;
+
+    /// Every line logged while it is installed.
+    struct LogText final : llmbridge::net::log::Sink
+    {
+        LogText() { llmbridge::net::log::set_sink(this); }
+        ~LogText() override { llmbridge::net::log::set_sink(nullptr); }
+        LogText(const LogText&) = delete;
+        LogText& operator=(const LogText&) = delete;
+        void write(llmbridge::net::log::Level, std::string_view line) noexcept override
+        {
+            try
+            {
+                text.append(line);
+            }
+            catch (...)
+            {
+            }
+        }
+        std::string text;
+    };
 
     /// Records every call; a send completes only when `next_send` says Done.
     class FakeIo final : public llmbridge::detail::IoOps
@@ -511,6 +532,55 @@ namespace
         EXPECT_TRUE(c->rbuf.empty()) << "the failover's copy of the request was left behind";
     }
 
+    // Each limit is raised in a different place, so the 503 names the one that ran out, and
+    // the profile counts them apart from the venues' failures.
+    TEST(CoreFailover, ALocalFailureNamesWhatRanOutAndIsCounted)
+    {
+        LogText log;
+        {
+            Venues v({"127.0.0.1", "127.0.0.1"});
+            v.io.refusals = {EMFILE};
+            ClientConn* c = v.t.client();
+            c->rbuf = kChat;
+            v.t.bytes(c);
+            EXPECT_EQ(v.client_status(), 503);
+            EXPECT_EQ(v.t.stats().upstream_local_failures, 1u);
+        }
+        {
+            Venues v({"127.0.0.1", "127.0.0.1"});
+            ClientConn* c = v.t.client();
+            UpstreamConn* u = v.t.upstream();
+            dispatched(v.t, c, u);
+            v.t.connect_error(u, ENOBUFS);
+            EXPECT_EQ(v.client_status(), 503);
+            EXPECT_EQ(v.t.stats().upstream_local_failures, 1u);
+        }
+        EXPECT_NE(log.text.find("reply 503 no upstream (gateway out of resources: EMFILE"), std::string::npos)
+            << log.text;
+        EXPECT_NE(log.text.find("reply 503 no upstream (gateway out of resources: ENOBUFS"), std::string::npos)
+            << log.text;
+    }
+
+    // Past dispatch a 5xx names the venue it was for; a refusal before any venue does not.
+    TEST(CoreFailover, AFailedRequestsReplyNamesItsVenue)
+    {
+        LogText log;
+        Venues v({"127.0.0.1", "127.0.0.1"});
+        ClientConn* c = v.t.client();
+        UpstreamConn* u = v.t.upstream(1);
+        v.t.dispatch(c, u);
+        v.t.error_respond(c, 502);
+        EXPECT_NE(log.text.find("reply 502 test on "), std::string::npos) << log.text;
+        EXPECT_NE(log.text.find(" venue=1"), std::string::npos) << log.text;
+
+        ClientConn* d = v.t.client();
+        d->req.begin(8);
+        v.t.error_respond(d, 503);
+        const size_t at = log.text.find("reply 503 test on ");
+        ASSERT_NE(at, std::string::npos) << log.text;
+        EXPECT_EQ(log.text.find(" venue=", at), std::string::npos) << "no venue was chosen:\n" << log.text;
+    }
+
     // No free local port is per destination on Linux: another venue may still have one, so
     // it is the venue's to fail over from, never a 503 for the whole host.
     TEST(CoreFailover, NoLocalPortForOneVenueFailsOver)
@@ -816,6 +886,41 @@ namespace
         EXPECT_EQ(t.venue(0).ip, "127.0.0.1");
     }
 
+    // An address that does not parse, with no name to look up, is never dialled: said once,
+    // at boot, rather than only by the refusals.
+    TEST(CoreResolve, AnAddressWithNoNameToResolveIsCalledOutAtBoot)
+    {
+        LogText log;
+        std::vector<llmbridge::Upstream> ups{{.ip = "venue.example", .port = 9}, {.ip = "127.0.0.1", .port = 10}};
+        Gateway gw(0, ups, 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {}, false,
+                   nullptr, {});
+        EXPECT_NE(log.text.find("upstream[0] address 'venue.example' is not an IPv4 address and it has no host"),
+                  std::string::npos)
+            << log.text;
+        EXPECT_EQ(log.text.find("upstream[1] address"), std::string::npos) << log.text;
+    }
+
+    // A lookup that finds what the venue already has is no news at INFO: a venue refusing
+    // connects is looked up again every second.
+    TEST(CoreResolve, AnUnchangedAnswerIsNotLoggedAtInfo)
+    {
+        g_lookups = 0;
+        g_fail_first = 0;
+        LogText log;
+        std::vector<llmbridge::Upstream> ups{{.ip = "127.0.0.1", .port = 9, .host = "localhost"}};
+        Gateway gw(0, ups, 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {}, false,
+                   nullptr, {});
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        t.e._rr->resolve = &flaky_lookup;
+        t.e.note_connect_failure(0, "refused");
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_EQ(t.stats().upstream_reresolved, 1u);
+        EXPECT_EQ(log.text.find("resolved localhost"), std::string::npos) << log.text;
+    }
+
     // A failed connect moves a venue given by addresses to its next one, and the Host it
     // names moves with it.
     TEST(CoreResolve, TheHostHeaderFollowsTheAddressInUse)
@@ -849,7 +954,11 @@ namespace
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         ASSERT_TRUE(g_in_lookup.load());
         const auto t0 = std::chrono::steady_clock::now();
-        gw.reset();
+        {
+            LogText log;
+            gw.reset();
+            EXPECT_NE(log.text.find("a name lookup is still running at shutdown"), std::string::npos) << log.text;
+        }
         EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(1));
         g_release = true; // the detached lookup finishes against the state it shares
     }
@@ -1304,6 +1413,22 @@ namespace
         EXPECT_EQ(t.stats().client_idle_timeouts, 1u);
         EXPECT_EQ(t.stats().upstream_timeouts, 0u);
         EXPECT_EQ(t.stats().upstream_retries, 0u);
+    }
+
+    // A client that stopped reading its reply is timed out as its own stall, and the reply's
+    // line says so: the venue answered.
+    TEST_F(Core, AReplyTheClientStoppedReadingIsLoggedAsItsStall)
+    {
+        LogText log;
+        ClientConn* c = t.client();
+        t.dispatch(c, t.upstream());
+        c->ever_framed = true;
+        c->req.f.ts_progress = 1;
+        c->out.stage() = "HTTP/1.1 200 OK\r\n"; // owed, not yet read
+        t.sweep(c, 2 + Gateway::kDefaultUpstreamIdleNs);
+        EXPECT_EQ(t.stats().client_idle_timeouts, 1u);
+        EXPECT_NE(log.text.find("reply 504 client stalled, not reading"), std::string::npos) << log.text;
+        EXPECT_EQ(log.text.find("upstream idle timeout"), std::string::npos) << log.text;
     }
 
     // The same sweep with request bytes the venue has not taken: it stopped reading, so it
