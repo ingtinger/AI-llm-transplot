@@ -155,7 +155,7 @@ the key itself stays in the head, found through the spans `HeadFacts` recorded.
 |---|---|---|
 | `Idle` | at framing (`begin()`), and when a reply finishes | a new request may be framed |
 | `Dispatched` | `*_forward`, before the upstream is acquired | retry on a fresh connection, failover to another venue |
-| `Responding` | the first response byte in the upstream's `rbuf` | neither: the venue may have acted on the request |
+| `Responding` | the first response byte in the upstream's `rbuf` | neither: the venue may have acted on the request; a failure is reported to the policy, `retryable` false |
 | `Streaming` | the SSE head is staged | the stream finishes when it ends |
 | `Replying` | a whole reply is staged | the reply finishes once it is on the wire |
 
@@ -175,10 +175,15 @@ written once and runs on both.
 | operation | epoll | io_uring |
 |---|---|---|
 | `send` | write now; `Queued` arms `EPOLLOUT` | one send SQE; always `Queued` unless nothing is owed |
-| `connect` | non-blocking `connect()`, `EPOLLIN` and `EPOLLOUT` | socket, resolve, a connect SQE |
+| `connect` | non-blocking `connect()`, `EPOLLIN` and `EPOLLOUT`; an error known at once is its return | socket, a connect SQE; a full queue returns `EAGAIN` |
 | `set_read` | `EPOLLIN` off or on | cancel the multishot recv; re-arm it on resume |
 | `close` | `Engine::forget`, then `::close` | `Engine::forget`, then cancel; freed at `inflight == 0` |
 
+`connect` returns 0, or the errno that stopped it with nothing open, and
+`connect_error_is_local` sorts that errno: out of descriptors, local ports or memory, or a
+full submission queue is this host's, answered 503 with no failover and nothing told to
+the policy; anything else is the venue's, which moves it to its next address, asks for its
+name again (section 8) and fails over, as the same answer arriving later as an event does.
 A send that completes at once is a return value (`Sent::Done`), never a callback, so
 no handler runs re-entered. `IoCaps` says how the backend bounds a stream for a slow
 client: both pause its upstream, each at its own threshold, and io_uring keeps a cap
@@ -233,6 +238,13 @@ its connect completing is its first writable event.
 **Back-pressure.** `set_read` drops `EPOLLIN`; `EPOLLHUP` and `EPOLLERR` still fire, so a
 close is never missed. Reads are bounded per event (`kMaxReadPerEvent`, 1 MiB): a drain
 to `EAGAIN` once staged 33 MB for a client that never read.
+
+**A close behind the answer.** One drain can read a venue's last bytes and its EOF
+together: a reply of a multiple of the 16 KiB read with the FIN in the same segment. The
+bytes are framed before the close is handled, the connection marked never to pool, so a
+complete answer is the client's; handled first, the close made it a 502 and a failure
+reported against a venue that had answered. A stream frames what is left at its own EOF.
+io_uring completes the data before the close, so it never had the question.
 
 ## 5. The io_uring backend (`gateway/src/io/uring_io.cpp`)
 
@@ -453,6 +465,8 @@ time to first token.
         +-- UpstreamPool::acquire(venue): the newest, from_pool = true, ++upstream_reused
         |
         +-- else: new socket, connect (async on both backends; IoOps::connect)
+        |         no address yet: refused, the name asked for off the loop
+        |         an error known at once: this host's (503), or the venue's (next address)
 
   ...request completes...
 
@@ -498,6 +512,19 @@ byte arrives is retry-eligible (`from_pool && !retried`): the request is resent
 on a fresh connection, and the client never sees the blip. The write path keeps
 `out`'s front for exactly this reason, so the request survives to be resent (2b);
 the gate is the phase (3c), so a request whose response has begun is never resent.
+
+**Addresses and the resolver thread.** A venue's address is `Upstream::ip`, read by
+`new_upstream` at every fresh connect, never cached. A failed connect moves it to the next
+of `ips`, and a venue with a `host` asks for the name again (`request_reresolve`). The
+lookup runs on a thread that shares only `Reresolver` with the engine, by `shared_ptr`:
+the name travels with the job and the answer comes back in `done`, whose capacity is one
+entry per venue, so a push never allocates; `apply_reresolved` installs answers from the
+sweep, on the loop. Per venue, one job in flight (`_rr_inflight`), and none before
+`_rr_next_ns`: a second after an answer, or a backoff that doubles with each failed lookup
+up to `kReresolveMaxNs`. A venue given by name with no address yet is asked for by `run()`
+and by every sweep the backoff allows, and refused meanwhile (`upstream_unresolved`). The
+engine's destructor joins an idle resolver and detaches a busy one, whose lookup finishes
+on the shared state: shutdown never takes the resolver's timeouts.
 
 
 ### 8b. Sizing `kMaxIdleUpstreams`, and why it is 8192
