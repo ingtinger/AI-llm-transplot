@@ -676,7 +676,8 @@ namespace llmbridge::detail
     /// providers route and verify on it; ip:port otherwise. Default ports omitted.
     std::string host_header_for(const Upstream& u)
     {
-        if (u.sni_host.empty()) return u.ip + ":" + std::to_string(u.port);
+        // A name with no address yet stands in until one resolves; nothing is sent meanwhile.
+        if (u.sni_host.empty()) return (u.ip.empty() ? u.host : u.ip) + ":" + std::to_string(u.port);
         const bool default_port = (u.tls && u.port == 443) || (!u.tls && u.port == 80);
         return default_port ? u.sni_host : u.sni_host + ":" + std::to_string(u.port);
     }

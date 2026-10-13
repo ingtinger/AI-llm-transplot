@@ -28,7 +28,7 @@ provider/   dialect translation (OpenAI ⇄ Anthropic / Gemini / Cohere)   (no I
 gateway/    the event-loop proxy that ties net + provider together
   ├─ facade.cpp         Gateway, the public class: forwards to the Engine
   ├─ engine.{hpp,cpp}   detail::Engine: construction, teardown, run(), warm buffers
-  ├─ resolve.cpp        next address after a failed connect, re-resolution thread
+  ├─ resolve.cpp        next address after a failed connect; names resolved off the loop
   ├─ core/              the one request lifecycle, by concern: client, upstream,
   │                     stream, transport (TLS), sink, sweep, pool; io.hpp is IoOps,
   │                     conn.hpp the two connection kinds, req.hpp a request,
@@ -661,15 +661,48 @@ traffic and crossing the idle line far more often, and every crossing costs the 
 request a reconnect and a TLS handshake. That is what `--pool-idle` exists to tune, and
 its 30 s default was chosen when there was one pool.
 
+### Venue addresses
+
+A venue is dialled at `Upstream::ip`. Given a list (`ips`), a failed connect moves it to
+the next address; given a name (`host`), the failure also asks for the name again. The
+lookup runs on a resolver thread, never the loop, and the loop installs its answer at the
+next sweep. One venue's name is looked up at most once a second, and a name that keeps
+failing waits twice as long each time, up to half a minute.
+
+A venue may be given by its name alone, with no address yet: an embedder that resolves
+at boot need not refuse to start on one name that did not resolve. `run()` asks for it,
+the sweep asks again as the backoff allows, traffic or not, and until an answer arrives
+the venue is refused ("no upstream (venue unresolved)") like any venue that cannot be
+reached, so a policy fails over from it. The stock binary still refuses a name that does
+not resolve at startup: with no policy there is nothing to fail over to.
+
+The bare `IP:PORT` form's Host header names the address dialled, so it follows the address
+as it moves. Destroying a `Gateway` never waits on a lookup in flight, which can take the
+resolver's timeouts while DNS is down: the lookup finishes on its own state, detached.
+
 ### When a venue fails
 
-`Policy::on_failure` fires when a venue did not answer and the client has seen nothing.
-It may name another; the request is then rebuilt for that venue's dialect, since the
-bytes queued for the failed one were translated for its API.
+`Policy::on_failure` fires once for every venue that failed while the client has seen
+nothing: a refused or unreachable connect, a failed write, EOF or silence before the
+response was whole, or a venue whose name has no address yet. It may name another; the
+request is then rebuilt for that venue's dialect, since the bytes queued for the failed one
+were translated for its API. A first attempt fails over like any later one.
+
+`FailureFacts::retryable` says whether the answer is used. It is false with a one-venue
+table, once a response byte is in (the venue may have acted, so a re-send could run the
+request twice), and for the third venue: those failures are reported so that a policy
+keeping health counts every one, and the gateway gives up whatever it returns.
+`FailureFacts::seq` is the request's sequencer, the one `RequestFacts` and `RequestRecord`
+carry, so a policy keys its own per-request state, such as the venues already tried, on it.
 
 A venue that did answer, unparseably, never reaches the hook: retrying would mask an
-incompatibility as a blip. Bounds, none of them policy: three venues per request, the
-failed venue may not be renamed, and nothing is re-sent once a byte reached the client.
+incompatibility as a blip. Neither does a failure of this host (out of descriptors or
+memory, or a full io_uring queue or epoll set), whether the connect says so at once or in
+its completion: another venue would need the same, and this one is not to blame, so the
+client gets a 503 and nothing fails over. No free local port is not one of them: Linux
+picks a port per destination, so another venue may still have one. Bounds, none of them
+policy: three venues per request, the failed venue may not be renamed, and nothing is
+re-sent once a byte reached the client.
 
 **Streaming fails over only before its first byte.** After that the stream is truncated
 honestly, because no LLM API can resume mid-stream and a reconnect would replay tokens

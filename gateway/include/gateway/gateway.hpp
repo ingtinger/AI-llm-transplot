@@ -83,10 +83,12 @@ namespace llmbridge
                 TlsConfig tls = {}, bool timing_headers = false,
                 Policy* policy = nullptr, std::vector<std::string> strip_headers = {});
         /// Several upstreams, chosen per request by the policy. Not empty, and fixed for
-        /// the process lifetime. `tls` here is the inbound leg only.
+        /// the process lifetime. `tls` here is the inbound leg only. A venue may be given
+        /// by `host` alone: run() resolves it off the loop, and it is refused until then.
         Gateway(uint16_t listen_port, std::vector<Upstream> upstreams, int64_t warmup_ns,
                 IoBackend io, int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers,
                 Policy* policy, std::vector<std::string> strip_headers);
+        /// Never waits on a name lookup in flight, which finishes on its own thread.
         ~Gateway();
         Gateway(const Gateway&) = delete;
         Gateway& operator=(const Gateway&) = delete;

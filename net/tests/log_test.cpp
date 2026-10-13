@@ -308,3 +308,14 @@ TEST(LogLine, NonFiniteAndHugeDoublesPrintWithoutUndefinedBehaviour)
     EXPECT_EQ(text(1e20), ">=2^64");
     EXPECT_EQ(text(1.5), "1.500");
 }
+
+// A default string_view's data() is null, and memcpy from null is undefined even for zero
+// bytes: an empty field in a log line must add nothing, under UBSan too.
+TEST(LogLine, AnEmptyViewAddsNothingWithoutUndefinedBehaviour)
+{
+    log_::Line l;
+    l.put(std::string_view("a"));
+    l.put(std::string_view());
+    l.put(std::string_view("b"));
+    EXPECT_EQ(std::string(l.view()), "ab");
+}

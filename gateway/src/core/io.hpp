@@ -9,6 +9,7 @@
 
 // What the shared request lifecycle asks of an event-loop backend, and nothing more.
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 
@@ -42,14 +43,25 @@ namespace llmbridge::detail
         size_t stream_cap = 0;
     };
 
+    /// Did a connect fail for want of something on this host (descriptors, memory, a full
+    /// submission queue or epoll set)? No other venue would do better, and the venue is
+    /// not to blame. Anything else is the venue's: no route, a refusal, and no free local
+    /// port, since Linux picks one per destination and another venue may still have one.
+    [[nodiscard]] constexpr bool connect_error_is_local(int err) noexcept
+    {
+        return err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM || err == EAGAIN ||
+               err == ENOSPC;
+    }
+
     /// A backend never calls back into shared code from inside one of these: a send
     /// that completes at once is a return value, so no handler runs re-entered.
     class IoOps
     {
       public:
         virtual Sent send(ConnBase& c) noexcept = 0;
-        /// Open a fresh upstream's socket and start connecting; false: nothing is open.
-        virtual bool connect(UpstreamConn& u) noexcept = 0;
+        /// Open a fresh upstream's socket and start connecting: 0, or the errno that
+        /// stopped it with nothing open (connect_error_is_local says whose it was).
+        virtual int connect(UpstreamConn& u) noexcept = 0;
         virtual void set_read(ConnBase& c, bool on) noexcept = 0;
         /// `c`, and a client's upstream with it; freed once no event can reach it.
         virtual void close(ConnBase& c) noexcept = 0;

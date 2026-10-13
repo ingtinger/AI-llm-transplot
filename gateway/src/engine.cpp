@@ -69,10 +69,11 @@ namespace llmbridge::detail
         // one is a programming error caught here and not a crash on the first request.
         if (_upstreams.empty()) throw std::runtime_error("Gateway: no upstreams configured");
         // The address first: the bare IP:PORT form's Host header is built from it.
+        // A venue given only a name has neither yet; run() asks the resolver for it.
         for (Upstream& u : _upstreams)
         {
-            if (u.ips.empty()) u.ips.push_back(u.ip);
-            if (u.ip.empty()) u.ip = u.ips.front();
+            if (u.ips.empty() && !u.ip.empty()) u.ips.push_back(u.ip);
+            if (u.ip.empty() && !u.ips.empty()) u.ip = u.ips.front();
         }
         for (Upstream& u : _upstreams)
         {
@@ -90,6 +91,10 @@ namespace llmbridge::detail
         _pool = std::make_unique<UpstreamPool>();
         _pool->init(_upstreams.size(), Gateway::kMaxIdleUpstreams);
         _rr_inflight.assign(_upstreams.size(), 0);
+        _rr_next_ns.assign(_upstreams.size(), 0);
+        _rr_backoff_ns.assign(_upstreams.size(), 0);
+        _rr->done.reserve(_upstreams.size());
+        _rr_batch.reserve(_upstreams.size());
         // Normalize once, at construction: lower-case with the colon, so the hot path
         // compares against a raw header line with no per-request work.
         for (std::string& h : strip_headers)
@@ -142,9 +147,13 @@ namespace llmbridge::detail
                     "remote endpoint. Build -DLLMBRIDGE_TLS=ON and run --listen-tls "
                     "--tls-cert --tls-key to terminate it here.");
         for (size_t i = 0; i < _upstreams.size(); ++i)
-            LB_INFO("  upstream[", static_cast<int64_t>(i), "] ", _upstreams[i].ip, ":",
-                    _upstreams[i].port, _upstreams[i].tls ? " tls" : " plaintext",
-                    " dialect=", dialect_name(_upstreams[i].dialect));
+        {
+            const Upstream& u = _upstreams[i];
+            const bool unresolved = !has_address(u) && !u.host.empty();
+            LB_INFO("  upstream[", static_cast<int64_t>(i), "] ", unresolved ? u.host : u.ip, ":", u.port,
+                    unresolved ? " (not resolved yet)" : "", u.tls ? " tls" : " plaintext",
+                    " dialect=", dialect_name(u.dialect));
+        }
 
         // Resolve the event-loop backend: io_uring for Uring/Auto when the kernel
         // supports it, else epoll. Uring requested but unavailable -> epoll.
@@ -165,12 +174,20 @@ namespace llmbridge::detail
 
     Engine::~Engine()
     {
+        // A lookup in flight can take the resolver's timeouts while DNS is down; it is left
+        // to finish on its own reference to the state, so shutdown never waits on it.
+        bool busy = false;
         {
-            std::lock_guard<std::mutex> g(_rr.mutex);
-            _rr.stop = true;
+            std::lock_guard<std::mutex> g(_rr->mutex);
+            _rr->stop = true;
+            busy = _rr->busy;
         }
-        _rr.cv.notify_all();
-        if (_rr.thread.joinable()) _rr.thread.join();
+        _rr->cv.notify_all();
+        if (_rr_thread.joinable())
+        {
+            if (busy) _rr_thread.detach();
+            else _rr_thread.join();
+        }
         // Every connection is in one registry, pooled and in-flight upstreams included,
         // so this frees each once. The pool's links into the freed are never read again.
         const auto release = [](auto* c) {
@@ -236,7 +253,8 @@ namespace llmbridge::detail
            << " tls_handshake_failures=" << _stats.client_tls_handshake_failures
            << " upstream_timeouts=" << _stats.upstream_timeouts
            << " connect_timeouts=" << _stats.connect_timeouts
-           << " upstream_reresolved=" << _stats.upstream_reresolved << "\n";
+           << " upstream_reresolved=" << _stats.upstream_reresolved
+           << " upstream_unresolved=" << _stats.upstream_unresolved << "\n";
         if (_stats.streamed_bodies + _stats.streamed_body_capped > 0)
             os << "streamed_bodies=" << _stats.streamed_bodies << " refused=" << _stats.streamed_body_refusals
                << " capped=" << _stats.streamed_body_capped << " timed_out=" << _stats.streamed_body_timeouts
@@ -328,6 +346,9 @@ namespace llmbridge::detail
 
     int Engine::run()
     {
+        // On the loop thread, which owns the per-venue resolution state; never for an
+        // engine already told to stop, whose lookups would serve nothing.
+        if (!_stop.load(std::memory_order_relaxed)) resolve_unaddressed();
         prefault(_rebuild);
         prefault(_xlate);
         // One spare set for the first connection, so its first request costs nothing.

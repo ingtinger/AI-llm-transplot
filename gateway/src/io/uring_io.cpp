@@ -266,10 +266,10 @@ namespace llmbridge::detail
         return Sent::Queued;
     }
 
-    bool UringIo::connect(UpstreamConn& u) noexcept
+    int UringIo::connect(UpstreamConn& u) noexcept
     {
         const int fd = net::make_client_socket();
-        if (fd < 0) return false;
+        if (fd < 0) return errno;
         if (_e._upstream_sndbuf > 0)
             ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_e._upstream_sndbuf, sizeof(_e._upstream_sndbuf));
         u.fd = fd;
@@ -278,7 +278,7 @@ namespace llmbridge::detail
         {
             ::close(fd);
             u.fd = -1;
-            return false;
+            return EAGAIN; // the submission queue is full: this host's, not the venue's
         }
         s->opcode = IORING_OP_CONNECT;
         s->fd = fd;
@@ -287,7 +287,7 @@ namespace llmbridge::detail
         s->user_data = make_ud(&u, UConnect);
         ++u.inflight;
         ++_inflight;
-        return true;
+        return 0;
     }
 
     void UringIo::set_read(ConnBase& c, bool on) noexcept
@@ -452,15 +452,7 @@ namespace llmbridge::detail
 
     void UringIo::on_connect(UpstreamConn* u, int res) noexcept
     {
-        if (res < 0)
-        {
-            _e.note_connect_failure(u->venue, std::strerror(-res));
-            ClientConn* client = unpair(u);
-            close(*u);
-            if (client) _e.fail_request(client, 502, "upstream connect refused");
-            else ++_e._stats.errors;
-            return;
-        }
+        if (res < 0) return _e.on_connect_error(u, -res);
         u->connected = true;
         // t2 for a plaintext upstream; tls_feed() stamps it when a handshake completes.
         if (!_e.upstream_is_tls(u))

@@ -32,7 +32,7 @@ namespace llmbridge::detail
         int run(); // until Engine::_stop, then drains every operation in flight
 
         Sent send(ConnBase& c) noexcept override;
-        bool connect(UpstreamConn& u) noexcept override;
+        int connect(UpstreamConn& u) noexcept override;
         /// Cancels the multishot recv; a resume re-arms it, or the cancel's completion does.
         void set_read(ConnBase& c, bool on) noexcept override;
         void close(ConnBase& c) noexcept override;

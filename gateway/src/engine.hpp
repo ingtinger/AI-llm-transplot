@@ -29,6 +29,7 @@
 #include "gateway/dialect.hpp"
 #include "net/http.hpp"
 #include "net/tls.hpp" // self-guarded by LLMBRIDGE_HAVE_TLS
+#include "net/upstream.hpp"
 #include "provider/translate.hpp"
 
 namespace llmbridge
@@ -149,9 +150,21 @@ namespace llmbridge::detail
         ConnBase* forget(UpstreamConn* u) noexcept;
 
         // The upstream side (core/upstream.cpp).
+        /// Why an acquire found no connection: the venue's address has not resolved, the
+        /// venue failed (a TLS session, a connect error known at once), or this host ran
+        /// out of something no other venue would supply (connect_error_is_local).
+        enum class AcquireFail : uint8_t
+        {
+            None,
+            Unresolved,
+            Venue,
+            Local,
+        };
         [[nodiscard]] UpstreamConn* new_upstream(int slot) noexcept; // its address parsed, not open
-        UpstreamConn* acquire_upstream(int slot) noexcept;         // pooled, else a fresh connect
-        bool retry_upstream(UpstreamConn* u) noexcept;             // once, on a fresh connection
+        UpstreamConn* acquire_upstream(int slot, AcquireFail* why = nullptr) noexcept; // pooled, else a fresh connect
+        void take_request(ClientConn* c) noexcept; // out of rbuf, into `saved` when a failover may resend it
+        bool retry_upstream(UpstreamConn* u) noexcept; // once, on a fresh connection; true: handled
+        void on_connect_error(UpstreamConn* u, int err) noexcept; // a connect's completion said no
         void release_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept;
         [[nodiscard]] bool pool_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept;
         bool upstream_failed(ClientConn* client, int status, const char* why) noexcept; // failover
@@ -229,20 +242,38 @@ namespace llmbridge::detail
 
         // Re-resolution (resolve.cpp).
         void note_connect_failure(int slot, const char* why) noexcept;
-        void request_reresolve(int slot) noexcept;
-        void reresolve_loop() noexcept;
+        void request_reresolve(int slot) noexcept; // off the loop, at most once a kReresolveMinNs
+        void resolve_unaddressed() noexcept;       // every venue with a name and no address yet
         void apply_reresolved() noexcept;
+        [[nodiscard]] static bool has_address(const Upstream& up) noexcept; // an ip that parses
+        void readdress(Upstream& up, const std::string& ip) noexcept;       // and Host with it
+        /// Shared with the resolver thread, which holds its own reference: a lookup still
+        /// in flight when the engine goes is detached, never waited out, and finishes here.
         struct Reresolver
         {
-            std::thread thread;
+            struct Done
+            {
+                int slot = -1;
+                std::vector<std::string> ips; ///< empty: the lookup failed
+                std::string err;
+            };
             std::mutex mutex;
             std::condition_variable cv;
-            std::vector<int> pending;
-            std::vector<std::pair<int, std::vector<std::string>>> done;
+            std::vector<std::pair<int, std::string>> pending; ///< slot, and its name copied
+            std::vector<Done> done; ///< capacity for every venue, so a push never allocates
+            /// The lookup; a test seam, set before the first request asks for one.
+            std::vector<std::string> (*resolve)(const std::string&, std::string*) = &net::resolve_host_ipv4;
             bool stop = false;
+            bool busy = false;              ///< a lookup is running
             std::atomic<bool> ready{false}; ///< `done` is non-empty; the loop's cheap check
-        } _rr;
-        std::vector<uint8_t> _rr_inflight; ///< per slot: a resolution is outstanding
+        };
+        static void reresolve_loop(const std::shared_ptr<Reresolver>& rr) noexcept;
+        std::shared_ptr<Reresolver> _rr = std::make_shared<Reresolver>();
+        std::thread _rr_thread;
+        std::vector<Reresolver::Done> _rr_batch; ///< swapped with `done`, keeping its capacity
+        std::vector<uint8_t> _rr_inflight;       ///< per slot: a resolution is outstanding
+        std::vector<int64_t> _rr_next_ns;        ///< per slot: no lookup before this
+        std::vector<int64_t> _rr_backoff_ns;     ///< per slot: 0, or how long the last failure waits
 
         /// At most this many venues per request: one dead provider is not a latency
         /// multiplier under a policy that always names another.

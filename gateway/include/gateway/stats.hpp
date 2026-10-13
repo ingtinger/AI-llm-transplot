@@ -38,7 +38,7 @@ namespace llmbridge
         uint64_t tls_buffered_peak = 0;
         uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
         uint64_t connect_timeouts = 0;  // fresh upstream connects abandoned at the deadline
-        uint64_t upstream_reresolved = 0; // venue address lists replaced after a connect failure
+        uint64_t upstream_reresolved = 0; // venue address lists replaced: a failure, or none at first
         uint64_t client_idle_timeouts = 0;  // established clients dropped after going quiet,
                                             // or for not reading a reply in flight
         uint64_t client_setup_timeouts = 0; // clients dropped for never completing a
@@ -86,5 +86,6 @@ namespace llmbridge
         /// counted in streamed_body_redone).
         uint64_t streamed_override_spliced = 0;
         uint64_t streamed_override_redone = 0;
+        uint64_t upstream_unresolved = 0; // acquires refused: the venue's name had no address yet
     };
 } // namespace llmbridge

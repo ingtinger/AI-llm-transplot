@@ -93,10 +93,16 @@ namespace llmbridge::detail
     UpstreamConn* Engine::new_upstream(int slot) noexcept
     {
         // The venue's address now, never a cached one: the ip may have rotated. One
-        // that does not parse fails the acquire, on both backends.
+        // that does not parse fails the acquire, on both backends, and a name with no
+        // address yet is asked for off the loop.
         const Upstream& up = _upstreams[static_cast<size_t>(slot)];
         sockaddr_in addr{};
-        if (!net::resolve_ipv4(up.ip.c_str(), up.port, addr)) return nullptr;
+        if (!net::resolve_ipv4(up.ip.c_str(), up.port, addr))
+        {
+            ++_stats.upstream_unresolved;
+            request_reresolve(slot);
+            return nullptr;
+        }
         auto* u = new UpstreamConn();
         u->venue = slot;
         u->ts_opened = now_ns();
@@ -105,8 +111,11 @@ namespace llmbridge::detail
         return u;
     }
 
-    UpstreamConn* Engine::acquire_upstream(int slot) noexcept
+    UpstreamConn* Engine::acquire_upstream(int slot, AcquireFail* why) noexcept
     {
+        AcquireFail ignored = AcquireFail::None;
+        AcquireFail& fail = why ? *why : ignored;
+        fail = AcquireFail::None;
         // Only this venue's pool: a connection to one provider cannot serve a request
         // bound for another, and handing one over would send the request, and its
         // credential, to the wrong company.
@@ -119,18 +128,32 @@ namespace llmbridge::detail
             return u;
         }
         UpstreamConn* u = new_upstream(slot);
-        if (!u) return nullptr;
+        if (!u)
+        {
+            fail = AcquireFail::Unresolved;
+            return nullptr;
+        }
         adopt_warm(u);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (upstream_of(u).tls && !tls_attach_upstream(u))
         {
             delete u;
+            fail = AcquireFail::Venue;
             return nullptr;
         }
 #endif
-        if (!_ops->connect(*u))
+        if (const int err = _ops->connect(*u))
         {
             delete u;
+            if (connect_error_is_local(err))
+            {
+                fail = AcquireFail::Local;
+                return nullptr;
+            }
+            // Known at once, as epoll learns an unreachable network: the venue moves on as
+            // it would for the same answer arriving later.
+            fail = AcquireFail::Venue;
+            note_connect_failure(slot, std::strerror(err));
             return nullptr;
         }
         _upconns->add(u);
@@ -139,6 +162,19 @@ namespace llmbridge::detail
         // the log at its second request, never at its birth.
         LB_DEBUG("upstream open ", *u, " to ", upstream_of(u).ip, " pool=", pooled_upstream_count());
         return u;
+    }
+
+    void Engine::on_connect_error(UpstreamConn* u, int err) noexcept
+    {
+        // This host's (connect_error_is_local) is answered as an acquire answers it: a 503,
+        // nothing failed over, nothing told to the policy. Anything else is the venue's.
+        const bool local = connect_error_is_local(err);
+        if (!local) note_connect_failure(u->venue, std::strerror(err));
+        ClientConn* client = unpair(u);
+        _ops->close(*u);
+        if (!client) ++_stats.errors;
+        else if (local) error_respond(client, 503, "no upstream (gateway out of resources)");
+        else fail_request(client, 502, "upstream connect refused");
     }
 
     bool Engine::retry_upstream(UpstreamConn* u) noexcept
@@ -176,10 +212,17 @@ namespace llmbridge::detail
             return false;
         }
 #endif
-        if (!_ops->connect(*uf))
+        if (const int err = _ops->connect(*uf))
         {
             delete uf;
-            return false;
+            if (!connect_error_is_local(err))
+            {
+                note_connect_failure(u->venue, std::strerror(err));
+                return false;
+            }
+            // This host's: answered 503 here, never reported as the stale venue's EOF.
+            error_respond(client, 503, "no upstream (gateway out of resources)");
+            return true;
         }
         client->req.f.upstream_ip = uf->up_addr.sin_addr.s_addr;
         client->req.f.ts_up_sent = client->req.f.ts_body_sent = 0; // this attempt's own send
@@ -373,23 +416,26 @@ namespace llmbridge::detail
 
     Retry Engine::failover_target(ClientConn* client, int status, const char* why) noexcept
     {
-        // Every precondition here is about safety, not policy. Re-sending a request the
-        // client has already begun receiving would duplicate output; re-sending one we
-        // no longer hold is impossible; and an unbounded chain turns one dead provider
-        // into a latency multiplier.
-        if (!_policy || _upstreams.size() < 2) return {};
-        if (!client || client->doomed) return {};
-        // No response byte may have arrived, or the venue may have acted on the request,
-        // and nothing may be owed to the client, or a re-send duplicates output.
-        if (!client->req.can_redispatch() || !client->out.idle()) return {};
-        if (client->req.saved.empty() && !client->req.f.body_in_rbuf) return {};
-        if (client->req.f.body_parked) return {}; // no venue has it: nothing failed
-        if (client->req.f.failover_attempts >= kMaxFailoverAttempts - 1) return {};
-
-        const FailureFacts f{client->upstream_slot, status, why, client->req.f.failover_attempts,
-                             client->req.f.policy_tag};
+        if (!_policy || !client || client->doomed) return {};
+        ReqState& rf = client->req.f;
+        // A venue that had the request failed, and the client has been sent nothing: a
+        // reply begun is no failure of this kind, and a parked body no venue holds.
+        if (rf.body_parked || (rf.phase != Phase::Dispatched && rf.phase != Phase::Responding) ||
+            !client->out.idle())
+            return {};
+        // The policy hears of every such failure, so one that counts them sees them all; it
+        // routes only those that are safe to redo. Every precondition here is about safety,
+        // not policy: a response byte in means the venue may have acted, so a re-send could
+        // duplicate it; re-sending one we no longer hold is impossible; and an unbounded
+        // chain turns one dead provider into a latency multiplier.
+        const bool retryable = _upstreams.size() >= 2 && client->req.can_redispatch() &&
+                               (!client->req.saved.empty() || rf.body_in_rbuf) &&
+                               rf.failover_attempts < kMaxFailoverAttempts - 1;
+        const FailureFacts f{.upstream_index = client->upstream_slot, .status = status, .reason = why,
+                             .attempt = rf.failover_attempts, .tag = rf.policy_tag, .seq = rf.req_seq,
+                             .retryable = retryable};
         const Retry r = _policy->on_failure(f);
-        if (!r.retry) return {};
+        if (!retryable || !r.retry) return {};
         if (r.upstream_index < 0 || static_cast<size_t>(r.upstream_index) >= _upstreams.size())
         {
             LB_WARN(ReqId{client->req.f.req_seq}, " failover to out-of-range upstream ",
@@ -413,7 +459,6 @@ namespace llmbridge::detail
         }
         // The new venue's overrides, never the failed one's: its model name is wrong for
         // another venue. Copied now, since the views die once on_failure has returned.
-        ReqState& rf = client->req.f;
         if (!rf.model_override.set(r.model) || !rf.tier_override.set(r.service_tier) ||
             !rf.speed_override.set(r.speed) || !rf.geo_override.set(r.inference_geo) ||
             (!r.anthropic_beta.empty() && !beta_token_ok(r.anthropic_beta)) ||

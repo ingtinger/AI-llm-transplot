@@ -171,9 +171,10 @@ namespace llmbridge
         std::string_view substitute_for{};
     };
 
-    /// A venue did not answer (refused connect, failed write, EOF before the response, idle
-    /// timeout) and the client has seen nothing: the policy may fail over. An unparseable
-    /// answer never reaches here, since retrying would mask an incompatibility.
+    /// A venue did not answer (refused connect, failed write, EOF or silence before the
+    /// response was whole) and the client has seen nothing. `retryable`: the policy may fail
+    /// over; false (one venue, a response byte in, the third venue) ignores its answer and
+    /// leaves the failure for it to count. An unparseable answer never reaches here.
     struct FailureFacts
     {
         int upstream_index = -1; ///< the venue that just failed
@@ -181,6 +182,8 @@ namespace llmbridge
         const char* reason = ""; ///< the gateway's short literal for the failure
         int attempt = 0;         ///< venues already tried for this request, 0 on the first
         uint64_t tag = 0;        ///< Decision::tag of this request, verbatim; 0 if unset
+        uint64_t seq = 0;        ///< RequestFacts::seq of this request, as RequestRecord::seq carries it
+        bool retryable = true;   ///< false: the gateway gives up whatever on_failure returns
     };
 
     /// Value-initialised means give up and let the client see the error.
@@ -217,8 +220,9 @@ namespace llmbridge
         /// noexcept and allocation-free on the allow path: every request pays for it.
         virtual Decision decide(const RequestFacts& facts) noexcept = 0;
 
-        /// After a venue failed with nothing sent to the client. The default never retries:
-        /// llmbridge measures no health, so ordering, ejection and cooldown are the policy's.
+        /// Once per venue that failed with nothing sent to the client. The default never
+        /// retries: llmbridge measures no health, so ordering, ejection and cooldown are the
+        /// policy's. With FailureFacts::retryable false the answer is ignored: count, not route.
         virtual Retry on_failure(const FailureFacts&) noexcept { return {}; }
 
         virtual bool wants_prefix_hash() const noexcept { return false; }

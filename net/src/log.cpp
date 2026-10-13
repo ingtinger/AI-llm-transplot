@@ -124,6 +124,7 @@ namespace llmbridge::net::log
 
     void Line::put(std::string_view s) noexcept
     {
+        if (s.empty()) return; // a default view's data() is null, which memcpy may not take
         const size_t room = kCap - _n;
         if (s.size() > room)
         {

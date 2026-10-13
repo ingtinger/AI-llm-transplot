@@ -256,25 +256,36 @@ namespace llmbridge::detail
 
     // One EPOLL_CTL_ADD, read and write interest together: the connect's completion is
     // the first writable event.
-    bool EpollIo::connect(UpstreamConn& u) noexcept
+    int EpollIo::connect(UpstreamConn& u) noexcept
     {
         const int fd = net::make_client_socket();
-        if (fd < 0) return false;
+        if (fd < 0) return errno;
         if (_e._upstream_sndbuf > 0)
             ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_e._upstream_sndbuf, sizeof(_e._upstream_sndbuf));
+        // An error known at once (no route, no local port) is the connect's answer now,
+        // where a refusal arrives as the first writable event.
         if (::connect(fd, reinterpret_cast<const sockaddr*>(&u.up_addr), sizeof(u.up_addr)) < 0 &&
             errno != EINPROGRESS)
         {
+            const int err = errno;
             ::close(fd);
-            return false;
+            return err;
         }
         u.fd = fd;
         u.write_armed = true;
         epoll_event ev{};
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.u64 = tag(&u);
-        ::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev);
-        return true;
+        // Unregistered, it would never hear its connect complete: nothing is open after all.
+        if (::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev) != 0)
+        {
+            const int err = errno;
+            ::close(fd);
+            u.fd = -1;
+            u.write_armed = false;
+            return err;
+        }
+        return 0;
     }
 
     Sent EpollIo::send(ConnBase& c) noexcept
@@ -355,16 +366,7 @@ namespace llmbridge::detail
         const uint64_t sent = u->sent_bytes;
         if (!u->connected)
         {
-            const int err = net::connect_result(u->fd);
-            if (err != 0)
-            {
-                _e.note_connect_failure(u->venue, std::strerror(err));
-                ClientConn* client = unpair(u);
-                close(*u);
-                if (client) _e.fail_request(client, 502, "upstream connect refused");
-                else ++_e._stats.errors;
-                return;
-            }
+            if (const int err = net::connect_result(u->fd); err != 0) return _e.on_connect_error(u, err);
             u->connected = true;
             // t2 for a plaintext upstream; tls_feed() stamps it when a handshake completes.
             if (!_e.upstream_is_tls(u))
@@ -402,6 +404,7 @@ namespace llmbridge::detail
 
     void EpollIo::on_upstream_readable(UpstreamConn* u) noexcept
     {
+        const size_t had = u->rbuf.size();
 #ifdef LLMBRIDGE_HAVE_TLS
         const bool read_ok = u->tls ? tls_drain_read(u) : drain_read(u);
 #else
@@ -409,6 +412,15 @@ namespace llmbridge::detail
 #endif
         note_response_bytes(u);
         if (read_ok) return _e.on_upstream_bytes(u);
+        // The venue closed right behind bytes this same drain read: they are framed first,
+        // as a close arriving in a later event would have left them, so a complete answer is
+        // the client's and not a failure. A stream frames what is left at its own EOF.
+        if (u->rbuf.size() > had && u->client && !u->client->req.f.streaming)
+        {
+            u->peer_eof = true; // never pooled, whatever these bytes finish
+            _e.on_upstream_bytes(u);
+            if (u->doomed || !u->client) return;
+        }
 #ifdef LLMBRIDGE_HAVE_TLS
         _e.on_upstream_eof(u, u->tls && u->tls->want() == net::tls::Want::Error);
 #else

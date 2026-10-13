@@ -26,8 +26,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace llmbridge
@@ -101,6 +104,28 @@ namespace llmbridge
         size_t pooled() const { return g.pooled_upstream_count(); }
         size_t bodies_streaming() const { return e._bodies_streaming; }
         void sweep(ClientConn* c, int64_t now) { e.sweep_client(c, now, /*busy=*/true); }
+        void resolve_unaddressed() { e.resolve_unaddressed(); }
+        /// The resolver thread answered, within `limit`; apply_resolved() installs it, as
+        /// the sweep would. `ready` is set under the mutex apply_reresolved takes.
+        bool wait_resolved(std::chrono::milliseconds limit = std::chrono::milliseconds(5000))
+        {
+            const auto end = std::chrono::steady_clock::now() + limit;
+            while (!e._rr->ready.load(std::memory_order_acquire))
+            {
+                if (std::chrono::steady_clock::now() > end) return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return true;
+        }
+        void apply_resolved() { e.apply_reresolved(); }
+        void connect_error(UpstreamConn* u, int err) { e.on_connect_error(u, err); }
+        /// One sweep now, whenever the last one ran.
+        void sweep_idle()
+        {
+            e._last_sweep_ns = 0;
+            e.sweep_idle();
+        }
+        llmbridge::Upstream& venue(int i) { return e._upstreams[static_cast<size_t>(i)]; }
     };
 } // namespace llmbridge
 
@@ -122,23 +147,33 @@ namespace
         explicit FakeIo(GatewayCoreTest& t) noexcept : _t(t) {}
         std::vector<std::string> calls;
         Sent next_send = Sent::Done;
-        bool connect_ok = true;
+        bool connect_ok = true;          ///< false: every connect is refused with connect_errno
+        int connect_errno = ENETUNREACH;
+        std::vector<int> refusals;       ///< the next connects refused, in order, before one starts
+        std::string client_wire;         ///< every byte a client was sent
 
         Sent send(ConnBase& c) noexcept override
         {
             calls.push_back(c.kind == ConnKind::Client ? "send client" : "send upstream");
             if (next_send != Sent::Done) return next_send;
             const size_t n = c.out.wire().size();
+            if (c.kind == ConnKind::Client) client_wire.append(c.out.wire().data(), n);
             c.out.sent(n);
             c.sent_bytes += n;
             return Sent::Done;
         }
-        bool connect(UpstreamConn& u) noexcept override
+        int connect(UpstreamConn& u) noexcept override
         {
             calls.push_back("connect");
-            if (!connect_ok) return false;
+            if (!connect_ok) return connect_errno;
+            if (!refusals.empty())
+            {
+                const int err = refusals.front();
+                refusals.erase(refusals.begin());
+                return err;
+            }
             u.fd = ::eventfd(0, EFD_CLOEXEC);
-            return true;
+            return 0;
         }
         void set_read(ConnBase& c, bool on) noexcept override
         {
@@ -348,6 +383,475 @@ namespace
 
         c->req.f.phase = Phase::Responding;
         EXPECT_FALSE(t.failover(c)) << "the venue may have acted";
+    }
+
+    /// Sends every request to venue 0 tagged 0xBEEF, fails each failure over to the next
+    /// venue, and keeps what it was told.
+    class Walk final : public llmbridge::Policy
+    {
+      public:
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = 0, .tag = 0xBEEF};
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            seen.push_back(f);
+            return {.retry = true, .upstream_index = f.attempt + 1};
+        }
+        std::vector<llmbridge::FailureFacts> seen;
+    };
+
+    /// One venue per address, ports 9, 10, ..., behind a Walk policy.
+    struct Venues
+    {
+        explicit Venues(const std::vector<std::string>& ips)
+            : gw(0, table(ips), 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {}, false,
+                 &policy, {})
+        {
+            t.attach(io, true);
+        }
+        static std::vector<llmbridge::Upstream> table(const std::vector<std::string>& ips)
+        {
+            std::vector<llmbridge::Upstream> ups;
+            for (const std::string& ip : ips)
+                ups.push_back({.ip = ip, .port = static_cast<uint16_t>(9 + ups.size())});
+            return ups;
+        }
+        /// The status line's code of what the client was sent, 0 for nothing.
+        int client_status() const
+        {
+            const std::string& w = io.client_wire;
+            return w.size() >= 12 ? std::stoi(w.substr(9, 3)) : 0;
+        }
+        Walk policy;
+        Gateway gw;
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+    };
+
+    const std::string kChat = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
+
+    /// A request dispatched on `u`, kept for a failover as dispatch keeps one.
+    void dispatched(GatewayCoreTest& t, ClientConn* c, UpstreamConn* u)
+    {
+        t.dispatch(c, u);
+        c->req.saved = kChat;
+        ASSERT_EQ(llmbridge::net::http::parse_request(c->req.saved, c->msg),
+                  llmbridge::net::http::FrameStatus::Complete);
+    }
+
+    // A first attempt whose connect fails at once, as epoll learns an unreachable network
+    // inside connect(), had kept nothing for a failover to resend: a 502 where the same
+    // answer arriving later, as io_uring learns it, failed over.
+    TEST(CoreFailover, AFirstAttemptWhoseConnectFailsAtOnceFailsOver)
+    {
+        Venues v({"127.0.0.1", "127.0.0.1"});
+        v.io.refusals = {ENETUNREACH};
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat + "GET /next"; // the start of a pipelined request, behind it
+        v.t.bytes(c);
+        ASSERT_NE(c->up, nullptr);
+        EXPECT_EQ(c->up->venue, 1);
+        ASSERT_EQ(v.policy.seen.size(), 1u);
+        EXPECT_EQ(v.policy.seen[0].upstream_index, 0);
+        EXPECT_STREQ(v.policy.seen[0].reason, "no upstream (connect failed)");
+        EXPECT_EQ(c->up->out.bytes().rfind("POST /v1/chat/completions", 0), 0u);
+        EXPECT_EQ(c->rbuf, "GET /next") << "what was pipelined stays, once";
+        EXPECT_EQ(v.io.calls, (std::vector<std::string>{"connect", "connect"}));
+        EXPECT_EQ(v.t.stats().upstream_failovers, 1u);
+    }
+
+    // A venue whose name has not resolved has no address to dial; it is passed over as
+    // any venue that cannot be reached is.
+    TEST(CoreFailover, AFirstChoiceWithNoAddressFailsOver)
+    {
+        Venues v({"", "127.0.0.1"});
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat;
+        v.t.bytes(c);
+        ASSERT_NE(c->up, nullptr);
+        EXPECT_EQ(c->up->venue, 1);
+        ASSERT_EQ(v.policy.seen.size(), 1u);
+        EXPECT_STREQ(v.policy.seen[0].reason, "no upstream (venue unresolved)");
+        EXPECT_EQ(v.io.calls, (std::vector<std::string>{"connect"})) << "venue 0 was never dialled";
+        EXPECT_TRUE(c->rbuf.empty());
+    }
+
+    // This host out of descriptors, local ports or memory is no venue's fault, and every
+    // other venue would need the same: a 503, and the policy hears nothing.
+    TEST(CoreFailover, AConnectThatFailsForWantOfALocalResourceFailsNothingOver)
+    {
+        for (const int err : {EMFILE, ENFILE, ENOBUFS, ENOMEM, EAGAIN, ENOSPC})
+        {
+            Venues v({"127.0.0.1", "127.0.0.1"});
+            v.io.refusals = {err};
+            ClientConn* c = v.t.client();
+            c->rbuf = kChat;
+            v.t.bytes(c);
+            EXPECT_TRUE(v.policy.seen.empty()) << err;
+            EXPECT_EQ(v.t.stats().upstream_failovers, 0u) << err;
+            EXPECT_EQ(v.client_status(), 503) << err;
+            EXPECT_TRUE(c->doomed) << err;
+        }
+    }
+
+    // On a failover attempt too: the copy put back for it is dropped, never left to run
+    // as a second request.
+    TEST(CoreFailover, ALocalFailureOnAFailoverAttemptAnswers503Once)
+    {
+        Venues v({"127.0.0.1", "127.0.0.1"});
+        // The first refusal is the venue's and fails over; the second is this host's.
+        v.io.refusals = {ENETUNREACH, EMFILE};
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat;
+        v.t.bytes(c);
+        ASSERT_EQ(v.policy.seen.size(), 1u);
+        EXPECT_EQ(v.client_status(), 503);
+        EXPECT_TRUE(c->rbuf.empty()) << "the failover's copy of the request was left behind";
+    }
+
+    // No free local port is per destination on Linux: another venue may still have one, so
+    // it is the venue's to fail over from, never a 503 for the whole host.
+    TEST(CoreFailover, NoLocalPortForOneVenueFailsOver)
+    {
+        Venues v({"127.0.0.1", "127.0.0.1"});
+        v.io.refusals = {EADDRNOTAVAIL};
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat;
+        v.t.bytes(c);
+        ASSERT_NE(c->up, nullptr);
+        EXPECT_EQ(c->up->venue, 1);
+        EXPECT_EQ(v.policy.seen.size(), 1u);
+    }
+
+    // The same rule when the answer arrives as a connect's completion, as io_uring and an
+    // epoll writable event deliver it: this host's is a 503 the policy never hears of.
+    TEST(CoreFailover, AConnectCompletionSortsLocalFromTheVenues)
+    {
+        {
+            Venues v({"127.0.0.1", "127.0.0.1"});
+            ClientConn* c = v.t.client();
+            UpstreamConn* u = v.t.upstream();
+            dispatched(v.t, c, u);
+            v.t.connect_error(u, ENOBUFS);
+            EXPECT_TRUE(v.policy.seen.empty());
+            EXPECT_EQ(v.client_status(), 503);
+        }
+        {
+            Venues v({"127.0.0.1", "127.0.0.1"});
+            ClientConn* c = v.t.client();
+            UpstreamConn* u = v.t.upstream();
+            dispatched(v.t, c, u);
+            v.t.connect_error(u, ECONNREFUSED);
+            ASSERT_EQ(v.policy.seen.size(), 1u);
+            EXPECT_STREQ(v.policy.seen[0].reason, "upstream connect refused");
+            ASSERT_NE(c->up, nullptr);
+            EXPECT_EQ(c->up->venue, 1);
+        }
+    }
+
+    // A stale keep-alive's resend whose fresh connect fails for this host's reason is a 503,
+    // never reported as the stale venue's EOF and failed over.
+    TEST(CoreFailover, AStaleResendThatFailsForWantOfALocalResourceIsA503)
+    {
+        Venues v({"127.0.0.1", "127.0.0.1"});
+        ClientConn* c = v.t.client();
+        UpstreamConn* u = v.t.upstream();
+        v.t.release(u, true);
+        ASSERT_EQ(v.t.acquire(0), u);
+        dispatched(v.t, c, u);
+        v.io.refusals = {EMFILE};
+        EXPECT_TRUE(v.t.retry(u)) << "handled: nothing more to do for the stale connection";
+        EXPECT_TRUE(v.policy.seen.empty());
+        EXPECT_EQ(v.client_status(), 503);
+    }
+
+    // What a policy keys its own state on: the request's sequencer, the one its decision
+    // and its sink record carry, and the decision's tag.
+    TEST(CoreFailover, TheFailureCarriesTheRequestsSequencerAndTag)
+    {
+        Venues v({"127.0.0.1", "127.0.0.1"});
+        v.io.refusals = {ENETUNREACH};
+        // Past 0, which a fresh test process would otherwise hand out, so an unwired field
+        // cannot pass by also being 0.
+        llmbridge::detail::g_seq.fetch_add(1000);
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat;
+        v.t.bytes(c);
+        ASSERT_EQ(v.policy.seen.size(), 1u);
+        const llmbridge::FailureFacts& f = v.policy.seen[0];
+        EXPECT_GE(f.seq, 1000u);
+        EXPECT_EQ(f.seq, c->req.f.req_seq);
+        EXPECT_EQ(f.tag, 0xBEEFu);
+        EXPECT_EQ(f.attempt, 0);
+        EXPECT_TRUE(f.retryable);
+    }
+
+    // The budget spent: the third venue's failure is still the policy's to count, though
+    // nothing more is tried.
+    TEST(CoreFailover, TheThirdVenuesFailureIsReportedButNotRetried)
+    {
+        Venues v({"127.0.0.1", "127.0.0.1", "127.0.0.1", "127.0.0.1"});
+        v.io.refusals = {ENETUNREACH, ENETUNREACH, ENETUNREACH};
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat;
+        v.t.bytes(c);
+        ASSERT_EQ(v.policy.seen.size(), 3u);
+        EXPECT_TRUE(v.policy.seen[0].retryable);
+        EXPECT_TRUE(v.policy.seen[1].retryable);
+        EXPECT_FALSE(v.policy.seen[2].retryable);
+        EXPECT_EQ(v.policy.seen[2].attempt, 2);
+        EXPECT_EQ(v.policy.seen[2].upstream_index, 2);
+        EXPECT_EQ(v.t.stats().upstream_failovers, 2u);
+        EXPECT_EQ(v.client_status(), 502);
+    }
+
+    // One venue: nowhere to fail over to, and still a failure to count.
+    TEST(CoreFailover, AOneVenueTablesFailureIsReportedButNotRetried)
+    {
+        Venues v({"127.0.0.1"});
+        v.io.refusals = {ENETUNREACH};
+        ClientConn* c = v.t.client();
+        c->rbuf = kChat;
+        v.t.bytes(c);
+        ASSERT_EQ(v.policy.seen.size(), 1u);
+        EXPECT_FALSE(v.policy.seen[0].retryable);
+        EXPECT_EQ(v.client_status(), 502);
+    }
+
+    // A venue that answered part of a response and then failed (EOF, silence) may have
+    // acted on the request: reported, never redone.
+    TEST(CoreFailover, AFailureAfterAResponseByteIsReportedButNotRetried)
+    {
+        Venues v({"127.0.0.1", "127.0.0.1"});
+        ClientConn* c = v.t.client();
+        UpstreamConn* u = v.t.upstream();
+        dispatched(v.t, c, u);
+        c->req.f.phase = Phase::Responding;
+        EXPECT_FALSE(v.t.failover(c));
+        ASSERT_EQ(v.policy.seen.size(), 1u);
+        EXPECT_FALSE(v.policy.seen[0].retryable);
+        EXPECT_EQ(v.t.stats().upstream_failovers, 0u);
+    }
+
+    // Not this kind of failure: a reply already begun (a stream's head, an interim 100
+    // Continue still owed), or a parked body no venue holds.
+    TEST(CoreFailover, NothingIsReportedOnceTheClientWasSentBytesOrNoVenueHadIt)
+    {
+        {
+            Venues v({"127.0.0.1", "127.0.0.1"});
+            ClientConn* c = v.t.client();
+            dispatched(v.t, c, v.t.upstream());
+            c->req.f.phase = Phase::Streaming;
+            EXPECT_FALSE(v.t.failover(c));
+            EXPECT_TRUE(v.policy.seen.empty()) << "streaming";
+        }
+        {
+            Venues v({"127.0.0.1", "127.0.0.1"});
+            ClientConn* c = v.t.client();
+            dispatched(v.t, c, v.t.upstream());
+            c->req.f.body_parked = true;
+            EXPECT_FALSE(v.t.failover(c));
+            EXPECT_TRUE(v.policy.seen.empty()) << "parked";
+        }
+        {
+            Venues v({"127.0.0.1", "127.0.0.1"});
+            ClientConn* c = v.t.client();
+            dispatched(v.t, c, v.t.upstream());
+            c->out.stage() = "HTTP/1.1 100 Continue\r\n\r\n";
+            EXPECT_FALSE(v.t.failover(c));
+            EXPECT_TRUE(v.policy.seen.empty()) << "100 Continue owed";
+        }
+    }
+
+#ifdef LLMBRIDGE_HAVE_TLS
+    // Neither leg moved and the client still owes a read, here only of TLS records: the
+    // sweep calls that a client stall, and the venue is not reported for it.
+    TEST(CoreFailover, AClientStalledOnItsTlsRecordsIsNotTheVenuesFailure)
+    {
+        Venues v({"127.0.0.1", "127.0.0.1"});
+        ClientConn* c = v.t.client();
+        dispatched(v.t, c, v.t.upstream());
+        c->ever_framed = true;
+        c->req.f.ts_progress = 1;
+        c->tls_out.stage() = "a record the client has not read";
+        v.t.sweep(c, 1 + Gateway::kDefaultUpstreamIdleNs + 1);
+        EXPECT_TRUE(v.policy.seen.empty());
+        EXPECT_EQ(v.client_status(), 504);
+    }
+#endif
+
+    /// One venue given only by name, `localhost`, which /etc/hosts answers, on port 9.
+    std::vector<llmbridge::Upstream> named_only() { return {{.ip = "", .port = 9, .host = "localhost"}}; }
+
+    /// A lookup that fails `g_fail_first` times, then answers 127.0.0.1.
+    std::atomic<int> g_lookups{0};
+    std::atomic<int> g_fail_first{0};
+    std::vector<std::string> flaky_lookup(const std::string&, std::string* err)
+    {
+        if (g_lookups.fetch_add(1) < g_fail_first.load())
+        {
+            if (err) *err = "test: no such name";
+            return {};
+        }
+        return {"127.0.0.1"};
+    }
+
+    /// A lookup that hangs, as one does while DNS is down, until released.
+    std::atomic<bool> g_in_lookup{false};
+    std::atomic<bool> g_release{false};
+    std::vector<std::string> hanging_lookup(const std::string&, std::string*)
+    {
+        g_in_lookup.store(true);
+        while (!g_release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return {"127.0.0.1"};
+    }
+
+    // A venue given by name alone has no address until its name resolves: refused, and
+    // asked for off the loop once however often it is refused, then dialled at the answer.
+    TEST(CoreResolve, AVenueGivenOnlyANameIsResolvedOffTheLoopAndThenDialled)
+    {
+        Gateway gw(0, named_only(), 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {},
+                   false, nullptr, {});
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        EXPECT_EQ(t.acquire(0), nullptr);
+        EXPECT_EQ(t.acquire(0), nullptr);
+        EXPECT_TRUE(io.calls.empty()) << "there was nothing to dial";
+        EXPECT_EQ(t.e._rr_inflight[0], 1) << "one lookup, however many refusals";
+        EXPECT_EQ(t.stats().upstream_unresolved, 2u);
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_EQ(t.venue(0).ip.rfind("127.", 0), 0u) << t.venue(0).ip;
+        EXPECT_EQ(t.venue(0).host_hdr, t.venue(0).ip + ":9") << "the Host of the address it now dials";
+        EXPECT_EQ(t.e._rr_inflight[0], 0);
+        EXPECT_EQ(t.stats().upstream_reresolved, 1u);
+        ASSERT_NE(t.acquire(0), nullptr);
+        EXPECT_EQ(io.calls, (std::vector<std::string>{"connect"}));
+    }
+
+    // run() and the sweep ask for every venue that has a name and no address, and only those.
+    TEST(CoreResolve, EveryVenueWithANameAndNoAddressIsAskedFor)
+    {
+        std::vector<llmbridge::Upstream> ups{{.ip = "", .port = 9, .host = "localhost"},
+                                             {.ip = "127.0.0.1", .port = 10, .host = "localhost"},
+                                             {.ip = "", .port = 11}};
+        Gateway gw(0, ups, 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {}, false,
+                   nullptr, {});
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        t.resolve_unaddressed();
+        EXPECT_EQ(t.e._rr_inflight, (std::vector<uint8_t>{1, 0, 0}));
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_EQ(t.venue(0).ip.rfind("127.", 0), 0u);
+        EXPECT_EQ(t.venue(1).ip, "127.0.0.1");
+        EXPECT_TRUE(t.venue(2).ip.empty()) << "no name, nothing to ask for";
+    }
+
+    // A name that does not resolve is asked for again, later each time, and never at the
+    // rate requests are refused for want of it.
+    TEST(CoreResolve, ANameThatFailsToResolveBacksOffAndIsAskedAgain)
+    {
+        using llmbridge::detail::kReresolveMinNs;
+        g_lookups = 0;
+        g_fail_first = 2;
+        Gateway gw(0, named_only(), 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {},
+                   false, nullptr, {});
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        t.e._rr->resolve = &flaky_lookup; // before the first lookup starts the thread
+
+        EXPECT_EQ(t.acquire(0), nullptr);
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_TRUE(t.venue(0).ip.empty());
+        EXPECT_EQ(t.e._rr_backoff_ns[0], kReresolveMinNs);
+        EXPECT_EQ(t.acquire(0), nullptr);
+        EXPECT_EQ(t.e._rr_inflight[0], 0) << "asked again within its backoff";
+        EXPECT_EQ(g_lookups.load(), 1);
+
+        t.e._rr_next_ns[0] = 0; // the backoff has passed
+        t.resolve_unaddressed(); // as the sweep asks
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_EQ(t.e._rr_backoff_ns[0], 2 * kReresolveMinNs) << "twice as long after a second failure";
+
+        t.e._rr_next_ns[0] = 0;
+        t.resolve_unaddressed();
+        ASSERT_TRUE(t.wait_resolved());
+        t.apply_resolved();
+        EXPECT_EQ(t.venue(0).ip, "127.0.0.1");
+        EXPECT_EQ(t.e._rr_backoff_ns[0], 0);
+        EXPECT_EQ(g_lookups.load(), 3);
+    }
+
+    // The sweep, not traffic, asks again once the backoff has passed, and installs the answer:
+    // a policy may route nothing to a venue it has given up on.
+    TEST(CoreResolve, TheSweepAsksAgainAndInstallsTheAnswer)
+    {
+        g_lookups = 0;
+        g_fail_first = 1;
+        Gateway gw(0, named_only(), 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {},
+                   false, nullptr, {});
+        GatewayCoreTest t{gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        t.e._rr->resolve = &flaky_lookup;
+        t.resolve_unaddressed(); // as run() asks
+        ASSERT_TRUE(t.wait_resolved());
+        t.sweep_idle(); // installs the failure
+        EXPECT_TRUE(t.venue(0).ip.empty());
+        EXPECT_EQ(t.e._rr_inflight[0], 0) << "within its backoff, the sweep did not ask";
+
+        t.e._rr_next_ns[0] = 0; // the backoff has passed
+        t.sweep_idle();
+        EXPECT_EQ(t.e._rr_inflight[0], 1) << "the sweep did not ask again";
+        ASSERT_TRUE(t.wait_resolved());
+        t.sweep_idle();
+        EXPECT_EQ(t.venue(0).ip, "127.0.0.1");
+    }
+
+    // A failed connect moves a venue given by addresses to its next one, and the Host it
+    // names moves with it.
+    TEST(CoreResolve, TheHostHeaderFollowsTheAddressInUse)
+    {
+        std::vector<llmbridge::Upstream> ups{{.ip = "127.0.0.2", .port = 9, .ips = {"127.0.0.2", "127.0.0.1"}}};
+        Gateway gw(0, ups, 0, llmbridge::IoBackend::Epoll, Gateway::kDefaultUpstreamIdleNs, {}, false,
+                   nullptr, {});
+        GatewayCoreTest t{gw};
+        EXPECT_EQ(t.venue(0).host_hdr, "127.0.0.2:9");
+        t.e.note_connect_failure(0, "refused");
+        EXPECT_EQ(t.venue(0).ip, "127.0.0.1");
+        EXPECT_EQ(t.venue(0).host_hdr, "127.0.0.1:9");
+    }
+
+    // Shut down while DNS is down: the lookup in flight is left to finish on its own
+    // reference to the resolver's state, never waited out.
+    TEST(CoreResolve, TheEngineNeverWaitsOnALookupInFlight)
+    {
+        g_in_lookup = false;
+        g_release = false;
+        auto gw = std::make_unique<Gateway>(0, named_only(), 0, llmbridge::IoBackend::Epoll,
+                                            Gateway::kDefaultUpstreamIdleNs, llmbridge::TlsConfig{}, false,
+                                            nullptr, std::vector<std::string>{});
+        GatewayCoreTest t{*gw};
+        FakeIo io{t};
+        t.attach(io, true);
+        t.e._rr->resolve = &hanging_lookup;
+        EXPECT_EQ(t.acquire(0), nullptr);
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!g_in_lookup.load() && std::chrono::steady_clock::now() < limit)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ASSERT_TRUE(g_in_lookup.load());
+        const auto t0 = std::chrono::steady_clock::now();
+        gw.reset();
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(1));
+        g_release = true; // the detached lookup finishes against the state it shares
     }
 
     TEST_F(Core, AStreamStagesItsHeadAndPumps)
