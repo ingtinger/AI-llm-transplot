@@ -212,13 +212,24 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   refused before it leaves, so the model the gateway matched is the one the venue reads.
   The sentinel is matched raw: an escaped spelling of it goes as sent. GATEWAY-INTERNALS.md
   12d.
+- **Members spliced into a stream make the length ours too, and never send two.** Under
+  `Decision::service_tier`, `speed` or `inference_geo` a streamed JSON body's
+  Content-Length is the client's plus the members inserted after its opening brace, each
+  value held to the held rewrite's rule (no control byte, DEL, quote or backslash; one that
+  fails parks the body, and the held rewrite refuses it), so the count is exact. A member
+  of the client's own by one of those names leaves as spaces, with its separator, so no
+  provider reads two, whether it takes the first key or the last: the scan holds it, from
+  the separator before it, until its value closes. The root must be an object and the
+  client's value a string, else a 400 with the venue reset, as the held rewrite refuses
+  both; another dialect's body may not repeat one either. GATEWAY-INTERNALS.md 12e.
 - **A non-OpenAI client's top-level keys are not checked.** The gateway refuses an OpenAI
   client's body whose top-level keys a provider could read differently from it (a
   repeated, escaped or excess key), held or arriving; another dialect's body is not
   checked, so an Anthropic client's `{"model":"a",...,"model":"b"}` shows the policy and
   the sink `a` while a provider that takes the last key runs `b`. This predates head
   decisions, and a withheld last byte does not close it: nothing reads the second key.
-  A body streamed under a model substitution is the exception: its `model` is checked.
+  A body streamed under a model substitution is the exception: its `model` is checked,
+  and so, under a member splice, are `service_tier`, `speed` and `inference_geo`.
 - **A key in the request target is forwarded.** A Gemini client byte-forwarding to a
   Gemini venue may carry its own key as `?key=`; a named key header goes beside it, not
   instead, so the venue receives two keys and Google decides which applies. The start

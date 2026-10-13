@@ -707,8 +707,8 @@ across reads or sits in the last one. On a refusal the gateway stops sending, se
 short of its `Content-Length`, which it never runs, and the connection is never
 pooled. The client gets the 400 a held body would have got. Other clients' bodies
 are not scanned; their translators would refuse a bad one, and here none runs. The
-one exception is a body a model substitution is spliced into (12d), whose JSON is
-scanned whatever the client's dialect.
+exceptions are a body a model substitution (12d) or service_tier, speed or
+inference_geo (12e) is spliced into, whose JSON is scanned whatever the client's dialect.
 
 **A response before the last byte.** A venue may answer early (an error, usually).
 `end_body_stream` stops forwarding, marks the upstream not poolable, drops the copy
@@ -818,11 +818,12 @@ cut name: `ModelOf.EveryPrefixYieldsNothingOrTheWholeBodysModel`), `stream` and
 - **Refused.** The reply goes at once, while the client is still uploading, and no venue is
   contacted. It says `Connection: keep-alive`: the rest of the body is read and dropped
   (`discard`, on the body's deadline), and the connection carries the next request.
-- **Allowed as is.** No override, no `hold`, and the venue it names byte-forwards: the body
-  streams there as in 12, in a `--stream-body-max` slot. A model substitution
-  (`substitute_model`, 12d) is not an override: it is spliced in as the body streams.
-- **Allowed otherwise.** An override, `hold`, or a venue that translates needs the whole
-  body. It is **parked** (`body_parked`): kept in rbuf with nothing sent, holding no venue
+- **Allowed as is.** No `model` override, no `hold`, and the venue it names byte-forwards:
+  the body streams there as in 12, in a `--stream-body-max` slot. A model substitution
+  (`substitute_model`, 12d) is spliced in as the body streams, and so are `service_tier`,
+  `speed` and `inference_geo` into a JSON body (12e).
+- **Allowed otherwise.** A `model` override, `hold`, a venue that translates, or a member
+  override on a body not sent as JSON needs the whole body. It is **parked** (`body_parked`): kept in rbuf with nothing sent, holding no venue
   and no slot, an OpenAI client's JSON still checked by BodyScan as it arrives, and the
   upload deadline of 12b still running, in `pump_body` and the sweep alike. At its last
   byte it is sent as a held body.
@@ -850,8 +851,8 @@ request it can run: the cost of a change of mind is a partial upload, dropped.
 **Failover and retry.** A body decided on its head stays in rbuf (`body_in_rbuf`) until the
 first response byte, so a failover resends it from there, never from `saved`, and a request
 pipelined behind it keeps its place. While it is still arriving, a failover to a venue that
-takes it as it is streams it there from its first byte; with an override, or to a venue
-that translates, it parks. Once whole it goes as a held body. A stale connection's retry
+takes it as it is streams it there from its first byte; with a `model` override, a member
+override the head decision did not set (12e), or to a venue that translates, it parks. Once whole it goes as a held body. A stale connection's retry
 rebuilds a body that went in parts (`body_parts`) from rbuf, with the key the policy named
 (`named_key`), and resends one that went whole from its staged copy.
 
@@ -931,11 +932,83 @@ whose head decision named none, so the model was not tracked from the first byte
 Once whole, the retry's substitution is an override as above. A stale connection's retry
 rebuilds the spliced head and bytes from rbuf with `forward_parts` too.
 
-**Not done: `service_tier`.** `Decision::service_tier` still parks a body decided on its
-head. Inserting it after the opening `{` would need the first member held until it is known
-whether the object is empty, and a redo whenever the client sent its own: left for later.
-
 **Counted.** At a confirm that keeps a spliced body, `streamed_model_substituted` when the
 model was the sentinel, `streamed_model_padded` when it was not and spaces followed the
 body. A sink record's `model_substituted` says the venue got the replacement, spliced or
 rewritten whole; `model` stays the client's, `served_model` the venue's.
+
+### 12e. service_tier, speed and inference_geo spliced into the stream
+
+`Decision::service_tier`, `speed` and `inference_geo` set top-level string members. A held
+body gets them from `apply_overrides`: a member the client sent has its value replaced
+where it stands, and absent ones go in together right after the root's `{`, as
+`"service_tier":"flex","speed":"fast",` in that order, without the comma for an empty
+object. On a head decision (12c) that sets any of them, with no `model` override and no
+`hold`, a JSON body whose venue byte-forwards now streams with them spliced in
+(`MemberSplice`, request.hpp) instead of parking; a model substitution (12d) rides in the
+same stream. kottos sets all three on its head decisions, so its flex and standard mixes
+stream.
+
+**The insertion.** The members go right after the root's `{`, in the text the held rewrite
+writes for absent keys, then one separator byte: `,` when the object's first member stays,
+a space when the object is empty or its first member is one the splice blanks (below).
+Whitespace before the `{` stays where it is. So the declared Content-Length is the client's
+plus `MemberSplice::grow()`, the members and their one separator, whatever the client sent,
+plus the substitution's growth (12d). Each value must pass `MemberSplice::plain()`, the held
+rewrite's own rule (no control byte, DEL, quote or backslash), so it goes between quotes
+unescaped and its size is its wire size. One that fails parks the body, as every override
+did, and the held rewrite then refuses it with the same 400.
+
+**The client's own member: the rule.** The policy's value wins and the venue never reads
+two. The splice treats our members as the object's first member, so every member the
+client sent has a separator before it: the one after our members, or the client's own
+comma. A client member the splice replaces goes as spaces from that separator through its
+value, whatever whitespace surrounds it:
+
+- first: `{"service_tier":"flex" ` then spaces for `"service_tier":"auto"`, then `,"messages":...`;
+- in the middle: `{"service_tier":"flex","messages":[...]` then spaces for
+  `,"service_tier":"auto"`, then `,"model":...`;
+- last: `...,"model":"gpt-4o"` then spaces for `,"service_tier":"auto"`, then `}`.
+
+Every placement is fixed in the stream, so no client member ever costs a redo. A client
+member equal to the policy's goes the same way. The venue gets the held rewrite's members
+and values, in another order and with spaces where the client's member stood
+(`fuzz_body_stream` holds the splice to exactly that); for a body that names none of them,
+in a non-empty object, it gets the held rewrite byte for byte, and for an empty one that
+plus a space.
+
+**What the scan holds.** `start_body` resets BodyScan with `members`, the mask of members
+set (`members_tracked`), whatever the client's dialect. BodyScan then refuses a root that is
+not an object, a value that is not a string under a member it replaces (the held rewrite
+refuses both: a 400 either way, the venue reset short of the body), and a repeat of one,
+in another dialect's body too. It holds the bytes after the root's `{` until the first key
+or the empty object's `}`, since the separator depends on them; each top-level member from
+the separator before it until its key closes; and a member the mask names until its value
+closes, then tells its span (`members()`: from the separator, the value's quote, its end).
+So a forwarded range never splits a span, and `Splice::append` (request.hpp) maps each
+range in one pass: the insertion when the range covers the byte after the `{`, spaces for
+each member replaced, the model as in 12d.
+
+**The confirm.** `confirm(whole, early)` gets `whole.service_tier_spliced`, `speed_spliced`
+and `inference_geo_spliced`. A keep is judged on what the venue gets: on a spliced body,
+the override, or with none, the client's own member, read off the scan's span. So a
+confirm returning `early` keeps, and so does one naming no tier when the client's own
+equals the tier spliced; one changing a value, or dropping it where the client sent
+another, redoes the request as in 12c, the whole body rewritten as a held one.
+
+**Failover and retry.** `Retry::service_tier`, `speed` and `inference_geo` are the new
+venue's. While the body streams, a retry setting only members the head decision set too
+(the scan has held the client's own back from the first byte) resends it from its first
+byte with the retry's values spliced, under its own declared length; one setting a member
+the head decision did not parks, as for `model`. A stale connection's retry rebuilds the
+spliced head and bytes with `forward_parts`. A venue that translates still parks the body:
+its translation is built whole. A body not sent as JSON is never scanned, so it parks.
+
+**Counted.** At a confirm that keeps a spliced body, `streamed_override_spliced`; at one
+that redoes it while a venue holds part of it, `streamed_override_redone`, which
+`streamed_body_redone` counts too. A sink record's `service_tier_spliced`, `speed_spliced`
+and `inference_geo_spliced` say what went spliced, and its `asked_tier` is the client's
+own tier the splice blanked, as a held rewrite records the one it replaced.
+
+**Not done.** The held rewrite parses with unique keys at every depth, so it refuses a body
+that repeats a key inside a nested object; spliced, as substituted (12d), that body streams.
