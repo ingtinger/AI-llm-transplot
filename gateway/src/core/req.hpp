@@ -197,7 +197,8 @@ namespace llmbridge
         bool reply_kept = false; ///< our error reply keeps the connection; the rest is dropped
         ConfirmOutcome confirm_outcome = ConfirmOutcome::None;
 
-        /// A body override is in force, so the body is spliced and cannot go as it arrives.
+        /// A body override is in force, so the body is rewritten when sent whole; streamed,
+        /// only the members can be spliced in (member_overrides), never a model.
         [[nodiscard]] bool rewrites_body() const noexcept
         {
             return !(model_override.empty() && tier_override.empty() && speed_override.empty() &&
@@ -212,6 +213,20 @@ namespace llmbridge
         bool subst_tracked = false;
         bool splice = false;
         bool model_substituted = false;
+        /// The service_tier, speed and inference_geo overrides spliced into a streamed body
+        /// (GATEWAY-INTERNALS.md 12e), as BodyScan bits: those it holds the client's own
+        /// member back for from the first byte, so an attempt may splice any of them; and
+        /// those the venue got spliced, at a confirm that kept the body.
+        uint8_t members_tracked = 0;
+        uint8_t members_spliced = 0;
+
+        /// BodyScan's bits for the service_tier, speed and inference_geo overrides in force.
+        [[nodiscard]] uint8_t member_overrides() const noexcept
+        {
+            return static_cast<uint8_t>((tier_override.empty() ? 0 : provider::BodyScan::kServiceTier) |
+                                        (speed_override.empty() ? 0 : provider::BodyScan::kSpeed) |
+                                        (geo_override.empty() ? 0 : provider::BodyScan::kInferenceGeo));
+        }
     };
     static_assert(std::is_trivially_copyable_v<ReqState>);
     static_assert(std::is_trivially_destructible_v<ReqState>);

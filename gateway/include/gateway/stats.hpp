@@ -81,5 +81,10 @@ namespace llmbridge
         /// and spaces after the body made up the replacement's extra length.
         uint64_t streamed_model_substituted = 0;
         uint64_t streamed_model_padded = 0;
+        /// service_tier, speed or inference_geo spliced into a streamed body (GATEWAY-INTERNALS.md
+        /// 12e): kept by its confirm; redone by it, the venue holding part of the body (also
+        /// counted in streamed_body_redone).
+        uint64_t streamed_override_spliced = 0;
+        uint64_t streamed_override_redone = 0;
     };
 } // namespace llmbridge

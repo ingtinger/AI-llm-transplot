@@ -140,6 +140,12 @@ namespace llmbridge
         /// Decision::substitute_model replaced the client's `model` (`model` above), spliced
         /// into a streamed body or rewritten in a held one; `served_model` is the venue's.
         bool model_substituted = false;
+        /// Decision::service_tier, speed and inference_geo spliced into a streamed body at a
+        /// confirm that kept it (GATEWAY-INTERNALS.md 12e); false when rewritten in a held
+        /// body, or not set. `asked_tier` is the client's own tier the splice blanked.
+        bool service_tier_spliced = false;
+        bool speed_spliced = false;
+        bool inference_geo_spliced = false;
     };
 
     /// Called on the loop thread once per completed request, streams included.

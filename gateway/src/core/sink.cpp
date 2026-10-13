@@ -168,6 +168,9 @@ namespace llmbridge::detail
         r.decided_on_head = c->req.f.decided_on_head;
         r.confirm_outcome = c->req.f.confirm_outcome;
         r.model_substituted = c->req.f.model_substituted;
+        r.service_tier_spliced = (c->req.f.members_spliced & provider::BodyScan::kServiceTier) != 0;
+        r.speed_spliced = (c->req.f.members_spliced & provider::BodyScan::kSpeed) != 0;
+        r.inference_geo_spliced = (c->req.f.members_spliced & provider::BodyScan::kInferenceGeo) != 0;
         _sink->on_request(r);
     }
 

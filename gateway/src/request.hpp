@@ -22,6 +22,7 @@
 #include "gateway/metrics.hpp"
 #include "core/conn.hpp"
 #include "engine.hpp"
+#include "provider/body_scan.hpp"
 #include "provider/translate.hpp"
 
 namespace llmbridge::detail
@@ -156,6 +157,41 @@ namespace llmbridge::detail
         /// open or absent). Neither `from` nor `to` may fall inside the value.
         void append(std::string& out, std::string_view body, size_t from, size_t to, size_t body_len, size_t at,
                     size_t end) const;
+    };
+    /// Decision::service_tier, speed and inference_geo spliced into a body forwarded as it
+    /// arrives (GATEWAY-INTERNALS.md 12e). The members go in after the root's `{`, as
+    /// apply_overrides inserts absent ones, then the separator: `,` before a member the
+    /// client keeps, else a space. A member of the client's that one replaces goes as
+    /// spaces, with the separator before it. The head declares the client's length plus
+    /// grow(), whatever the client sent.
+    struct MemberSplice
+    {
+        std::string_view service_tier, speed, inference_geo; ///< empty: not set
+
+        /// BodyScan's bits for the members set.
+        [[nodiscard]] uint8_t mask() const noexcept;
+        /// The members and their separator; 0 when none is set.
+        [[nodiscard]] size_t grow() const noexcept;
+        /// `"service_tier":"flex","speed":"fast"`: apply_overrides' text, in its order.
+        void append_members(std::string& out) const;
+        /// Every value goes between quotes as it is: no control byte, DEL, `"` or `\`,
+        /// which apply_overrides refuses.
+        [[nodiscard]] bool plain() const noexcept;
+    };
+    /// What a body forwarded as it arrives carries spliced in: a model substitution
+    /// (`model.sentinel` empty for none) and members, over BodyScan's spans.
+    struct Splice
+    {
+        ModelSplice model;
+        MemberSplice members;
+
+        [[nodiscard]] size_t grow() const noexcept { return model.grow() + members.grow(); }
+        /// The body's model was the sentinel and goes replaced.
+        [[nodiscard]] bool substitutes(std::string_view body, const provider::BodyScan& s) const noexcept;
+        /// Appends the venue's bytes for body[from, to) of a body `body_len` long. Neither
+        /// `from` nor `to` may fall inside a span BodyScan holds back.
+        void append(std::string& out, std::string_view body, size_t from, size_t to, size_t body_len,
+                    const provider::BodyScan& s) const;
     };
     /// A Decision's or a Retry's substitution: none, or both halves substitute_ok.
     [[nodiscard]] inline bool substitution_ok(std::string_view model, std::string_view for_model) noexcept

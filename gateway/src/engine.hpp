@@ -96,10 +96,15 @@ namespace llmbridge::detail
         void pump_body(ClientConn* c) noexcept;       // scan, then stage what is safe upstream
         /// Stage what may go, up to `safe`, and send it; false when the send lost the venue.
         bool forward_body(ClientConn* c, std::string_view body, size_t safe) noexcept;
-        /// A model substitution spliced into a streamed body (GATEWAY-INTERNALS.md 12d):
-        /// the venue's bytes for body[from, to), and whether its model was the sentinel.
+        /// A model substitution and members spliced into a streamed body (GATEWAY-INTERNALS.md
+        /// 12d, 12e): the venue's bytes for body[from, to), and whether its model was the sentinel.
         void append_spliced(const ClientConn* c, std::string& out, size_t from, size_t to) const noexcept;
         [[nodiscard]] bool splice_hit(const ClientConn* c) const noexcept;
+        /// The body overrides in force can be spliced into a stream (GATEWAY-INTERNALS.md 12e),
+        /// at the head decision or on a later attempt of a body already streaming.
+        [[nodiscard]] bool overrides_stream(const ClientConn* c, bool at_head) const noexcept;
+        /// The client's own value of a member BodyScan tracked, raw and unquoted; empty if none.
+        [[nodiscard]] std::string_view client_member(const ClientConn* c, uint8_t bit) const noexcept;
         /// A streamed attempt's head and its body's first `body_sent` bytes, spliced or not.
         [[nodiscard]] const char* forward_parts(const ClientConn* c, const Upstream& up, const NamedKey& key,
                                                 std::string& into) const noexcept;

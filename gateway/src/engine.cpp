@@ -246,7 +246,9 @@ namespace llmbridge::detail
                << " parked=" << _stats.streamed_body_parked << " redone=" << _stats.streamed_body_redone
                << " confirm_refusals=" << _stats.streamed_body_confirm_refusals
                << " model_substituted=" << _stats.streamed_model_substituted
-               << " model_padded=" << _stats.streamed_model_padded << "\n";
+               << " model_padded=" << _stats.streamed_model_padded
+               << " override_spliced=" << _stats.streamed_override_spliced
+               << " override_redone=" << _stats.streamed_override_redone << "\n";
         std::fputs(os.str().c_str(), out);
     }
 
