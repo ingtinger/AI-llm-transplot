@@ -154,7 +154,7 @@ namespace llmbridge::detail
         UpstreamConn* uf = new_upstream(u->venue);
         if (!uf) return false;
         // A streamed body was staged in pieces, so it is rebuilt from the client's buffer,
-        // with the key a policy that decided on its head named and any model it spliced in,
+        // with the key a policy that decided on its head named and any model or members spliced in,
         // as dispatch sent it.
         if (client->req.f.body_parts)
         {
@@ -354,14 +354,15 @@ namespace llmbridge::detail
         // request queued behind it keeps its place. A body kept in rbuf is still there.
         if (!f.body_in_rbuf) client->rbuf.insert(0, client->req.saved);
         // A body still arriving goes on as it arrives to a venue that takes it as it is, a
-        // substitution spliced if its model was tracked from the first byte, else it parks to
-        // its last byte (GATEWAY-INTERNALS.md 12c, 12d).
-        else if (f.body_streaming && !(!f.rewrites_body() &&
+        // substitution spliced if its model was tracked from the first byte, members if the
+        // client's own were, else it parks to its last byte (GATEWAY-INTERNALS.md 12c-12e).
+        else if (f.body_streaming && !(overrides_stream(client, /*at_head=*/false) &&
                                        (f.subst_model.empty() || f.subst_tracked) &&
                                        venue_streams(client_dialect_of(client->rbuf), client->upstream_slot)))
         {
             stop_body(client);
             f.body_parked = true;
+            f.splice = false; // nothing goes spliced: the body is rewritten whole after the confirm
             f.ts_progress = 0; // no venue to time out: the body's deadline holds it (12b)
             ++_stats.streamed_body_parked;
             return true;

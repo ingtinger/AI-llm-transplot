@@ -409,7 +409,10 @@ fields faster than we adopt them. Only the value span moves.
 - **`apply_overrides` sets `model`, `service_tier`, `speed` and `inference_geo` in one
   parse and one copy.** Absent keys go in together after the opening brace. A body with
   an escaped top-level key is refused when a key is inserted, since `find` matches keys
-  as written and the venue would then see two spellings of one.
+  as written and the venue would then see two spellings of one. A body streamed on a head
+  decision gets the same insertion spliced in as it passes, every key; a member the client
+  sent is blanked rather than replaced, since its place has gone by (GATEWAY-INTERNALS.md
+  12e).
 - **A policy's `anthropic_beta` token is a header, not a body field.** It goes only to a
   venue taking an `x-api-key`. A byte-forward joins it to the client's own
   `anthropic-beta` value in one line, unless the client already sent it; a repeated or
@@ -597,8 +600,8 @@ top-level `model` only once it has closed in the bytes so far, the streaming fla
 the prefix hash as a held body's (the gateway waits for its bytes). It may refuse there,
 and the refusal reaches no provider: the client is answered while still uploading, and
 the rest of its body is read and dropped. Allowed, the body streams to the venue as it
-arrives, or, when the decision needs all of it (an override, `Decision::hold`, a venue
-that translates), parks in the gateway unsent until its last byte.
+arrives, or, when the decision needs all of it (a `model` override, `Decision::hold`, a
+venue that translates), parks in the gateway unsent until its last byte.
 
 Either way the last byte waits for `confirm(whole, early)`, called once with the whole
 body's facts, exactly a held body's. Returning `early` keeps the decision; refusing answers
@@ -621,6 +624,16 @@ something else goes as sent with spaces after its last byte, so the declared len
 and the JSON stays valid; a shorter replacement is followed by spaces instead. The policy's
 confirm sees the client's model and `model_substituted`, and keeping it is no redo. On a
 body sent whole the substitution is an ordinary override. GATEWAY-INTERNALS.md 12d.
+
+A tier listing is known on the head, so `service_tier`, `speed` and `inference_geo` need no
+model, only a place in the body. On a streamed JSON body the gateway inserts them right
+after the opening brace, in the text the held rewrite writes, and declares the client's
+length plus theirs. A member of the client's own by the same name goes as spaces, with
+the separator before it, so the venue reads the policy's value once and the JSON stays
+valid. The scan holds back what follows the brace until the first key (or the close of an
+empty object, which takes a space for the comma), and every member, separator first, until
+its key shows whether it is one being replaced. No placement costs a redo, and the
+confirm's keep is judged by what the venue gets. GATEWAY-INTERNALS.md 12e.
 
 ### Selecting a venue
 

@@ -46,6 +46,7 @@
 #include "net/http.hpp"
 #include "net/sha256.hpp"
 #include "provider/json.hpp" // reassemble the streamed OpenAI chunks
+#include "provider/translate.hpp" // the held rewrite a spliced body is held to
 
 using llmbridge::Gateway;
 using llmbridge::UpstreamDialect;
@@ -13269,6 +13270,7 @@ namespace
         int64_t at = 0;          ///< when it was called
         size_t venue_bytes = 0;  ///< what `probe` read then
         bool substituted = false; ///< RequestFacts::model_substituted
+        bool tier_spliced = false, speed_spliced = false, geo_spliced = false;
     };
 
     /// The decision confirm() was handed as the one in force.
@@ -13278,6 +13280,7 @@ namespace
         std::string model, credential_header;
         uint64_t tag = 0;
         std::string substitute_model, substitute_for;
+        std::string service_tier, speed, inference_geo;
     };
 
     /// Opts in to deciding on the head unless `opt_in` is cleared, records every call, and
@@ -13303,7 +13306,9 @@ namespace
                 _confirms.push_back(seen(f));
                 _early.push_back({early.upstream_index, std::string(early.model),
                                   std::string(early.credential_header), early.tag,
-                                  std::string(early.substitute_model), std::string(early.substitute_for)});
+                                  std::string(early.substitute_model), std::string(early.substitute_for),
+                                  std::string(early.service_tier), std::string(early.speed),
+                                  std::string(early.inference_geo)});
             }
             in_confirm.store(true);
             for (int i = 0; gate && !gate->load() && i < 1000; ++i)
@@ -13342,7 +13347,8 @@ namespace
         SeenFacts seen(const llmbridge::RequestFacts& f) const
         {
             return {f.body_whole, std::string(f.model), f.stream, f.include_usage, f.prefix_hash,
-                    f.body_bytes, llmbridge::now_ns(), probe ? probe() : 0, f.model_substituted};
+                    f.body_bytes, llmbridge::now_ns(), probe ? probe() : 0, f.model_substituted,
+                    f.service_tier_spliced, f.speed_spliced, f.inference_geo_spliced};
         }
         mutable std::mutex _mu;
         std::vector<SeenFacts> _decides, _confirms;
@@ -14467,20 +14473,24 @@ TEST_P(ProxyHeadDecide, ASplicedBodyCarriesTheBetaToken)
     EXPECT_EQ(_gw->stats().streamed_model_substituted, 1u);
 }
 
-// speed rewrites the body, so it parks like a model override and goes whole with the field.
-TEST_P(ProxyHeadDecide, ASpeedOverrideParksTheBody)
+// speed rewrites the body. Into a body not sent as JSON nothing is spliced (12e), so it
+// parks like a model override and goes whole with the field.
+TEST_P(ProxyHeadDecide, ASpeedOverrideOnABodyNotSentAsJsonParks)
 {
     HeadPolicy pol;
     pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 0, .speed = "fast"}};
     pol.probe = [this] { return _backend.bytes_seen(); };
     start_with(pol);
-    const Halves h = openai_halves(R"(,"temperature":0.5})");
+    const Halves h = split_request(model_first(), R"(,"temperature":0.5})", /*json=*/false);
     expect_parked(_backend, pol, h, _proxy_port);
     shutdown();
     const std::string body = body_of(_backend.last_request());
     EXPECT_EQ(body, "{\"speed\":\"fast\"," + whole_body(h).substr(1));
     EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
     EXPECT_EQ(_gw->stats().streamed_bodies, 0u);
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, 0u);
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_FALSE(pol.confirms()[0].speed_spliced);
 }
 
 // Never two models: another dialect's repeat is refused before it leaves, as an OpenAI
@@ -14765,6 +14775,477 @@ TEST_P(ProxyHeadDecide, AnUnusableSubstitutionIsA500)
     EXPECT_EQ(_backend.accepted(), 0);
     EXPECT_EQ(pol.decides().size(), pol.heads.size() + 1);
     EXPECT_FALSE(pol.decides().back().whole);
+}
+
+// ── service_tier, speed and inference_geo spliced into a streamed body (GATEWAY-INTERNALS.md 12e) ──
+
+namespace
+{
+    /// A head decision that sets a tier at venue `venue`.
+    llmbridge::Decision tier_route(int venue = 0, const char* tier = "flex")
+    {
+        return llmbridge::Decision{.allow = true, .upstream_index = venue, .service_tier = tier};
+    }
+    /// What the held path sends: one parse and one copy, apply_overrides.
+    std::string held_rewrite(const std::string& body, const llmbridge::provider::Overrides& o)
+    {
+        std::string out;
+        return llmbridge::provider::apply_overrides(body, o, nullptr, out) ? out : std::string("<refused>");
+    }
+    /// The root object's members as sorted (key, raw value), for "the same JSON object but
+    /// for whitespace and member order".
+    std::vector<std::pair<std::string, std::string>> members_of(const std::string& body)
+    {
+        bool ok = false;
+        const llmbridge::provider::json::Value v =
+            llmbridge::provider::json::parse(body, ok, llmbridge::provider::json::Keys::Any);
+        std::vector<std::pair<std::string, std::string>> out;
+        if (!ok || !v.is_object()) return out;
+        for (const auto& [k, val] : v.obj)
+            out.emplace_back(std::string(k), val.is_string() ? "\"" + std::string(val.sv) + "\"" : std::string(val.sv));
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+    std::string blank(const std::string& s) { return std::string(s.size(), ' '); }
+    /// Sends `h` as two parts, the second once `venue` holds 16 KiB more than it did: the
+    /// body streamed before its last byte. Returns the reply's status.
+    int send_streamed(TestBackend& venue, uint16_t port, const Halves& h, size_t ahead = 16 * 1024)
+    {
+        Client c;
+        if (!c.connect(port)) return -1;
+        const size_t was = venue.bytes_seen();
+        if (!c.send(h.first)) return -2;
+        EXPECT_TRUE(wait_for([&] { return venue.bytes_seen() > was + ahead; })) << "held to its last byte";
+        if (!c.send(h.rest)) return -3;
+        const int status = c.recv_status();
+        c.close();
+        return status;
+    }
+    /// The request in `all` whose body is `want`, its head checked for the declared length.
+    bool sent_with_length(const std::string& all, const std::string& want)
+    {
+        const size_t at = all.find("\r\n\r\n" + want);
+        if (at == std::string::npos) return false;
+        const std::string head = all.substr(0, at + 2);
+        return declares(head.substr(head.rfind("POST ")), want.size());
+    }
+} // namespace
+
+// The openai-python shape with kottos' "auto" route and a flex tier listing: the model comes
+// last, so the decision is made on the head, and the body still streams. The venue gets the
+// held rewrite, byte for byte, under a Content-Length that counts both: no park, no redo.
+TEST_P(ProxyHeadDecide, AnAutoModelAndAFlexTierAreSplicedIntoOneStream)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    llmbridge::Decision d = auto_route();
+    d.service_tier = "flex";
+    pol.heads = {d};
+    start_with(pol);
+    const Halves h = openai_sdk_halves();
+    EXPECT_EQ(send_streamed(_backend, _proxy_port, h), 200);
+    shutdown();
+    const std::string want = held_rewrite(whole_body(h), {"gpt-4o-mini", "flex", "", ""});
+    EXPECT_EQ(want.rfind(R"({"service_tier":"flex","messages":)", 0), 0u) << want.substr(0, 80);
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_TRUE(declares(up, want.size())) << up.substr(0, 300);
+    EXPECT_EQ(_backend.requests_seen(), 1);
+    EXPECT_EQ(_backend.resets(), 0);
+    const auto w = pol.confirms();
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_TRUE(w[0].substituted);
+    EXPECT_TRUE(w[0].tier_spliced);
+    EXPECT_FALSE(w[0].speed_spliced);
+    EXPECT_FALSE(w[0].geo_spliced);
+    ASSERT_EQ(pol.earlies().size(), 1u);
+    EXPECT_EQ(pol.earlies()[0].service_tier, "flex");
+    EXPECT_FALSE(pol.decides()[0].tier_spliced) << "only the confirm sees the splice";
+    const llmbridge::Stats& st = _gw->stats();
+    EXPECT_EQ(st.streamed_bodies, 1u);
+    EXPECT_EQ(st.streamed_body_parked, 0u);
+    EXPECT_EQ(st.streamed_body_redone, 0u);
+    EXPECT_EQ(st.streamed_model_substituted, 1u);
+    EXPECT_EQ(st.streamed_override_spliced, 1u);
+    EXPECT_EQ(st.streamed_override_redone, 0u);
+    EXPECT_EQ(st.errors, 0u);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.confirm_outcome, llmbridge::ConfirmOutcome::Kept);
+    EXPECT_TRUE(recs[0].r.service_tier_spliced);
+    EXPECT_FALSE(recs[0].r.speed_spliced);
+    EXPECT_FALSE(recs[0].r.inference_geo_spliced);
+    EXPECT_TRUE(recs[0].r.model_substituted);
+    EXPECT_EQ(recs[0].asked_tier, "") << "the client sent none";
+}
+
+// Fast mode and US-only inference on the anthropic-python shape, at an Anthropic venue: both
+// inserted in apply_overrides' order, the beta token on the head that goes ahead of them.
+TEST_P(ProxyHeadDecide, SpeedAndInferenceGeoAreSplicedIntoAnAnthropicBody)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _second.set_response(http_ok(anthropic_resp_body("ok")));
+    HeadPolicy pol;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .speed = "fast", .inference_geo = "us",
+                                     .anthropic_beta = "fast-mode-2026-02-01"}};
+    start_with(pol, UpstreamDialect::Anthropic);
+    const Halves h = anthropic_sdk_halves(
+        R"({"max_tokens":1024,"messages":[{"role":"user","content":")" + std::string(64 * 1024, 'p'),
+        R"("}],"model":"claude-sonnet-4-5","system":"be brief","stream":true})");
+    EXPECT_EQ(send_streamed(_second, _proxy_port, h), 200);
+    shutdown();
+    const std::string want = held_rewrite(whole_body(h), {"", "", "fast", "us"});
+    EXPECT_EQ(want.rfind(R"({"speed":"fast","inference_geo":"us","max_tokens":)", 0), 0u) << want.substr(0, 80);
+    const std::string up = _second.last_request();
+    EXPECT_EQ(up.rfind("POST /v1/messages HTTP/1.1\r\n", 0), 0u);
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_TRUE(declares(up, want.size())) << up.substr(0, 300);
+    EXPECT_NE(up.find("\r\nanthropic-beta: fast-mode-2026-02-01\r\n"), std::string::npos) << up.substr(0, 400);
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_FALSE(pol.confirms()[0].tier_spliced);
+    EXPECT_TRUE(pol.confirms()[0].speed_spliced);
+    EXPECT_TRUE(pol.confirms()[0].geo_spliced);
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 0u);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 0u);
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_TRUE(sink.records()[0].r.speed_spliced);
+    EXPECT_TRUE(sink.records()[0].r.inference_geo_spliced);
+    EXPECT_FALSE(sink.records()[0].r.service_tier_spliced);
+}
+
+// An empty object takes no comma after the members: the `{` waits for its `}`, and a space
+// stands where the comma would, so the declared length holds. Whitespace before the `{` stays.
+TEST_P(ProxyHeadDecide, AnEmptyObjectGetsTheMembersAndASpace)
+{
+    HeadPolicy pol;
+    pol.heads = {tier_route()};
+    start_with(pol);
+    const Halves h = split_request(" \r\n{" + std::string(40 * 1024, ' '), std::string(24 * 1024, '\n') + "}\n");
+    // Nothing past the `{` can go before the `}` says the object is empty.
+    EXPECT_EQ(send_streamed(_backend, _proxy_port, h, /*ahead=*/0), 200);
+    shutdown();
+    const std::string held = held_rewrite(whole_body(h), {"", "flex", "", ""});
+    const std::string want = replaced(held, R"("service_tier":"flex")", R"("service_tier":"flex" )");
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_TRUE(declares(up, want.size())) << up.substr(0, 300);
+    EXPECT_TRUE(parses(want));
+    EXPECT_EQ(members_of(want), members_of(held));
+    EXPECT_EQ(_gw->stats().streamed_bodies, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 0u);
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, 1u);
+}
+
+// The client's own service_tier, wherever it stands, goes as spaces with the separator before
+// it (the comma, or the one after our members for the first), so the venue reads the policy's
+// tier and never two: the held rewrite's members and values, under the declared length.
+TEST_P(ProxyHeadDecide, AClientsOwnServiceTierIsBlankedWhereverItStands)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.heads = {tier_route()};
+    start_with(pol);
+    const std::string pad(64 * 1024, 'p');
+    const std::string msgs = R"("messages":[{"role":"user","content":")" + pad + R"("}])";
+    struct Case
+    {
+        std::string first, rest, want;
+    };
+    const std::string mine = R"("service_tier":"auto")";
+    const size_t cut = msgs.size() - 1024; // most of the body in the first send
+    const std::vector<Case> cases = {
+        // first
+        {"{" + mine + "," + msgs.substr(0, cut), msgs.substr(cut) + R"(,"model":"gpt-4o"})",
+         R"({"service_tier":"flex" )" + blank(mine) + "," + msgs + R"(,"model":"gpt-4o"})"},
+        // middle
+        {"{" + msgs.substr(0, cut), msgs.substr(cut) + "," + mine + R"(,"model":"gpt-4o"})",
+         R"({"service_tier":"flex",)" + msgs + blank("," + mine) + R"(,"model":"gpt-4o"})"},
+        // last
+        {"{" + msgs.substr(0, cut), msgs.substr(cut) + R"(,"model":"gpt-4o",)" + mine + "}",
+         R"({"service_tier":"flex",)" + msgs + R"(,"model":"gpt-4o")" + blank("," + mine) + "}"},
+        // first, with whitespace around it
+        {"\n{\n  \"service_tier\" : \"auto\" ,\n  " + msgs.substr(0, cut), msgs.substr(cut) + "\n}",
+         "\n{\"service_tier\":\"flex\" " + blank("\n  \"service_tier\" : \"auto\"") + " ,\n  " + msgs + "\n}"},
+        // last, with whitespace around it
+        {"{ " + msgs.substr(0, cut), msgs.substr(cut) + " , \"model\" : \"gpt-4o\" ,\n  \"service_tier\" : \"auto\"\n}",
+         R"({"service_tier":"flex", )" + msgs + " , \"model\" : \"gpt-4o\" " +
+             blank(",\n  \"service_tier\" : \"auto\"") + "\n}"},
+    };
+    for (const Case& k : cases) EXPECT_EQ(send_streamed(_backend, _proxy_port, split_request(k.first, k.rest)), 200);
+    shutdown();
+    const std::string all = _backend.all_requests();
+    for (size_t i = 0; i < cases.size(); ++i)
+    {
+        const std::string client = cases[i].first + cases[i].rest;
+        const std::string& want = cases[i].want;
+        EXPECT_TRUE(sent_with_length(all, want)) << "case " << i;
+        EXPECT_TRUE(parses(want)) << i;
+        EXPECT_EQ(count_of(want, "service_tier"), 1u) << i;
+        // The held rewrite replaces the client's value where it stands: the same object.
+        EXPECT_EQ(members_of(want), members_of(held_rewrite(client, {"", "flex", "", ""}))) << i;
+    }
+    EXPECT_EQ(all.find(R"("auto")"), std::string::npos) << "the client's tier reached the venue";
+    EXPECT_EQ(_backend.requests_seen(), static_cast<int>(cases.size()));
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, cases.size());
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 0u);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 0u);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), cases.size());
+    for (const auto& r : recs)
+    {
+        EXPECT_TRUE(r.r.service_tier_spliced);
+        EXPECT_EQ(r.asked_tier, "auto") << "the client's own tier, which the splice blanked";
+    }
+}
+
+// A client that asks for the tier the policy sets still gets it once. A confirm that names no
+// tier sends the venue what it already has, the client's own, so it keeps.
+TEST_P(ProxyHeadDecide, AClientTierEqualToThePolicysGoesOnceAndKeeps)
+{
+    HeadPolicy pol;
+    pol.heads = {tier_route()};
+    pol.whole = llmbridge::Decision{.allow = true, .upstream_index = 0};
+    start_with(pol);
+    const std::string mine = R"(,"service_tier":"flex")";
+    const Halves h = split_request(R"({"messages":[{"role":"user","content":")" + std::string(64 * 1024, 'p'),
+                                   R"("}],"model":"gpt-4o")" + mine + "}");
+    EXPECT_EQ(send_streamed(_backend, _proxy_port, h), 200);
+    shutdown();
+    const std::string want = R"({"service_tier":"flex",)" + replaced(whole_body(h), mine, blank(mine)).substr(1);
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_TRUE(declares(up, want.size()));
+    EXPECT_EQ(count_of(body_of(up), "service_tier"), 1u);
+    EXPECT_EQ(_backend.resets(), 0);
+    EXPECT_EQ(_backend.requests_seen(), 1);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 0u);
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, 1u);
+}
+
+// Judged on what the venue gets: with no tier at the confirm the venue would get the client's
+// "auto", not the "flex" it has, so the request is redone, the whole body as the client sent it.
+TEST_P(ProxyHeadDecide, AConfirmDroppingTheTierRedoesTheSplicedBody)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.heads = {tier_route()};
+    pol.whole = llmbridge::Decision{.allow = true, .upstream_index = 1};
+    start_with(pol);
+    const Halves h = split_request(R"({"messages":[{"role":"user","content":")" + std::string(64 * 1024, 'p'),
+                                   R"("}],"model":"gpt-4o","service_tier":"auto"})");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_NE(r.find("second"), std::string::npos) << r;
+    EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; })) << "the first venue was not reset";
+    c.close();
+    shutdown();
+    EXPECT_EQ(body_of(_second.last_request()), whole_body(h));
+    EXPECT_EQ(_backend.requests_seen(), 0);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 1u);
+    EXPECT_EQ(_gw->stats().streamed_override_redone, 1u);
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, 0u);
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_EQ(sink.records()[0].r.confirm_outcome, llmbridge::ConfirmOutcome::Redone);
+    EXPECT_FALSE(sink.records()[0].r.service_tier_spliced);
+}
+
+// A confirm that changes the tier redoes the request, the whole body rewritten as a held one.
+TEST_P(ProxyHeadDecide, AConfirmChangingTheTierRedoesTheSplicedBody)
+{
+    HeadPolicy pol;
+    pol.heads = {tier_route()};
+    pol.whole = tier_route(1, "priority");
+    start_with(pol);
+    const Halves h = openai_sdk_halves(R"("gpt-4o")");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest));
+    EXPECT_EQ(c.recv_status(), 200);
+    EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; })) << "the first venue was not reset";
+    c.close();
+    shutdown();
+    const std::string want = held_rewrite(whole_body(h), {"", "priority", "", ""});
+    EXPECT_EQ(body_of(_second.last_request()), want);
+    EXPECT_TRUE(declares(_second.last_request(), want.size()));
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_NE(cut[0].find("\r\n\r\n{\"service_tier\":\"flex\","), std::string::npos) << "spliced before the redo";
+    EXPECT_EQ(_gw->stats().streamed_override_redone, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 1u);
+}
+
+// A failover while the body streams resends it from its first byte under the retry's own
+// tier and substitution, both spliced again for the new venue.
+TEST_P(ProxyHeadDecide, AFailoverMidUploadSplicesTheRetrysTier)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    llmbridge::Decision d = auto_route();
+    d.service_tier = "flex";
+    pol.heads = {d};
+    pol.retry = {.retry = true, .upstream_index = 1, .service_tier = "priority", .substitute_model = "gpt-4.1",
+                 .substitute_for = "auto"};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port());
+    const Halves h = openai_sdk_halves();
+    EXPECT_EQ(send_streamed(_second, _proxy_port, h), 200);
+    shutdown();
+    const std::string want = held_rewrite(whole_body(h), {"gpt-4.1", "priority", "", ""});
+    const std::string up = _second.last_request();
+    EXPECT_EQ(body_of(up), want);
+    EXPECT_TRUE(declares(up, want.size())) << up.substr(0, 300);
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 0u);
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, 1u);
+    EXPECT_EQ(_gw->stats().streamed_model_substituted, 1u);
+    ASSERT_EQ(pol.earlies().size(), 1u);
+    EXPECT_EQ(pol.earlies()[0].upstream_index, 1);
+    EXPECT_EQ(pol.earlies()[0].service_tier, "priority");
+}
+
+// A retry that sets a member the head decision did not: the client's own was not held back
+// from the first byte, so the body parks, then goes rewritten whole.
+TEST_P(ProxyHeadDecide, AFailoverNamingAMemberTheHeadDidNotParks)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.heads = {tier_route()};
+    pol.retry = {.retry = true, .upstream_index = 1, .service_tier = "flex", .speed = "fast"};
+    start_with(pol, UpstreamDialect::OpenAI, dead.port());
+    const Halves h = openai_sdk_halves(R"("gpt-4o")");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(_second.bytes_seen(), 0u) << "a byte left before the body was complete";
+    ASSERT_TRUE(c.send(h.rest));
+    EXPECT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string want = held_rewrite(whole_body(h), {"", "flex", "fast", ""});
+    EXPECT_EQ(body_of(_second.last_request()), want);
+    EXPECT_TRUE(declares(_second.last_request(), want.size()));
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, 0u);
+    ASSERT_EQ(pol.confirms().size(), 1u);
+    EXPECT_FALSE(pol.confirms()[0].tier_spliced) << "parked: rewritten after the confirm";
+}
+
+// A pooled venue that dropped the connection as the body began: the retry rebuilds what went
+// with the members spliced in again, under the same declared length.
+TEST_P(ProxyHeadDecide, AStaleRetryReappliesTheMembers)
+{
+    _backend.set_drop_first_mid_second(true);
+    HeadPolicy pol;
+    pol.heads = {tier_route()};
+    start_with(pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "")));
+    ASSERT_EQ(c.recv_status(), 200);
+    const Halves h = split_request(R"({"model":"gpt-4o","messages":[{"role":"user","content":")" +
+                                       std::string(64 * 1024, 'p'),
+                                   R"("}],"stream":true})");
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.accepted() == 2; })) << "no retry on a fresh connection";
+    ASSERT_TRUE(c.send(h.rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_retries, 1u);
+    const std::string want = held_rewrite(whole_body(h), {"", "flex", "", ""});
+    EXPECT_EQ(body_of(_backend.last_request()), want);
+    EXPECT_TRUE(declares(_backend.last_request(), want.size()));
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_TRUE(declares(cut[0], want.size()));
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, 1u);
+}
+
+// What the held rewrite refuses, the splice refuses before the body is whole: a client's
+// member we replace that is not a string. The venue is reset short of the body.
+TEST_P(ProxyHeadDecide, AClientMemberThatIsNotAStringIsRefused)
+{
+    HeadPolicy pol;
+    pol.heads = {tier_route()};
+    start_with(pol);
+    const Halves h = split_request(R"({"messages":[{"role":"user","content":")" + std::string(64 * 1024, 'p'),
+                                   R"("}],"service_tier":["flex"],"model":"gpt-4o","pad":")" +
+                                       std::string(32 * 1024, 'q') + "\"}");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    ASSERT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; }));
+    ASSERT_TRUE(c.send(h.rest.substr(0, h.rest.size() - 2))); // not its last byte
+    EXPECT_EQ(c.recv_status(), 400);
+    EXPECT_TRUE(wait_for([&] { return _backend.resets() == 1; }));
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 0);
+    const auto cut = _backend.incomplete_requests();
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut[0].find(R"(["flex"])"), std::string::npos) << "the client's tier went upstream";
+    EXPECT_TRUE(pol.confirms().empty());
+    EXPECT_EQ(_gw->stats().streamed_body_refusals, 1u);
+}
+
+// A value the splice cannot write between quotes as it is parks, as before, and the held
+// rewrite refuses it whole: nothing reaches the venue.
+TEST_P(ProxyHeadDecide, AnOverrideTheSpliceCannotWriteParks)
+{
+    HeadPolicy pol;
+    pol.heads = {tier_route(0, "fl\"ex")};
+    start_with(pol);
+    const Halves h = openai_sdk_halves(R"("gpt-4o")");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(h.first));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(_backend.bytes_seen(), 0u) << "a byte left before the body was complete";
+    ASSERT_TRUE(c.send(h.rest));
+    EXPECT_EQ(c.recv_status(), 400);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.accepted(), 0);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 1u);
+}
+
+// A venue that read the whole spliced body and closed: the failover resends it as a held
+// body, rewritten whole, and the record says the serving attempt got no splice.
+TEST_P(ProxyHeadDecide, AFailoverAfterTheWholeSplicedBodyRewritesItWhole)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_close_unanswered(true);
+    HeadPolicy pol;
+    pol.heads = {tier_route()};
+    pol.retry = {.retry = true, .upstream_index = 1, .service_tier = "priority"};
+    start_with(pol);
+    const Halves h = openai_sdk_halves(R"("gpt-4o")");
+    EXPECT_EQ(send_streamed(_backend, _proxy_port, h), 200);
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 1) << "the first venue read it whole";
+    EXPECT_EQ(body_of(_backend.last_request()), held_rewrite(whole_body(h), {"", "flex", "", ""}));
+    const std::string want = held_rewrite(whole_body(h), {"", "priority", "", ""});
+    EXPECT_EQ(body_of(_second.last_request()), want);
+    EXPECT_TRUE(declares(_second.last_request(), want.size()));
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(_gw->stats().streamed_override_spliced, 1u) << "the confirm kept the splice";
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.confirm_outcome, llmbridge::ConfirmOutcome::Kept);
+    EXPECT_FALSE(recs[0].r.service_tier_spliced) << "the venue serving got it rewritten whole";
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyHeadDecide,

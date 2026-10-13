@@ -24,9 +24,12 @@ namespace llmbridge::detail
     // of a body still arriving, by decide_on_head.
     RequestFacts Engine::facts_of(const ClientConn* c, bool whole) const noexcept
     {
+        // A streamed body's splice is done once it is whole: every member set went in (12e).
+        const uint8_t spliced = whole && c->req.f.splice ? c->req.f.member_overrides() : 0;
         return {std::string_view(c->rbuf.data(), c->msg.header_len), c->msg.body_len, c->req.f.model.view(),
                 c->req.f.prefix_hash, c->req.f.req_seq, c->req.f.asked_stream, c->req.f.asked_usage, whole,
-                whole && c->req.f.splice && splice_hit(c)};
+                whole && c->req.f.splice && splice_hit(c), (spliced & provider::BodyScan::kServiceTier) != 0,
+                (spliced & provider::BodyScan::kSpeed) != 0, (spliced & provider::BodyScan::kInferenceGeo) != 0};
     }
 
     Decision Engine::policy_decision(ClientConn* c, bool whole) noexcept
@@ -229,7 +232,8 @@ namespace llmbridge::detail
         }
         if (!apply_decision(c, d)) return;
         f.held = d.hold;
-        start_body(c, !d.hold && !f.rewrites_body() && venue_streams(client_dialect_of(c->rbuf), c->upstream_slot));
+        start_body(c, !d.hold && overrides_stream(c, /*at_head=*/true) &&
+                          venue_streams(client_dialect_of(c->rbuf), c->upstream_slot));
     }
 
     // The decision in force, as confirm() is handed it: the venue serving now, never -1.
@@ -284,10 +288,18 @@ namespace llmbridge::detail
         std::string_view now = f.model_override.view();
         if (f.splice) now = whole.model_substituted ? f.subst_model.view() : std::string_view{};
         else if (f.body_parked) now = served(now, f.subst_model.view(), f.subst_for.view());
-        const bool same = slot == c->upstream_slot && served(d.model, d.substitute_model, d.substitute_for) == now &&
-                          d.service_tier == f.tier_override.view() && d.speed == f.speed_override.view() &&
-                          d.inference_geo == f.geo_override.view() &&
-                          d.anthropic_beta == f.beta_override.view() && d.credential_header == f.key_header.view();
+        // So for service_tier, speed and inference_geo: on a spliced body the venue gets the
+        // override, or with none the client's own member, which the scan read (12e).
+        const auto member = [&](std::string_view v, uint8_t bit) {
+            return v.empty() && f.splice ? client_member(c, bit) : v;
+        };
+        using provider::BodyScan;
+        const bool same =
+            slot == c->upstream_slot && served(d.model, d.substitute_model, d.substitute_for) == now &&
+            member(d.service_tier, BodyScan::kServiceTier) == member(f.tier_override.view(), BodyScan::kServiceTier) &&
+            member(d.speed, BodyScan::kSpeed) == member(f.speed_override.view(), BodyScan::kSpeed) &&
+            member(d.inference_geo, BodyScan::kInferenceGeo) == member(f.geo_override.view(), BodyScan::kInferenceGeo) &&
+            d.anthropic_beta == f.beta_override.view() && d.credential_header == f.key_header.view();
         f.policy_tag = d.tag; // a tag alone changing is still a keep
         if (same)
         {
@@ -297,6 +309,10 @@ namespace llmbridge::detail
                 f.model_substituted = whole.model_substituted;
                 if (whole.model_substituted) ++_stats.streamed_model_substituted;
                 else if (f.subst_model.n > f.subst_for.n) ++_stats.streamed_model_padded;
+                // The members went in; the client's own tier, if any, went as spaces.
+                f.members_spliced = f.member_overrides();
+                if (f.members_spliced) ++_stats.streamed_override_spliced;
+                if (f.members_spliced & BodyScan::kServiceTier) f.asked_tier.set(client_member(c, BodyScan::kServiceTier));
             }
             if (!f.body_parked) return true;
         }
@@ -307,6 +323,7 @@ namespace llmbridge::detail
             if (c->up)
             {
                 ++_stats.streamed_body_redone;
+                if (f.splice && f.member_overrides()) ++_stats.streamed_override_redone;
                 LB_WARN(ReqId{f.req_seq}, " confirm redid the request after ",
                         static_cast<uint64_t>(f.body_sent), " bytes went upstream; resetting it");
             }
@@ -378,7 +395,7 @@ namespace llmbridge::detail
             // Byte-forward still rebuilds: Host must name the venue. The model is
             // spliced, so every other byte the client sent survives.
             std::string_view rewritten;
-            if (c->req.f.rewrites_body())
+            if (!c->req.f.body_streaming && c->req.f.rewrites_body())
             {
                 const ReqState& f = c->req.f;
                 std::string_view had;
@@ -400,8 +417,10 @@ namespace llmbridge::detail
                 size_t safe = c->req.f.body_scanned ? c->req.scan->safe() : body.size();
                 if (c->req.f.confirm_pending && safe == c->msg.body_len) --safe;
                 c->req.f.body_sent = static_cast<uint32_t>(safe);
-                // A substitution needs the model tracked from the first byte (12d).
-                c->req.f.splice = c->req.f.subst_tracked && !c->req.f.subst_model.empty();
+                // A substitution needs the model tracked from the first byte (12d), members
+                // their client's own (12e), which overrides_stream saw to.
+                c->req.f.splice = (c->req.f.subst_tracked && !c->req.f.subst_model.empty()) ||
+                                  c->req.f.member_overrides() != 0;
                 if (const char* bad = forward_parts(c, up, key, _rebuild)) return error_respond(c, 400, bad);
             }
             else if (const char* bad = build_forward(std::string_view(c->rbuf.data(), c->msg.header_len),

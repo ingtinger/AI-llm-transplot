@@ -10,6 +10,7 @@
 
 #include "provider/body_scan.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 #include "provider/json.hpp" // kMaxDepth, string_stop
@@ -47,6 +48,13 @@ namespace llmbridge::provider
         using json::detail::string_stop;
 
         bool ws(char c) noexcept { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+        uint8_t member_bit(std::string_view k) noexcept
+        {
+            if (k == "service_tier") return BodyScan::kServiceTier;
+            if (k == "speed") return BodyScan::kSpeed;
+            if (k == "inference_geo") return BodyScan::kInferenceGeo;
+            return 0;
+        }
         bool digit(char c) noexcept { return c >= '0' && c <= '9'; }
         bool hex(char c) noexcept
         {
@@ -54,7 +62,7 @@ namespace llmbridge::provider
         }
     } // namespace
 
-    void BodyScan::reset(bool all_keys, bool track_model) noexcept
+    void BodyScan::reset(bool all_keys, bool track_model, uint8_t members) noexcept
     {
         _top.clear();
         _options.clear();
@@ -69,6 +77,11 @@ namespace llmbridge::provider
         _track_model = track_model;
         _model_next = _model_open = _model_seen = false;
         _model_at = _model_end = SIZE_MAX;
+        _members = members;
+        _members_seen = _nfound = _member_bit = 0;
+        _open_at = SIZE_MAX;
+        _member_at = _member_value = 0;
+        _has_member = _member_next = _member_open = false;
         _why = nullptr;
         _verdict = Verdict::More;
     }
@@ -103,6 +116,15 @@ namespace llmbridge::provider
             _model_end = end;
             _hold = SIZE_MAX;
         }
+        if (_member_open && _depth == 1)
+        {
+            // A member the mask names closed: told whole, with the separator before it.
+            _member_open = false;
+            _found[_nfound++] = {_member_at, _member_value, end, _member_bit};
+            _hold = SIZE_MAX;
+        }
+        // The root closed: an empty object held from its `{` lets it go.
+        if (_depth == 0 && _members) _hold = SIZE_MAX;
         if (_depth == 0) _st = St::End;
         else _st = (_kinds >> (_depth - 1)) & 1 ? St::ObjNext : St::ArrNext;
         return true;
@@ -113,10 +135,26 @@ namespace llmbridge::provider
     {
         _key = false;
         if (!_tracked) return true;
-        _hold = SIZE_MAX;
         const std::string_view k = body.substr(_str, end - _str);
         std::vector<Span>& set = _depth == 1 ? _top : _options;
         if (k.find('\\') != std::string_view::npos) { _why = "escaped top-level key"; return false; }
+        if (_depth == 1 && _members)
+        {
+            // Held from the separator before it: a member the mask names until its value
+            // closes, any other one only until now.
+            _has_member = true;
+            const uint8_t bit = member_bit(k) & _members;
+            if (bit)
+            {
+                if (_members_seen & bit) { _why = "repeated top-level key"; return false; }
+                _members_seen |= bit;
+                _member_bit = bit;
+                _member_at = _hold;
+                _member_next = true;
+            }
+            else _hold = SIZE_MAX;
+        }
+        else _hold = SIZE_MAX;
         if (_depth == 1 && k == "model")
         {
             if (_model_seen) { _why = "repeated top-level key"; return false; }
@@ -232,12 +270,17 @@ namespace llmbridge::provider
                 if (c != '"') return false;
                 _key = true;
                 _tracked = _depth == 1 || (_options_depth != 0 && _depth == _options_depth);
-                if (_tracked) _hold = i - 1;
+                if (_tracked) _hold = std::min(_hold, i - 1); // a separator held before it stays
                 _str = i;
                 _st = St::Str;
                 return true;
             case St::ObjNext:
-                if (c == ',') { _st = St::ObjKey; return true; }
+                if (c == ',')
+                {
+                    if (_members && _depth == 1) _hold = i - 1; // with the member after it
+                    _st = St::ObjKey;
+                    return true;
+                }
                 if (c != '}') return false;
                 break;
             case St::ArrNext:
@@ -259,6 +302,19 @@ namespace llmbridge::provider
                     _model_open = true;
                     _model_at = _hold = i - 1;
                 }
+                if (_members)
+                {
+                    // Members go in after the root's `{` and replace a string: anything else
+                    // is refused, as the held rewrite (apply_overrides) refuses it.
+                    if (_depth == 0 && c != '{') { _why = "body is not a JSON object"; return false; }
+                    if (_member_next)
+                    {
+                        _member_next = false;
+                        if (c != '"') { _why = "top-level override value not a string"; return false; }
+                        _member_open = true;
+                        _member_value = i - 1;
+                    }
+                }
                 if (c == '"') { _key = false; _st = St::Str; return true; }
                 if (c == '{' || c == '[')
                 {
@@ -266,6 +322,8 @@ namespace llmbridge::provider
                     const uint64_t bit = uint64_t{1} << _depth;
                     _kinds = c == '{' ? (_kinds | bit) : (_kinds & ~bit);
                     ++_depth;
+                    // The first member waits, with the `{`'s insertion, until it is known.
+                    if (_members && _depth == 1) _open_at = _hold = i;
                     if (c == '{' && options && _depth == 2) _options_depth = 2;
                     _st = c == '{' ? St::ObjFirst : St::ArrFirst;
                     return true;

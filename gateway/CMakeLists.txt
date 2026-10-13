@@ -20,6 +20,7 @@ add_library(gateway STATIC
         src/io/uring_io.cpp
         src/request.cpp
         src/response.cpp
+        src/splice.cpp
 )
 target_include_directories(gateway PUBLIC include PRIVATE src)
 target_compile_features(gateway PUBLIC cxx_std_20)

@@ -287,6 +287,9 @@ at its last byte and `body_work_ns` 0, so nothing done for the venue it left is 
 A model substitution spliced into a streamed body (GATEWAY-INTERNALS.md 12d) moves no
 stamp either: the splice is done as each part is staged, so after t3 it is in
 `body_work_ns`, and the trailing spaces go with the last byte, before `ts_body_sent`.
+Nor does a `service_tier`, `speed` or `inference_geo` splice (12e). The bytes after the
+root's `{` wait for the first key, so an object with no member (a body of whitespace,
+in practice never) goes only at its last byte.
 
 
 ## 3. Per-request headers (`--timing-headers`)

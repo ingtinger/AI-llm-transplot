@@ -56,7 +56,8 @@ namespace llmbridge::detail
     // Admitted before its last byte: forwarded as it arrives, or parked unsent in rbuf to
     // its last byte (12c), which holds no venue and no slot. An OpenAI client's JSON is
     // checked as it passes either way; a file upload is not JSON. Any client's JSON that
-    // streams under a model substitution is scanned too, its model tracked (12d).
+    // streams under a model substitution is scanned too, its model tracked (12d), and so
+    // is one that streams with service_tier, speed or inference_geo spliced in (12e).
     void Engine::start_body(ClientConn* c, bool forward) noexcept
     {
         ReqState& f = c->req.f;
@@ -64,11 +65,12 @@ namespace llmbridge::detail
         const bool json = json_media_type(f.head.content_type.in(c->rbuf));
         const bool openai = client_dialect_of(c->rbuf) == Dialect::OpenAI;
         f.subst_tracked = json && forward && !f.subst_model.empty();
-        f.body_scanned = json && (openai || f.subst_tracked);
+        f.members_tracked = json && forward ? f.member_overrides() : 0;
+        f.body_scanned = json && (openai || f.subst_tracked || f.members_tracked);
         if (f.body_scanned)
         {
             if (!c->req.scan) c->req.scan = std::make_unique<provider::BodyScan>();
-            c->req.scan->reset(/*all_keys=*/openai, f.subst_tracked);
+            c->req.scan->reset(/*all_keys=*/openai, f.subst_tracked, f.members_tracked);
         }
         f.body_in = static_cast<uint32_t>(body_so_far(c).size());
         if (forward)
@@ -181,20 +183,51 @@ namespace llmbridge::detail
 
     namespace
     {
-        ModelSplice splice_of(const ReqState& f) noexcept { return {f.subst_for.view(), f.subst_model.view()}; }
+        MemberSplice members_of(const ReqState& f) noexcept
+        {
+            return {f.tier_override.view(), f.speed_override.view(), f.geo_override.view()};
+        }
+        Splice splice_of(const ReqState& f) noexcept
+        {
+            return {{f.subst_for.view(), f.subst_model.view()}, members_of(f)};
+        }
     } // namespace
 
-    // The scan holds the model's value back until it closes, so a range never splits it.
+    // The scan holds the model's value back until it closes, and each member it tracks with
+    // the separator before it, so a range never splits one.
     void Engine::append_spliced(const ClientConn* c, std::string& out, size_t from, size_t to) const noexcept
     {
-        const provider::BodyScan& s = *c->req.scan;
-        splice_of(c->req.f).append(out, body_so_far(c), from, to, c->msg.body_len, s.model_at(), s.model_end());
+        splice_of(c->req.f).append(out, body_so_far(c), from, to, c->msg.body_len, *c->req.scan);
     }
 
     bool Engine::splice_hit(const ClientConn* c) const noexcept
     {
+        return splice_of(c->req.f).substitutes(body_so_far(c), *c->req.scan);
+    }
+
+    // The body overrides in force can go into a stream (12e): none but members, each plain,
+    // spliced into a JSON body at the head decision; on a later attempt, only members whose
+    // client's own the scan has held back from the first byte.
+    bool Engine::overrides_stream(const ClientConn* c, bool at_head) const noexcept
+    {
+        const ReqState& f = c->req.f;
+        if (!f.model_override.empty()) return false;
+        const uint8_t m = f.member_overrides();
+        if (!m) return true;
+        if (!members_of(f).plain()) return false;
+        return at_head ? json_media_type(f.head.content_type.in(c->rbuf)) : (m & ~f.members_tracked) == 0;
+    }
+
+    // The client's own value of a member the scan tracked, raw, without its quotes; empty
+    // when it sent none.
+    std::string_view Engine::client_member(const ClientConn* c, uint8_t bit) const noexcept
+    {
+        if (!(c->req.f.members_tracked & bit)) return {};
         const provider::BodyScan& s = *c->req.scan;
-        return splice_of(c->req.f).matches(body_so_far(c), s.model_at(), s.model_end());
+        for (size_t i = 0; i < s.member_count(); ++i)
+            if (const provider::BodyScan::Member& m = s.members()[i]; m.bit == bit)
+                return body_so_far(c).substr(m.value_at + 1, m.end - m.value_at - 2);
+        return {};
     }
 
     const char* Engine::forward_parts(const ClientConn* c, const Upstream& up, const NamedKey& key,
@@ -206,7 +239,7 @@ namespace llmbridge::detail
         if (!f.splice)
             return build_forward(head, c->msg.header_len, f.head, _strip_headers, up.host_hdr, up.base_path,
                                  body_so_far(c).substr(0, f.body_sent), into, c->msg.body_len, key, beta);
-        // The length is ours: the client's, and what the replacement adds (12d).
+        // The length is ours: the client's, and what the replacement and members add (12d, 12e).
         if (const char* bad = build_forward(head, c->msg.header_len, f.head, _strip_headers, up.host_hdr,
                                             up.base_path, {}, into, c->msg.body_len + splice_of(f).grow(), key,
                                             beta))
@@ -222,6 +255,7 @@ namespace llmbridge::detail
         ReqState& f = c->req.f;
         f.splice = false;
         f.model_substituted = false;
+        f.members_spliced = 0; // rewritten whole, if set: no splice
         if (f.subst_model.empty() || !f.model_override.empty() || f.model.view() != f.subst_for.view()) return;
         f.model_override.set(f.subst_model.view());
         f.model_substituted = true;

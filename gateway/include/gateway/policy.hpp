@@ -39,6 +39,11 @@ namespace llmbridge
         /// Decision::substitute_model. The decision in force has been carried out: returning
         /// it keeps the request, with no redo. False for a parked body, rewritten after.
         bool model_substituted = false;
+        /// At confirm() only: the streaming body went with Decision::service_tier, speed or
+        /// inference_geo spliced in, the client's own blanked (GATEWAY-INTERNALS.md 12e).
+        bool service_tier_spliced = false;
+        bool speed_spliced = false;
+        bool inference_geo_spliced = false;
     };
 
     inline constexpr size_t kMaxDenyMessage = 256;
@@ -128,6 +133,7 @@ namespace llmbridge
         std::string_view model{};
 
         /// Set the request's `service_tier`, at most 32 bytes; empty leaves the body alone.
+        /// A streamed body gets it, `speed` and `inference_geo` spliced in: 12e, no park.
         std::string_view service_tier{};
 
         /// Logged, never sent; must outlive the call and carry no credential material.
@@ -190,6 +196,8 @@ namespace llmbridge
         /// attempt that named one, the decision or a retry, the request is not retried.
         std::string_view credential_header{};
         /// As Decision's, for the venue named here; empty sends none of the failed one's.
+        /// Still streaming, these and `service_tier` splice only if the head decision set
+        /// each too (12e); else the body parks.
         std::string_view speed{};
         std::string_view inference_geo{};
         std::string_view anthropic_beta{};
@@ -231,7 +239,9 @@ namespace llmbridge
         /// the whole body goes as a held one under the new venue, overrides,
         /// credential_header and tag. A change of tag alone is a keep, the tag updated, and so
         /// is a decision that sends the venue the same model the one in force does, as a
-        /// substitution or an override (`whole.model_substituted` says the splice is done).
+        /// substitution or an override (`whole.model_substituted` says the splice is done),
+        /// and the same service_tier, speed and inference_geo: an override spliced in, or with
+        /// none on a spliced body the client's own (`whole.service_tier_spliced` and the rest).
         /// The request was counted at decide(): do not count it again here.
         virtual Decision confirm(const RequestFacts& whole, const Decision& early) noexcept
         {
