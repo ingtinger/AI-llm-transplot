@@ -87,5 +87,6 @@ namespace llmbridge
         uint64_t streamed_override_spliced = 0;
         uint64_t streamed_override_redone = 0;
         uint64_t upstream_unresolved = 0; // acquires refused: the venue's name had no address yet
+        uint64_t upstream_local_failures = 0; // connects this host could not make, answered 503
     };
 } // namespace llmbridge

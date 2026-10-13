@@ -111,7 +111,7 @@ namespace llmbridge::detail
         return u;
     }
 
-    UpstreamConn* Engine::acquire_upstream(int slot, AcquireFail* why) noexcept
+    UpstreamConn* Engine::acquire_upstream(int slot, AcquireFail* why, int* local_err) noexcept
     {
         AcquireFail ignored = AcquireFail::None;
         AcquireFail& fail = why ? *why : ignored;
@@ -148,6 +148,8 @@ namespace llmbridge::detail
             if (connect_error_is_local(err))
             {
                 fail = AcquireFail::Local;
+                if (local_err) *local_err = err;
+                ++_stats.upstream_local_failures;
                 return nullptr;
             }
             // Known at once, as epoll learns an unreachable network: the venue moves on as
@@ -172,8 +174,9 @@ namespace llmbridge::detail
         if (!local) note_connect_failure(u->venue, std::strerror(err));
         ClientConn* client = unpair(u);
         _ops->close(*u);
+        if (local) ++_stats.upstream_local_failures;
         if (!client) ++_stats.errors;
-        else if (local) error_respond(client, 503, "no upstream (gateway out of resources)");
+        else if (local) error_respond(client, 503, local_connect_why(err));
         else fail_request(client, 502, "upstream connect refused");
     }
 
@@ -221,7 +224,8 @@ namespace llmbridge::detail
                 return false;
             }
             // This host's: answered 503 here, never reported as the stale venue's EOF.
-            error_respond(client, 503, "no upstream (gateway out of resources)");
+            ++_stats.upstream_local_failures;
+            error_respond(client, 503, local_connect_why(err));
             return true;
         }
         client->req.f.upstream_ip = uf->up_addr.sin_addr.s_addr;

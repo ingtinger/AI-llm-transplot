@@ -152,7 +152,7 @@ namespace llmbridge::detail
         // A client that stopped reading is not the venue's failure: no policy hears of it.
         if (!c->req.f.streaming)
         {
-            if (stalled) error_respond(c, 504, "upstream idle timeout");
+            if (stalled) error_respond(c, 504, "client stalled, not reading");
             else fail_request(c, 504, "upstream idle timeout");
             return;
         }

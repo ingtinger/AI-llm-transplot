@@ -453,7 +453,8 @@ namespace llmbridge::detail
         c->req.f.phase = Phase::Dispatched; // from here until a response byte, failover may redo it
         c->req.f.body_parts = c->req.f.body_streaming;
         AcquireFail fail = AcquireFail::None;
-        UpstreamConn* u = acquire_upstream(c->upstream_slot, &fail);
+        int local_err = 0;
+        UpstreamConn* u = acquire_upstream(c->upstream_slot, &fail, &local_err);
         if (!u)
         {
             secure_clear(_rebuild); // a credential must not wait in the scratch
@@ -462,7 +463,7 @@ namespace llmbridge::detail
             if (fail == AcquireFail::Local)
             {
                 if (!c->req.saved.empty()) c->rbuf.erase(0, c->msg.total_len);
-                return error_respond(c, 503, "no upstream (gateway out of resources)");
+                return error_respond(c, 503, local_connect_why(local_err));
             }
             // Taken as a request that reached its venue is, so a first attempt fails over
             // like any other: the failover finds its bytes in `saved`.
@@ -587,12 +588,17 @@ namespace llmbridge::detail
                                bool keep) noexcept
     {
         if (!client || client->doomed) return;
-        // A client-caused refusal is DEBUG; anything we or the provider caused is WARN.
+        // Every reply of our own is WARN, a client's 4xx too: DEBUG is not in a default build.
         // An authentication refusal names where it came from.
         const std::string peer = (code == 401 || code == 403) ? peer_of(client->fd)
                                                               : std::string{};
-        LB_WARN(ReqId{client->req.f.req_seq}, " reply ", code, " ", why, " on ", *client,
-                peer.empty() ? "" : " peer=", peer);
+        // Past dispatch, a 5xx names the venue: the one that failed, or that was refused.
+        if (code >= 500 && client->req.f.phase >= Phase::Dispatched)
+            LB_WARN(ReqId{client->req.f.req_seq}, " reply ", code, " ", why, " on ", *client, " venue=",
+                    static_cast<int64_t>(client->upstream_slot));
+        else
+            LB_WARN(ReqId{client->req.f.req_seq}, " reply ", code, " ", why, " on ", *client,
+                    peer.empty() ? "" : " peer=", peer);
         // A reply already begun cannot be followed by a second one: close instead.
         if (client->req.f.phase >= Phase::Streaming || !client->out.idle())
         {

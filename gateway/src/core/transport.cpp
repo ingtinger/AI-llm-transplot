@@ -15,6 +15,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <string_view>
 
 namespace llmbridge::detail
 {
@@ -65,6 +67,11 @@ namespace llmbridge::detail
         u->tls = std::make_unique<net::tls::Session>();
         if (!u->tls->init_client(_tls_upstream_ctx, upstream_of(u).sni_host))
         {
+            // The request goes on as a failed connect; only this line says it was TLS.
+            const std::string& err = u->tls->last_error();
+            LB_WARN("venue ", static_cast<int64_t>(u->venue), " TLS session setup failed (",
+                    err.empty() ? std::string_view("context not ready") : std::string_view(err), ") sni=",
+                    upstream_of(u).sni_host, "; no connect attempted");
             u->tls.reset();
             return false;
         }

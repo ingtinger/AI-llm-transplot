@@ -8,6 +8,42 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.99.1]. 2026-10-13
+
+Logging only, from an audit of the 0.99.0 paths: what fails now says why, and what repeats
+says it once. No behaviour or API change beyond the one appended counter.
+
+### Added
+
+- **`Stats::upstream_local_failures`**, appended: connects this host could not make (out of
+  descriptors, memory, a full submission queue or epoll set), each answered 503. The exit
+  profile and the SIGUSR1 dump print it beside `upstream_unresolved`.
+- **A boot WARN for a venue that can never be dialled**: an `ip` that is not an IPv4
+  address and no `host` to resolve. Every request to it is refused, and before this only
+  the refusals said so.
+- **A WARN when an upstream TLS session cannot be set up** (out of memory, or an `sni_host`
+  OpenSSL refuses), with OpenSSL's reason and the SNI name. The request went on as a
+  failed connect with nothing saying it was TLS.
+- **An INFO when the engine shuts down with a name lookup still running**, before it
+  leaves the resolver thread to finish on its own.
+
+### Changed
+
+- **A 503 for this host's want names the errno.** "no upstream (gateway out of resources)"
+  now reads, for example, "(gateway out of resources: EMFILE, the process descriptor
+  limit)": EMFILE, ENFILE, ENOBUFS, ENOMEM, ENOSPC and EAGAIN are each raised in a
+  different place. The same reason on acquire, a connect's completion and a stale resend.
+- **A 5xx past dispatch names its venue**, `venue=N` at the end of the reply line.
+- **A 504 for a client that stopped reading its reply says so**: "client stalled, not
+  reading", where it read "upstream idle timeout" right after the correct TIMEOUT line.
+- **A lookup that finds the addresses a venue already has is DEBUG**, not INFO: a venue
+  refusing connects is looked up again every second, and each said nothing new.
+- **A resolver job that cannot be queued** (no thread, no memory) names the exception and
+  whether the venue keeps an address, backs off as a failed lookup does, and logs once
+  per outage instead of once a second per venue.
+- **DESIGN.md "Logging"** states the rule the code has followed since 0.34.0: every reply
+  of the gateway's own is WARN, a client's 4xx included. It still said 4xx was DEBUG.
+
 ## [0.99.0]. 2026-10-13
 
 A policy hears of every venue that failed while the client was sent nothing, and can key
