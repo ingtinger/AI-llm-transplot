@@ -111,6 +111,9 @@ namespace llmbridge::detail
     /// The client's dialect from the request line of `head`: client_wire on its method
     /// and full target.
     [[nodiscard]] Dialect client_dialect_of(std::string_view head) noexcept;
+    /// The request line of `head` creates an OpenAI Responses API response, whose
+    /// search calls are billed per call and stated only as output items.
+    [[nodiscard]] bool responses_api(std::string_view head) noexcept;
     /// application/json or a +json type, whatever its parameters and case.
     [[nodiscard]] bool json_media_type(std::string_view content_type) noexcept;
     /// Everything a policy or the sink reads from the body; the gateway calls this

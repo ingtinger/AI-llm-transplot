@@ -150,6 +150,28 @@ namespace llmbridge::provider::json_scan
         }
     }
 
+    /// Calls `f(value)` for each element of the array at the front of `arr`, raw, until
+    /// `f` returns false. False when `arr` is not an array or stops parsing early.
+    template <class F>
+    bool for_each_element(std::string_view arr, F&& f) noexcept
+    {
+        size_t i = skip_ws(arr, 0);
+        if (i >= arr.size() || arr[i] != '[') return false;
+        i = skip_ws(arr, i + 1);
+        if (i < arr.size() && arr[i] == ']') return true;
+        while (true)
+        {
+            const size_t vb = i;
+            i = skip_value(arr, i);
+            if (i == kNpos) return false;
+            if (!f(arr.substr(vb, i - vb))) return true;
+            i = skip_ws(arr, i);
+            if (i < arr.size() && arr[i] == ']') return true;
+            if (i >= arr.size() || arr[i] != ',') return false;
+            i = skip_ws(arr, i + 1);
+        }
+    }
+
     /// A string value without escapes, unquoted; empty for anything else.
     inline std::string_view plain_string(std::string_view raw) noexcept
     {
@@ -170,5 +192,46 @@ namespace llmbridge::provider::json_scan
             v = v * 10 + (c - '0');
         }
         return v;
+    }
+
+    /// Dollars as a JSON number (`0.0000268`, `2.68e-05`) in picodollars, rounded; -1
+    /// for a negative, malformed or overflowing one. Digits past the eighteenth
+    /// significant one are dropped, below any price a venue states.
+    inline long long picodollars(std::string_view raw) noexcept
+    {
+        size_t i = 0;
+        unsigned long long m = 0;
+        int digits = 0, exp10 = 12;
+        bool any = false, point = false;
+        for (; i < raw.size(); ++i)
+        {
+            const char c = raw[i];
+            if (c == '.' && !point) { point = true; continue; }
+            if (c < '0' || c > '9') break;
+            any = true;
+            if (m == 0 && c == '0') { exp10 -= point; continue; }
+            if (digits < 18) { m = m * 10 + static_cast<unsigned>(c - '0'); ++digits; exp10 -= point; }
+            else exp10 += !point;
+        }
+        if (!any) return -1;
+        if (i < raw.size())
+        {
+            if (raw[i] != 'e' && raw[i] != 'E') return -1;
+            bool neg = false;
+            if (++i < raw.size() && (raw[i] == '+' || raw[i] == '-')) neg = raw[i++] == '-';
+            int e = 0;
+            const size_t from = i;
+            for (; i < raw.size() && raw[i] >= '0' && raw[i] <= '9'; ++i)
+                if (e < 400) e = e * 10 + (raw[i] - '0');
+            if (i == from || i != raw.size()) return -1;
+            exp10 += neg ? -e : e;
+        }
+        for (; exp10 > 0; --exp10)
+        {
+            if (m > 922337203685477580ULL) return -1;
+            m *= 10;
+        }
+        for (; exp10 < 0 && m; ++exp10) m = exp10 == -1 ? (m + 5) / 10 : m / 10;
+        return m > 9223372036854775807ULL ? -1 : static_cast<long long>(m);
     }
 } // namespace llmbridge::provider::json_scan

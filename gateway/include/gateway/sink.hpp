@@ -87,18 +87,48 @@ namespace llmbridge
         /// the input rate and the one-hour entry at 2x.
         int32_t cache_write_5m_tokens = -1;
         int32_t cache_write_1h_tokens = -1;
-        /// The rest of the venue's token accounting. Reasoning
-        /// is inside `tokens_out` (OpenAI's completion_tokens_details, Gemini's
-        /// thoughtsTokenCount); audio in and out are priced at their own rates; the
-        /// prediction pair is OpenAI's predicted outputs, rejected ones billed and
-        /// never shown; tool_prompt_tokens is Gemini's server-tool addition to the
-        /// prompt. Anthropic states none of these: its thinking is in output_tokens.
+        /// The rest of the venue's token accounting. Reasoning is inside `tokens_out`
+        /// (OpenAI's and the Responses API's reasoning_tokens, Anthropic's
+        /// thinking_tokens, Gemini's thoughtsTokenCount); audio in and out are priced at
+        /// their own rates; the prediction pair is OpenAI's predicted outputs, rejected
+        /// ones billed and never shown; tool_prompt_tokens is Gemini's server-tool
+        /// addition to the prompt; image_in_tokens is part of `tokens_in`.
         int32_t reasoning_tokens = -1;
         int32_t audio_in_tokens = -1;
         int32_t audio_out_tokens = -1;
         int32_t accepted_prediction_tokens = -1;
         int32_t rejected_prediction_tokens = -1;
         int32_t tool_prompt_tokens = -1;
+        int32_t image_in_tokens = -1;
+        /// Server tools billed per call: Anthropic's server_tool_use counts, and the
+        /// Responses API's search calls counted from its output.
+        int32_t web_search_requests = -1;
+        int32_t web_fetch_requests = -1;
+        int32_t code_exec_requests = -1;
+        int32_t file_search_calls = -1;
+        /// The venue's own price for this request in picodollars (DeepInfra's
+        /// estimated_cost), a check on ours.
+        int64_t venue_cost_pdollars = -1;
+        /// Anthropic's `usage.iterations`, billed beside the counts above, which leave
+        /// them out: a compaction pass on the served model, and attempts declined before
+        /// a fallback, on `prior_model`. Inputs include their cached part, as tokens_in does.
+        int32_t compaction_in_tokens = -1;
+        int32_t compaction_out_tokens = -1;
+        int32_t compaction_cached_tokens = -1;
+        int32_t prior_in_tokens = -1;
+        int32_t prior_out_tokens = -1;
+        int32_t prior_cached_tokens = -1;
+        int32_t prior_cache_write_tokens = -1;
+        int32_t prior_attempts = -1;
+        std::string_view prior_model;
+        /// What served, as the venue says: Anthropic's `usage.speed` and
+        /// `usage.inference_geo`, Bedrock's latency header. Each prices the request.
+        std::string_view served_speed;
+        std::string_view served_geo;
+        std::string_view served_latency;
+        /// The client's `prompt_cache_options.ttl`, which prices a write its venue
+        /// reports without a lifetime.
+        std::string_view asked_cache_ttl;
         bool streamed = false;
         /// The venue connection was reused from the pool. Not the same as
         /// `client_conn_reused`, which is the client's leg.

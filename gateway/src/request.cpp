@@ -351,6 +351,15 @@ namespace llmbridge::detail
         return client_wire(rl.substr(0, sp1), rl.substr(sp1 + 1, sp2 - sp1 - 1));
     }
 
+    bool responses_api(std::string_view head) noexcept
+    {
+        const std::string_view rl = head.substr(0, head.find("\r\n"));
+        const size_t sp1 = rl.find(' '), sp2 = rl.rfind(' ');
+        if (sp1 == std::string_view::npos || sp2 <= sp1 || rl.substr(0, sp1) != "POST") return false;
+        const std::string_view target = rl.substr(sp1 + 1, sp2 - sp1 - 1);
+        return target.substr(0, target.find('?')).ends_with("/v1/responses");
+    }
+
     /// The translation for a request, from the client's dialect (read off the request
     /// line) and the venue's. Shared by both backends; the caller handles the refusal
     /// so each can use its own error path. A free function, not a Gateway method,

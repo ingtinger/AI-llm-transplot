@@ -63,6 +63,7 @@ namespace llmbridge::detail
         clock_gettime(CLOCK_REALTIME, &tw);
         c->req.f.wall_t0 = static_cast<int64_t>(tw.tv_sec) * 1000000000 + tw.tv_nsec;
         const std::string_view head(c->rbuf.data(), c->msg.header_len);
+        c->req.f.responses_api = responses_api(head); // read at the reply, when rbuf has moved on
         for (size_t i = 0; i < kSinkCaptureMax && i < _sink_capture_names.size(); ++i)
             c->req.f.captured[i].set(net::http::find_header(head, _sink_capture_names[i]));
     }
@@ -80,6 +81,7 @@ namespace llmbridge::detail
             detail::body_facts(std::string_view(c->rbuf.data(), c->msg.header_len), body);
         c->req.f.asked_stream = top.stream;
         c->req.f.asked_usage = top.include_usage;
+        c->req.f.asked_cache_ttl.set(top.cache_ttl);
         // What a policy or the sink reads here must be what the provider reads. Our
         // readers take the first raw match; a provider unescapes and may take the last.
         switch (top.keys)
@@ -159,6 +161,25 @@ namespace llmbridge::detail
         r.accepted_prediction_tokens = static_cast<int32_t>(u.accepted_prediction);
         r.rejected_prediction_tokens = static_cast<int32_t>(u.rejected_prediction);
         r.tool_prompt_tokens = static_cast<int32_t>(u.tool_prompt);
+        r.image_in_tokens = static_cast<int32_t>(u.image_in);
+        r.web_search_requests = static_cast<int32_t>(u.web_search);
+        r.web_fetch_requests = static_cast<int32_t>(u.web_fetch);
+        r.code_exec_requests = static_cast<int32_t>(u.code_exec);
+        r.file_search_calls = static_cast<int32_t>(u.file_search);
+        r.venue_cost_pdollars = u.venue_cost_pdollars;
+        r.compaction_in_tokens = static_cast<int32_t>(u.compaction_in);
+        r.compaction_out_tokens = static_cast<int32_t>(u.compaction_out);
+        r.compaction_cached_tokens = static_cast<int32_t>(u.compaction_cached);
+        r.prior_in_tokens = static_cast<int32_t>(u.prior_in);
+        r.prior_out_tokens = static_cast<int32_t>(u.prior_out);
+        r.prior_cached_tokens = static_cast<int32_t>(u.prior_cached);
+        r.prior_cache_write_tokens = static_cast<int32_t>(u.prior_cache_write);
+        r.prior_attempts = static_cast<int32_t>(u.prior_attempts);
+        r.prior_model = u.prior_model.view(); // `u` outlives on_request
+        r.served_speed = u.speed.view();
+        r.served_geo = u.inference_geo.view();
+        r.served_latency = c->req.f.served_latency.view();
+        r.asked_cache_ttl = c->req.f.asked_cache_ttl.view();
         for (size_t i = 0; i < kSinkCaptureMax; ++i)
             r.captured[i] = c->req.f.captured[i].view();
         r.ts_body_end = c->req.f.ts_body_end;

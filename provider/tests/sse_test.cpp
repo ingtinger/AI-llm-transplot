@@ -174,6 +174,29 @@ TEST(Sse, ContentStartedLatchesOnFirstToolCall)
     EXPECT_TRUE(t.content_started());
 }
 
+// The translated stream reads usage as a byte-forwarded one does: the prompt
+// Anthropic restates once server tools ran, and every count beside the tokens.
+TEST(Sse, TheLastDeltasPromptAndToolCountsWin)
+{
+    AnthropicToOpenAiSse t(kFixedCreated);
+    std::string out;
+    t.feed("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\","
+           "\"usage\":{\"input_tokens\":2679,\"cache_read_input_tokens\":100,"
+           "\"output_tokens\":3,\"speed\":\"fast\"}}}\n\n", out);
+    t.feed("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"
+           "\"usage\":{\"input_tokens\":10682,\"cache_read_input_tokens\":100,"
+           "\"output_tokens\":510,\"output_tokens_details\":{\"thinking_tokens\":200},"
+           "\"server_tool_use\":{\"web_search_requests\":2}}}\n\n", out);
+    const llmbridge::provider::openai::Usage u = t.usage();
+    EXPECT_EQ(u.in, 10782) << "message_start's prompt undercounts a server-tool turn";
+    EXPECT_EQ(u.cached, 100);
+    EXPECT_EQ(u.out, 510);
+    EXPECT_EQ(u.reasoning, 200);
+    EXPECT_EQ(u.web_search, 2);
+    EXPECT_EQ(u.speed.view(), "fast");
+    EXPECT_EQ(t.input_tokens(), 10782);
+}
+
 TEST(Sse, MaxTokensMapsToLength)
 {
     const char* s =

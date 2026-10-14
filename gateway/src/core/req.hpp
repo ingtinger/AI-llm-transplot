@@ -155,6 +155,7 @@ namespace llmbridge
         bool stream_ended = false;
         bool stream_keep_alive = false; ///< the upstream may be pooled at the end
         bool sse_translating = false;
+        bool responses_api = false; ///< its search calls are counted for the sink
         Phase phase = Phase::Idle;
         uint8_t quota_exhausted = 0;
         uint16_t retry_after_s = 0;
@@ -169,9 +170,11 @@ namespace llmbridge
         FixedStr<kMaxKeyHeaderName> key_header; ///< the family header holding this attempt's key
         FixedStr<64> model;          ///< the client's, for the policy and the sink
         FixedStr<16> asked_tier;     ///< the client's own service_tier
+        FixedStr<8> asked_cache_ttl; ///< the client's prompt_cache_options.ttl
         FixedStr<32> upstream_error; ///< the venue's name for a failure
         FixedStr<64> venue_req_id;
         FixedStr<16> served_tier;
+        FixedStr<16> served_latency; ///< Bedrock's performance config, from its header
         FixedStr<64> served_model;   ///< cut at 64: longer ids are Bedrock ARNs
         FixedStr<kSinkCaptureBytes> captured[kSinkCaptureMax];
         HeadFacts head;

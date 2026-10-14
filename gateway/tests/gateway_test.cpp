@@ -6619,6 +6619,11 @@ namespace
             c.served_tier.assign(r.served_tier);       // and this
             c.served_model.assign(r.served_model);     // and this
             c.venue_req_id.assign(r.venue_req_id);     // and this
+            c.served_latency.assign(r.served_latency); // and these
+            c.served_speed.assign(r.served_speed);
+            c.served_geo.assign(r.served_geo);
+            c.prior_model.assign(r.prior_model);
+            c.asked_cache_ttl.assign(r.asked_cache_ttl);
             _records.push_back(std::move(c));
         }
         struct Copy
@@ -6631,6 +6636,7 @@ namespace
             std::string served_tier;
             std::string served_model;
             std::string venue_req_id;
+            std::string served_latency, served_speed, served_geo, prior_model, asked_cache_ttl;
         };
         std::vector<Copy> records()
         {
@@ -7808,6 +7814,107 @@ TEST_P(ProxyForwardStream, TheSinkGetsEveryUsageDetailTheVenueStates)
     EXPECT_EQ(r.accepted_prediction_tokens, 5);
     EXPECT_EQ(r.rejected_prediction_tokens, 1);
     EXPECT_EQ(r.tool_prompt_tokens, -1) << "OpenAI states none; Gemini does";
+}
+
+namespace
+{
+    std::string responses_request(const std::string& body)
+    {
+        return "POST /v1/responses HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+
+    constexpr const char* kSearchedReply =
+        R"({"id":"r","object":"response","output":[{"type":"web_search_call","id":"ws_1"},)"
+        R"({"type":"web_search_call","id":"ws_2"},{"type":"file_search_call","id":"fs_1"},)"
+        R"({"type":"message","content":[]}],"usage":{"input_tokens":30,"output_tokens":4}})";
+} // namespace
+
+// The Responses API bills search calls per call and states them only as output items.
+// A chat completion carrying the same bytes is not counted: only the one API has them.
+TEST_P(ProxyForwardStream, ResponsesSearchCallsReachTheSink)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(http_ok(kSearchedReply));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(responses_request(
+        R"({"model":"m","input":"hi","prompt_cache_options":{"mode":"explicit","ttl":"1h"}})")));
+    (void)c.recv_response();
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0].r.web_search_requests, 2);
+    EXPECT_EQ(recs[0].r.file_search_calls, 1);
+    EXPECT_EQ(recs[0].r.tokens_in, 30);
+    EXPECT_EQ(recs[0].asked_cache_ttl, "1h");
+    EXPECT_EQ(recs[1].r.web_search_requests, -1) << "a chat completion has no search items";
+    EXPECT_EQ(recs[1].asked_cache_ttl, "");
+}
+
+TEST_P(ProxyForwardStream, ResponsesStreamedSearchCallsReachTheSink)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    const std::string body =
+        "event: response.web_search_call.completed\n"
+        "data: {\"type\":\"response.web_search_call.completed\",\"item_id\":\"ws_1\"}\n\n"
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":"
+        "{\"output\":[{\"type\":\"web_search_call\"}],\"usage\":{\"input_tokens\":30,"
+        "\"output_tokens\":4}}}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: " +
+                          std::to_string(body.size()) + "\r\nConnection: keep-alive\r\n\r\n" + body);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(responses_request(R"({"model":"m","input":"hi","stream":true})")));
+    (void)c.recv_chunked(2000);
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.web_search_requests, 1) << "once per call, not once per mention";
+    EXPECT_EQ(recs[0].r.tokens_in, 30);
+}
+
+// Anthropic states what served, its server tools and its other attempts in usage.
+TEST_P(ProxyForwardStream, AnthropicsServedSpeedToolsAndAttemptsReachTheSink)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(http_ok(
+        R"({"id":"m","type":"message","model":"claude-opus-4-8","content":[],)"
+        R"("usage":{"input_tokens":412,"output_tokens":264,"speed":"fast","inference_geo":"us",)"
+        R"("server_tool_use":{"web_search_requests":3},"iterations":[)"
+        R"({"type":"compaction","input_tokens":9000,"output_tokens":300},)"
+        R"({"type":"message","model":"claude-fable-5","input_tokens":535,"output_tokens":12},)"
+        R"({"type":"fallback_message","model":"claude-opus-4-8","input_tokens":412,)"
+        R"("output_tokens":264}]}})"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_EQ(r.tokens_in, 412);
+    EXPECT_EQ(r.web_search_requests, 3);
+    EXPECT_EQ(r.compaction_in_tokens, 9000);
+    EXPECT_EQ(r.compaction_out_tokens, 300);
+    EXPECT_EQ(r.prior_in_tokens, 535);
+    EXPECT_EQ(r.prior_out_tokens, 12);
+    EXPECT_EQ(r.prior_attempts, 1);
+    EXPECT_EQ(recs[0].prior_model, "claude-fable-5");
+    EXPECT_EQ(recs[0].served_speed, "fast");
+    EXPECT_EQ(recs[0].served_geo, "us");
 }
 
 // Gemini states its counts under its own names and reaches the scanner untranslated
@@ -10507,6 +10614,31 @@ TEST_P(ProxyRoute, TheSinkRecordsTheTierTheVenueSaysItServed)
     const auto recs = sink.records();
     ASSERT_EQ(recs.size(), 1u);
     EXPECT_EQ(recs[0].served_tier, "flex");
+}
+
+// Bedrock names the tier and latency setting it served in response headers alone.
+TEST_P(ProxyRoute, TheSinkRecordsWhatBedrocksHeadersSayItServed)
+{
+    NamedBackend b;
+    b.start_with_header("X-Amzn-Bedrock-Service-Tier: priority\r\n"
+                        "X-Amzn-Bedrock-PerformanceConfig-Latency: optimized",
+                        R"({"id":"x","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2}})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].served_tier, "priority");
+    EXPECT_EQ(recs[0].served_latency, "optimized");
 }
 
 // The sink is handed the same identity the policy decided on, so a response's cache

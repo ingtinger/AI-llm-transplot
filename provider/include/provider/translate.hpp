@@ -65,6 +65,9 @@ namespace llmbridge::provider
         std::string_view model;
         bool stream = false;
         bool include_usage = false;
+        /// `prompt_cache_options.ttl` (DeepInfra: "5m" or "1h"), which its reply leaves
+        /// out though the two lifetimes' writes are priced apart.
+        std::string_view cache_ttl;
         KeyCheck keys = KeyCheck::Ok;
     };
     TopLevelFacts top_level_facts(std::string_view body) noexcept;

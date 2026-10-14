@@ -63,6 +63,7 @@ namespace llmbridge::detail
             client->req.f.translate_body &&
             provider::spec(client->req.f.effective_dialect).wire == provider::Wire::Anthropic;
         if (client->req.f.sse_translating) client->sse_xlate.reset(-1, client->req.f.wants_usage);
+        else client->req.stream_usage.reset(client->req.f.responses_api);
         // Chosen once, before either head is built, and remembered.
         client->req.f.stream_chunked_out = stream_reusable_out(client);
         std::string& out = client->out.stage();
