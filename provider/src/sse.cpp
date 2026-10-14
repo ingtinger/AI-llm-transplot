@@ -148,19 +148,16 @@ namespace llmbridge::provider
         _role_emitted = _content_started = _finish_emitted = _done = false;
         _include_usage = include_usage;
         _usage_emitted = false;
-        _in_tok = _out_tok = _cached_tok = _cache_write_tok = 0;
-        _cw_5m = _cw_1h = -1;
+        _u = {};
     }
 
     openai::Usage AnthropicToOpenAiSse::usage() const noexcept
     {
-        openai::Usage u;
-        u.in = _in_tok;
-        u.out = _out_tok;
-        u.cached = _cached_tok;
-        u.cache_write = _cache_write_tok;
-        u.cache_write_5m = _cw_5m;
-        u.cache_write_1h = _cw_1h;
+        openai::Usage u = _u;
+        u.in = input_tokens();
+        u.out = output_tokens();
+        u.cached = cached_tokens();
+        u.cache_write = cache_write_tokens();
         return u;
     }
 
@@ -293,26 +290,7 @@ namespace llmbridge::provider
                 _model.clear();
                 append_sanitized(_model, model);
                 if (const json::Value* u = m->find("usage"))
-                {
-                    const auto n = [](const json::Value* o, std::string_view k) {
-                        return o ? json_scan::count(o->num_or(k)) : -1;
-                    };
-                    const json::Value* cc = u->find("cache_creation");
-                    const openai::Usage t = detail::anthropic_usage(
-                        n(u, "input_tokens"), n(u, "output_tokens"),
-                        n(u, "cache_read_input_tokens"), n(u, "cache_creation_input_tokens"), n(cc, "ephemeral_5m_input_tokens"),
-                        n(cc, "ephemeral_1h_input_tokens"));
-                    _in_tok = t.in;
-                    _out_tok = t.out > 0 ? t.out : 0;
-                    _cached_tok = t.cached;
-                    _cache_write_tok = t.cache_write;
-                    // An absent breakdown stays -1: not the same fact as one of zero.
-                    if (cc)
-                    {
-                        _cw_5m = t.cache_write_5m > 0 ? t.cache_write_5m : 0;
-                        _cw_1h = t.cache_write_1h > 0 ? t.cache_write_1h : 0;
-                    }
-                }
+                    openai::merge_stated(_u, openai::usage_of(u->sv));
             }
             ensure_created();
             if (!_role_emitted) // OpenAI's first chunk carries the assistant role
@@ -364,10 +342,10 @@ namespace llmbridge::provider
                     _finish = openai::finish_name(f);
                     _tool_open = false; // the message completed; arguments are whole
                 }
-            // Anthropic reports output_tokens cumulatively on message_delta.
+            // Anthropic restates its counts cumulatively on message_delta, the prompt
+            // too once server tools have run.
             if (const json::Value* u = v.find("usage"))
-                if (const long long ot = json_scan::count(u->num_or("output_tokens")); ot >= 0)
-                    _out_tok = ot;
+                openai::merge_stated(_u, openai::usage_of(u->sv));
             if (_finish && !_finish_emitted) // finish chunk: empty delta + finish_reason
             {
                 emit_head(out);

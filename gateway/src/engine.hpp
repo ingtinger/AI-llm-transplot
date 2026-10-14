@@ -180,7 +180,8 @@ namespace llmbridge::detail
         void on_upstream_bytes(UpstreamConn* u) noexcept; // the response, its head parsed once
         void on_response(UpstreamConn* u, const net::http::ResponseHead& h, std::string_view body,
                          size_t total_len) noexcept;
-        static void note_quota(ClientConn* client, const net::http::ResponseHead& h) noexcept;
+        static void note_quota(ClientConn* client, const net::http::ResponseHead& h,
+                               std::string_view head) noexcept;
         static void note_venue_req_id(ClientConn* client, std::string_view head) noexcept;
         /// Read the kernel's RTT to the venue that just answered.
         static void note_upstream_rtt(ClientConn* client, const UpstreamConn* u) noexcept;

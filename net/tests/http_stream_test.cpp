@@ -107,6 +107,25 @@ TEST(RespHead, ConnectionCloseFlipsKeepAlive)
     EXPECT_FALSE(h.keep_alive);
 }
 
+TEST(RespHead, ReadsWhatBedrockSaysItServed)
+{
+    const std::string head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                             "X-Amzn-Bedrock-Service-Tier:  flex \r\n"
+                             "x-amzn-bedrock-performanceconfig-latency: optimized\r\n\r\n";
+    ResponseHead h;
+    ASSERT_EQ(parse_response_head(head, h), FrameStatus::Complete);
+    EXPECT_EQ(std::string_view(head).substr(h.bedrock_tier_at, h.bedrock_tier_len), "flex");
+    EXPECT_EQ(std::string_view(head).substr(h.bedrock_latency_at, h.bedrock_latency_len), "optimized");
+    ResponseHead none;
+    ASSERT_EQ(parse_response_head("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", none),
+              FrameStatus::Complete);
+    EXPECT_EQ(none.bedrock_tier_len, 0);
+    // A request may carry the same name to Bedrock, and keeps every rule an unnamed
+    // header has: classify still says Other.
+    EXPECT_EQ(llmbridge::net::http::detail::classify("x-amzn-bedrock-service-tier"),
+              llmbridge::net::http::Field::Other);
+}
+
 TEST(RespHead, NeedMoreUntilHeadersComplete)
 {
     ResponseHead h;

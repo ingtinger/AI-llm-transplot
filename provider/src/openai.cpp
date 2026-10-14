@@ -8,6 +8,7 @@
 #include "provider/openai.hpp"
 
 #include <charconv>
+#include <cstring>
 #include <string_view>
 
 #include "json_scan.hpp"
@@ -20,28 +21,56 @@ namespace llmbridge::provider::openai
         using namespace json_scan;
 
         // Counts under the names each venue gives them, before any mapping.
+        // One of Anthropic's `usage.iterations` sums, in its own names.
+        struct Attempts
+        {
+            long long fresh = -1, out = -1, read = -1, write = -1, n = 0;
+            std::string_view model; // the first entry's
+
+            void add(long long a_fresh, long long a_out, long long a_read, long long a_write,
+                     std::string_view a_model) noexcept
+            {
+                const auto plus = [](long long& sum, long long v) {
+                    if (v >= 0) sum = (sum > 0 ? sum : 0) + v;
+                };
+                plus(fresh, a_fresh);
+                plus(out, a_out);
+                plus(read, a_read);
+                plus(write, a_write);
+                if (n++ == 0) model = a_model;
+            }
+        };
+
         struct Raw
         {
             long long prompt = -1, completion = -1, cached = -1, cache_write = -1;
             long long audio_in = -1, audio_out = -1, reasoning = -1, accepted = -1, rejected = -1;
+            long long image_in = -1;
             long long input = -1, output = -1, cache_read = -1, cache_creation = -1;
             long long w5m = -1, w1h = -1;
+            long long web_search = -1, web_fetch = -1, code_exec = -1, cost = -1;
             long long g_prompt = -1, g_candidates = -1, g_thoughts = -1, g_cached = -1, g_tool = -1;
+            std::string_view speed, geo;
+            Attempts compaction, declined; // declined: `message` entries, before a fallback
+            bool fallback = false;
         };
 
         struct Key
         {
             std::string_view parent, name; // parent empty: a direct member
             long long Raw::*field;
+            long long (*parse)(std::string_view) noexcept = count;
         };
 
         // `"usage"`: OpenAI chat, the Responses API and Anthropic share the key.
         constexpr Key kUsageKeys[] = {
             {"", "prompt_tokens", &Raw::prompt},
             {"", "completion_tokens", &Raw::completion},
+            {"", "cached_tokens", &Raw::cached}, // Together, on some models
             {"prompt_tokens_details", "cached_tokens", &Raw::cached},
             {"prompt_tokens_details", "cache_write_tokens", &Raw::cache_write},
             {"prompt_tokens_details", "audio_tokens", &Raw::audio_in},
+            {"prompt_tokens_details", "image_tokens", &Raw::image_in},
             {"completion_tokens_details", "audio_tokens", &Raw::audio_out},
             {"completion_tokens_details", "reasoning_tokens", &Raw::reasoning},
             {"completion_tokens_details", "accepted_prediction_tokens", &Raw::accepted},
@@ -49,10 +78,17 @@ namespace llmbridge::provider::openai
             {"", "input_tokens", &Raw::input},
             {"", "output_tokens", &Raw::output},
             {"input_tokens_details", "cached_tokens", &Raw::cached},
+            {"input_tokens_details", "cache_write_tokens", &Raw::cache_write}, // Bedrock Mantle
+            {"output_tokens_details", "reasoning_tokens", &Raw::reasoning}, // Responses
+            {"output_tokens_details", "thinking_tokens", &Raw::reasoning},  // Anthropic
             {"", "cache_read_input_tokens", &Raw::cache_read},
             {"", "cache_creation_input_tokens", &Raw::cache_creation},
             {"cache_creation", "ephemeral_5m_input_tokens", &Raw::w5m},
             {"cache_creation", "ephemeral_1h_input_tokens", &Raw::w1h},
+            {"server_tool_use", "web_search_requests", &Raw::web_search},
+            {"server_tool_use", "web_fetch_requests", &Raw::web_fetch},
+            {"server_tool_use", "code_execution_requests", &Raw::code_exec},
+            {"", "estimated_cost", &Raw::cost, picodollars}, // DeepInfra
         };
         // `"usageMetadata"`: Gemini.
         constexpr Key kGeminiKeys[] = {
@@ -62,6 +98,29 @@ namespace llmbridge::provider::openai
             {"", "cachedContentTokenCount", &Raw::g_cached},
             {"", "toolUsePromptTokenCount", &Raw::g_tool},
         };
+
+        // Each entry of `usage.iterations`: a compaction pass, a declined attempt, or
+        // the `fallback_message` attempt the top-level counts describe.
+        void read_iterations(std::string_view arr, Raw& r) noexcept
+        {
+            (void)for_each_element(arr, [&](std::string_view e) {
+                std::string_view type, model;
+                long long fresh = -1, out = -1, read = -1, write = -1;
+                (void)for_each_member(e, [&](std::string_view k, std::string_view v) {
+                    if (k == "type") type = plain_string(v);
+                    else if (k == "model") model = plain_string(v);
+                    else if (k == "input_tokens") fresh = count(v);
+                    else if (k == "output_tokens") out = count(v);
+                    else if (k == "cache_read_input_tokens") read = count(v);
+                    else if (k == "cache_creation_input_tokens") write = count(v);
+                    return true;
+                });
+                if (type == "compaction") r.compaction.add(fresh, out, read, write, model);
+                else if (type == "message") r.declined.add(fresh, out, read, write, model);
+                else if (type == "fallback_message") r.fallback = true;
+                return true;
+            });
+        }
 
         template <size_t N>
         void read_members(std::string_view obj, std::string_view parent, const Key (&keys)[N],
@@ -73,17 +132,62 @@ namespace llmbridge::provider::openai
                     if (parent.empty()) read_members(v, k, keys, r);
                     return true;
                 }
+                if (parent.empty() && !v.empty())
+                {
+                    if (v.front() == '[')
+                    {
+                        if (k == "iterations") read_iterations(v, r);
+                        return true;
+                    }
+                    if (v.front() == '"')
+                    {
+                        if (k == "speed") r.speed = plain_string(v);
+                        else if (k == "inference_geo") r.geo = plain_string(v);
+                        return true;
+                    }
+                }
                 for (const Key& key : keys)
                     if (key.name == k && key.parent == parent)
                     {
-                        r.*key.field = count(v);
+                        r.*key.field = key.parse(v);
                         break;
                     }
                 return true;
             });
         }
 
-        Usage from_usage(const Raw& r) noexcept
+        // What every shape may carry beside its token counts.
+        void extras(const Raw& r, Usage& u) noexcept
+        {
+            u.image_in = r.image_in;
+            u.web_search = r.web_search;
+            u.web_fetch = r.web_fetch;
+            u.code_exec = r.code_exec;
+            u.venue_cost_pdollars = r.cost;
+            u.speed.set(r.speed);
+            u.inference_geo.set(r.geo);
+            if (const Attempts& c = r.compaction; c.n)
+            {
+                const Usage t = detail::anthropic_usage(c.fresh, c.out, c.read, c.write, -1, -1);
+                u.compaction_in = t.in;
+                u.compaction_out = t.out > 0 ? t.out : 0;
+                u.compaction_cached = t.cached;
+            }
+            // Without a fallback, `message` entries are the served model's own and the
+            // top-level counts already hold them.
+            if (const Attempts& d = r.declined; d.n && r.fallback)
+            {
+                const Usage t = detail::anthropic_usage(d.fresh, d.out, d.read, d.write, -1, -1);
+                u.prior_in = t.in;
+                u.prior_out = t.out > 0 ? t.out : 0;
+                u.prior_cached = t.cached;
+                u.prior_cache_write = t.cache_write;
+                u.prior_attempts = d.n;
+                u.prior_model.set(d.model);
+            }
+        }
+
+        Usage counts(const Raw& r) noexcept
         {
             Usage u;
             if (r.prompt >= 0 || r.completion >= 0) // OpenAI chat completions
@@ -108,10 +212,20 @@ namespace llmbridge::provider::openai
                 u.out = r.output;
                 u.cached = r.input >= 0 && r.cached < 0 ? 0 : r.cached;
                 if (r.cache_write > 0) u.cache_write = r.cache_write;
+                u.reasoning = r.reasoning;
                 return u;
             }
-            return detail::anthropic_usage(r.input, r.output, r.cache_read, r.cache_creation,
-                                           r.w5m, r.w1h);
+            u = detail::anthropic_usage(r.input, r.output, r.cache_read, r.cache_creation, r.w5m,
+                                        r.w1h);
+            u.reasoning = r.reasoning; // part of output_tokens, as on OpenAI
+            return u;
+        }
+
+        Usage from_usage(const Raw& r) noexcept
+        {
+            Usage u = counts(r);
+            extras(r, u);
+            return u;
         }
 
         Usage read_usage(std::string_view obj, bool gemini) noexcept
@@ -248,15 +362,102 @@ namespace llmbridge::provider::openai
         return code.empty() ? type : code;
     }
 
-    void StreamUsage::merge(const Usage& u) noexcept
+    Usage usage_of(std::string_view object) noexcept { return read_usage(object, false); }
+
+    void merge_stated(Usage& into, const Usage& u) noexcept
     {
-        for (auto f : {&Usage::in, &Usage::cached, &Usage::cache_write, &Usage::cache_write_5m,
-                       &Usage::cache_write_1h})
-            if (_u.*f < 0) _u.*f = u.*f;
+        // The prompt counts only grow: Anthropic restates them cumulatively on
+        // message_delta once server tools have run, and a restatement that leaves a
+        // count out reads as zero there, so the larger one is the true one.
+        for (auto f : {&Usage::in, &Usage::cached, &Usage::cache_write, &Usage::image_in})
+            if (u.*f > into.*f) into.*f = u.*f;
+        for (auto f : {&Usage::cache_write_5m, &Usage::cache_write_1h}) // message_start's only
+            if (into.*f < 0) into.*f = u.*f;
+        for (auto f : {&Usage::speed, &Usage::inference_geo})
+            if (!(into.*f).n) into.*f = u.*f;
         for (auto f : {&Usage::out, &Usage::reasoning, &Usage::audio_in, &Usage::audio_out,
                        &Usage::accepted_prediction, &Usage::rejected_prediction,
-                       &Usage::tool_prompt})
-            if (u.*f >= 0) _u.*f = u.*f;
+                       &Usage::tool_prompt, &Usage::web_search, &Usage::web_fetch,
+                       &Usage::code_exec, &Usage::venue_cost_pdollars, &Usage::compaction_in,
+                       &Usage::compaction_out, &Usage::compaction_cached})
+            if (u.*f >= 0) into.*f = u.*f;
+        if (u.prior_attempts >= 0) // the final message_delta's iterations, all of them
+        {
+            into.prior_in = u.prior_in;
+            into.prior_out = u.prior_out;
+            into.prior_cached = u.prior_cached;
+            into.prior_cache_write = u.prior_cache_write;
+            into.prior_attempts = u.prior_attempts;
+            into.prior_model = u.prior_model;
+        }
+    }
+
+    namespace
+    {
+        // An item's type names the call, `"web_search_call"`; an event's names it
+        // `"response.web_search_call.completed"`. A quote inside prompt text is escaped,
+        // so the quote before either name cannot be forged.
+        constexpr std::string_view kItem = "_search_call\"";
+        constexpr std::string_view kEvent = "_search_call.completed\"";
+
+        // f(begin, end, web) for each call named in `bytes`, one search for both tools.
+        template <class F>
+        void each_search_call(std::string_view bytes, bool events, F&& f) noexcept
+        {
+            const std::string_view lit = events ? kEvent : kItem;
+            const std::string_view web = events ? "\"response.web" : "\"web";
+            const std::string_view file = events ? "\"response.file" : "\"file";
+            for (size_t from = 0; from < bytes.size();)
+            {
+                const void* p = ::memmem(bytes.data() + from, bytes.size() - from, lit.data(), lit.size());
+                if (!p) return;
+                const auto at = static_cast<size_t>(static_cast<const char*>(p) - bytes.data());
+                from = at + 1;
+                const std::string_view head = bytes.substr(0, at);
+                if (head.ends_with(web)) f(at - web.size(), at + lit.size(), true);
+                else if (head.ends_with(file)) f(at - file.size(), at + lit.size(), false);
+            }
+        }
+
+        void add_call(Usage& u, bool web) noexcept
+        {
+            long long& n = web ? u.web_search : u.file_search;
+            n = (n > 0 ? n : 0) + 1;
+        }
+    } // namespace
+
+    void count_search_calls(std::string_view bytes, bool events, Usage& u) noexcept
+    {
+        each_search_call(bytes, events, [&](size_t, size_t, bool web) { add_call(u, web); });
+    }
+
+    void StreamUsage::count_calls(std::string_view bytes) noexcept
+    {
+        count_search_calls(bytes, true, _u);
+        // A name split across two reads: only a match that starts in the kept tail and
+        // ends in this read, the others being counted once already.
+        if (_tail_n)
+        {
+            char joint[2 * kTail];
+            const size_t lead = bytes.size() < kTail ? bytes.size() : kTail;
+            std::memcpy(joint, _tail, _tail_n);
+            std::memcpy(joint + _tail_n, bytes.data(), lead);
+            each_search_call({joint, _tail_n + lead}, true, [&](size_t at, size_t end, bool web) {
+                if (at < _tail_n && end > _tail_n) add_call(_u, web);
+            });
+        }
+        if (bytes.size() >= kTail)
+        {
+            std::memcpy(_tail, bytes.data() + bytes.size() - kTail, kTail);
+            _tail_n = kTail;
+        }
+        else
+        {
+            const size_t keep = _tail_n + bytes.size() > kTail ? kTail - bytes.size() : _tail_n;
+            std::memmove(_tail, _tail + _tail_n - keep, keep);
+            std::memcpy(_tail + keep, bytes.data(), bytes.size());
+            _tail_n = keep + bytes.size();
+        }
     }
 
     void StreamUsage::feed(std::string_view bytes)
@@ -265,6 +466,7 @@ namespace llmbridge::provider::openai
         // across reads, with the indentation of a pretty-printed body.
         constexpr size_t kLead = 64;
         constexpr size_t kMaxObject = 64 * 1024; // an unclosed usage object past this is dropped
+        if (_calls) count_calls(bytes);
         _carry.append(bytes);
         const std::string_view s = _carry;
         size_t next = s.size() >= kUsage.size() ? s.size() - (kUsage.size() - 1) : 0;
@@ -292,7 +494,7 @@ namespace llmbridge::provider::openai
                 if (s.size() - at > kMaxObject) continue;
                 keep = at; next = at; break;
             }
-            merge(read_usage(s.substr(v, e - v), gemini));
+            merge_stated(_u, read_usage(s.substr(v, e - v), gemini));
             from = e;
             if (next < e) next = e;
         }

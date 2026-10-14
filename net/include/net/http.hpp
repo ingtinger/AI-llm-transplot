@@ -378,6 +378,11 @@ namespace llmbridge::net::http
         bool event_stream = false;     // Content-Type: text/event-stream
         bool has_content_length = false;
         bool encoded = false;          // Content-Encoding present and not identity
+        /// Bedrock's served service tier and latency setting, trimmed, as offsets into
+        /// the head parsed: a pooled connection holds this, so they fill the padding
+        /// here. A value past 255 bytes reads as absent.
+        uint16_t bedrock_tier_at = 0, bedrock_latency_at = 0;
+        uint8_t bedrock_tier_len = 0, bedrock_latency_len = 0;
         size_t content_length = 0;
         /// The quota family whose remaining count is zero: Anthropic names it in the
         /// header name, OpenAI in its suffix.
@@ -459,6 +464,22 @@ namespace llmbridge::net::http
                     close |= has_token(h.value, "close");
                     keep |= has_token(h.value, "keep-alive");
                     return true;
+                case Field::Other:
+                {
+                    // Named here, not classified: a request carrying them stays Other.
+                    const auto keep = [&head](std::string_view v, uint16_t& at, uint8_t& len) noexcept {
+                        v = detail::trim_ows(v);
+                        if (v.size() > 255) return;
+                        at = static_cast<uint16_t>(v.data() - head.data());
+                        len = static_cast<uint8_t>(v.size());
+                    };
+                    if (h.name.size() == 27 && detail::same_ci(h.name, "x-amzn-bedrock-service-tier"))
+                        keep(h.value, out.bedrock_tier_at, out.bedrock_tier_len);
+                    else if (h.name.size() == 40 &&
+                             detail::same_ci(h.name, "x-amzn-bedrock-performanceconfig-latency"))
+                        keep(h.value, out.bedrock_latency_at, out.bedrock_latency_len);
+                    return true;
+                }
                 default:
                     return true;
             }

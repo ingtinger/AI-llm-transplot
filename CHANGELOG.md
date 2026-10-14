@@ -8,6 +8,65 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.100.0]. 2026-10-14
+
+The rest of what each venue states about a request's usage, read in the passes that
+already run and handed to the sink: reasoning counts the parser missed, Anthropic's other
+attempts and server-tool counts, what speed, region and tier actually served, per-call
+search tools, and the venue's own price. Checked against each seller's documentation, not
+against live traffic.
+
+### Added
+
+- **`RequestRecord` fields, appended**: `image_in_tokens`; `web_search_requests`,
+  `web_fetch_requests`, `code_exec_requests` and `file_search_calls`, server tools billed
+  per call; `venue_cost_pdollars`, the venue's own price in picodollars (DeepInfra's
+  `estimated_cost`, `1e-05` exponents included); the compaction and declined-attempt
+  counts of Anthropic's `usage.iterations` with `prior_model` and `prior_attempts`;
+  `served_speed`, `served_geo` and `served_latency`; `asked_cache_ttl`. Each is -1 or
+  empty when the venue stated none.
+- **Anthropic's `usage.iterations`.** A compaction pass is billed beside top-level counts
+  that leave it out, and an attempt declined before a server-side fallback is billed at its
+  own model's rate. Both are read into their own fields; a `message` entry with no
+  `fallback_message` beside it is the served attempt and is not counted twice.
+- **Anthropic's `usage.server_tool_use`, `usage.speed` and `usage.inference_geo`**, the
+  speed and region the venue served, which may differ from what was asked.
+- **The Responses API's search calls**, which its usage never states: counted from a
+  body's `web_search_call` and `file_search_call` items, or a stream's `.completed` events
+  (once per call; each item is named three times), a name split across reads counted once.
+  Only on `POST /v1/responses`, decided once at framing from the request line.
+- **Bedrock's `X-Amzn-Bedrock-Service-Tier` and `X-Amzn-Bedrock-PerformanceConfig-Latency`
+  response headers**, the only place Bedrock states what served. Read in the head's one
+  header walk; the request-side header classification is unchanged. The tier fills
+  `served_tier`, and a response without it clears an earlier attempt's.
+- **`TopLevelFacts::cache_ttl`**, `prompt_cache_options.ttl` from the same top-level walk.
+  DeepInfra prices a five-minute and a one-hour write differently and states neither in
+  its reply.
+- **`openai::usage_of`, `openai::merge_stated` and `openai::count_search_calls`**, the
+  shared usage reader, the merge a stream's restated usage needs, and the search-call
+  counter. `StreamUsage::reset` takes whether to count search calls.
+
+### Changed
+
+- **Reasoning counts that were dropped are read**: Anthropic's
+  `output_tokens_details.thinking_tokens` (Claude on Bedrock too) and the Responses API's
+  `output_tokens_details.reasoning_tokens`. `reasoning_tokens` was always -1 for Claude.
+- **Bedrock Mantle's Responses cache writes** (`input_tokens_details.cache_write_tokens`)
+  are a write, not plain input, and **Together's flat `usage.cached_tokens`** (Llama 3.3
+  70B Turbo and other non-reasoning models) is a cache hit, not zero.
+- **A stream's prompt counts keep the largest statement.** Anthropic restates input and
+  cache counts cumulatively on `message_delta` once server tools have run (its web-search
+  example grows from 2,679 to 10,682), and the first statement used to win. The cache
+  split stays message_start's, which alone carries it.
+- **Behaviour change: the OpenAI-in translator reads usage with the shared parser**, on the
+  stream and on a whole reply. A client speaking OpenAI to an Anthropic venue now gets
+  `completion_tokens_details.reasoning_tokens` when Claude thought, and a streamed input
+  count that includes what server tools added.
+- **Behaviour change: a repeated or escaped key inside `prompt_cache_options` is refused**
+  where a sink or policy reads the body, as one inside `stream_options` already was: our
+  reader takes the first `ttl` and a venue may take the last.
+- **`kUsageWindow` is 4096 bytes**, from 2048: `usage.iterations` can triple a usage block.
+
 ## [0.99.1]. 2026-10-13
 
 Logging only, from an audit of the 0.99.0 paths: what fails now says why, and what repeats

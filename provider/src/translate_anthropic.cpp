@@ -489,17 +489,7 @@ namespace llmbridge::provider
         const openai::Finish finish = finish_of(spec(Venue::Anthropic), v.str_or("stop_reason", "end_turn"));
         if (finish == openai::Finish::Error) return false;
 
-        if (const json::Value* m = v.find("usage"))
-        {
-            const auto n = [](const json::Value* o, std::string_view k) {
-                return o ? json_scan::count(o->num_or(k)) : -1;
-            };
-            const json::Value* cc = m->find("cache_creation");
-            usage = detail::anthropic_usage(
-                n(m, "input_tokens"), n(m, "output_tokens"), n(m, "cache_read_input_tokens"),
-                n(m, "cache_creation_input_tokens"), n(cc, "ephemeral_5m_input_tokens"),
-                n(cc, "ephemeral_1h_input_tokens"));
-        }
+        if (const json::Value* m = v.find("usage")) usage = openai::usage_of(m->sv);
         detail::as_written(usage);
 
         if (out.capacity() < anthropic_body.size() + 256) out.reserve(anthropic_body.size() + 256);

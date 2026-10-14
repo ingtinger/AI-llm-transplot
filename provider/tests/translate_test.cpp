@@ -1379,6 +1379,23 @@ TEST(TopLevelFacts, OnePassMatchesTheSingleKeyReaders)
     EXPECT_EQ(dup.keys, p::KeyCheck::DuplicateKey);
 }
 
+TEST(TopLevelFacts, TheRequestedCacheLifetimeIsReadInTheSameWalk)
+{
+    namespace p = llmbridge::provider;
+    const p::TopLevelFacts f = p::top_level_facts(
+        R"({"messages":[],"prompt_cache_options":{"mode":"explicit","ttl":"1h"},"model":"m"})");
+    EXPECT_EQ(f.cache_ttl, "1h");
+    EXPECT_EQ(f.model, "m");
+    EXPECT_EQ(p::top_level_facts(R"({"model":"m"})").cache_ttl, "");
+    EXPECT_EQ(p::top_level_facts(R"({"tools":[{"prompt_cache_options":{"ttl":"1h"}}]})").cache_ttl, "")
+        << "a nested member is not the request's";
+    EXPECT_EQ(p::top_level_facts(R"({"prompt_cache_options":{"ttl":"5m","ttl":"1h"}})").keys,
+              p::KeyCheck::DuplicateKey)
+        << "we would price the first lifetime while the venue may sell the last";
+    EXPECT_EQ(p::top_level_facts(R"({"prompt_cache_options":{"tt\u006c":"1h"}})").keys,
+              p::KeyCheck::EscapedKey);
+}
+
 TEST(StreamUsage, OnlyATopLevelStreamOptionsIncludeUsageTrueCounts)
 {
     using llmbridge::provider::stream_usage_of;
@@ -1763,6 +1780,186 @@ TEST(JsonScanUsage, GeminiThinkingIsOutput)
     EXPECT_EQ(g.reasoning, 2);
 }
 
+TEST(JsonScanUsage, ResponsesAndAnthropicDetails)
+{
+    const oai::Usage a = oai::scan_usage(
+        R"({"content":[],"usage":{"input_tokens":5,"cache_read_input_tokens":3,)"
+        R"("cache_creation_input_tokens":0,"output_tokens":267,)"
+        R"("output_tokens_details":{"thinking_tokens":185}}})");
+    EXPECT_EQ(a.out, 267) << "thinking stays inside output_tokens";
+    EXPECT_EQ(a.reasoning, 185);
+    const oai::Usage r = oai::scan_usage(
+        R"({"output":[],"usage":{"input_tokens":66125,)"
+        R"("input_tokens_details":{"cache_write_tokens":66123,"cached_tokens":0},)"
+        R"("output_tokens":107,"output_tokens_details":{"reasoning_tokens":52},)"
+        R"("total_tokens":66232}})");
+    EXPECT_EQ(r.in, 66125);
+    EXPECT_EQ(r.cache_write, 66123) << "Bedrock Mantle's Responses write, billed above input";
+    EXPECT_EQ(r.out, 107);
+    EXPECT_EQ(r.reasoning, 52);
+    EXPECT_EQ(oai::scan_usage(R"({"usage":{"input_tokens":5,"output_tokens":9}})").reasoning, -1)
+        << "no breakdown is not a breakdown of zero";
+}
+
+TEST(JsonScanUsage, TogethersFlatCachedCount)
+{
+    const oai::Usage u = oai::scan_usage(
+        R"({"usage":{"prompt_tokens":1200,"completion_tokens":8,"total_tokens":1208,)"
+        R"("cached_tokens":1024}})");
+    EXPECT_EQ(u.in, 1200);
+    EXPECT_EQ(u.cached, 1024) << "beside prompt_tokens, not in its details";
+}
+
+TEST(JsonScanUsage, AnthropicsFallbackAttemptsAreBilledApart)
+{
+    // Anthropic's own example: the declined attempt is not in the top-level counts.
+    const oai::Usage u = oai::scan_usage(
+        R"({"content":[],"usage":{"input_tokens":412,"output_tokens":264,)"
+        R"("cache_read_input_tokens":0,"cache_creation_input_tokens":0,"iterations":[)"
+        R"({"type":"message","model":"claude-fable-5","input_tokens":535,"output_tokens":0,)"
+        R"("cache_read_input_tokens":20,"cache_creation_input_tokens":7},)"
+        R"({"type":"fallback_message","model":"claude-opus-4-8","input_tokens":412,)"
+        R"("output_tokens":264,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}]}})");
+    EXPECT_EQ(u.in, 412) << "the top level is the attempt that answered";
+    EXPECT_EQ(u.out, 264);
+    EXPECT_EQ(u.prior_in, 562) << "its cache read and write are part of its prompt";
+    EXPECT_EQ(u.prior_out, 0);
+    EXPECT_EQ(u.prior_cached, 20);
+    EXPECT_EQ(u.prior_cache_write, 7);
+    EXPECT_EQ(u.prior_attempts, 1);
+    EXPECT_EQ(u.prior_model.view(), "claude-fable-5");
+    EXPECT_EQ(u.compaction_in, -1);
+}
+
+TEST(JsonScanUsage, AnthropicsCompactionPassIsBilledApart)
+{
+    const oai::Usage u = oai::scan_usage(
+        R"({"usage":{"input_tokens":23000,"output_tokens":1000,"iterations":[)"
+        R"({"type":"compaction","input_tokens":180000,"output_tokens":3500},)"
+        R"({"type":"message","input_tokens":23000,"output_tokens":1000}]}})");
+    EXPECT_EQ(u.in, 23000);
+    EXPECT_EQ(u.compaction_in, 180000);
+    EXPECT_EQ(u.compaction_out, 3500);
+    EXPECT_EQ(u.prior_attempts, -1) << "without a fallback a message entry is the served one";
+    const oai::Usage none = oai::scan_usage(
+        R"({"usage":{"input_tokens":9,"output_tokens":2,"iterations":[)"
+        R"({"type":"message","input_tokens":9,"output_tokens":2}]}})");
+    EXPECT_EQ(none.compaction_in, -1) << "the beta lists the one attempt on every reply";
+    EXPECT_EQ(none.prior_in, -1);
+}
+
+TEST(JsonScanUsage, PerCallToolsAndWhatServed)
+{
+    const oai::Usage a = oai::scan_usage(
+        R"({"usage":{"input_tokens":10682,"output_tokens":510,"service_tier":"standard",)"
+        R"("server_tool_use":{"web_search_requests":3,"web_fetch_requests":1,)"
+        R"("code_execution_requests":2},"speed":"fast","inference_geo":"us"}})");
+    EXPECT_EQ(a.web_search, 3);
+    EXPECT_EQ(a.web_fetch, 1);
+    EXPECT_EQ(a.code_exec, 2);
+    EXPECT_EQ(a.speed.view(), "fast");
+    EXPECT_EQ(a.inference_geo.view(), "us");
+    EXPECT_EQ(a.in, 10682);
+    const oai::Usage o = oai::scan_usage(
+        R"({"usage":{"prompt_tokens":800,"completion_tokens":5,)"
+        R"("prompt_tokens_details":{"image_tokens":765,"text_tokens":35}}})");
+    EXPECT_EQ(o.image_in, 765);
+    EXPECT_EQ(oai::scan_usage(R"({"usage":{"input_tokens":1,"speed":"\u0066ast"}})").speed.view(), "")
+        << "an escaped word is not read";
+    EXPECT_EQ(oai::scan_usage(R"({"usage":{"input_tokens":1,"inference_geo":")" +
+                              std::string(17, 'x') + R"("}})").inference_geo.view(), "")
+        << "a word that does not fit whole is left out, not cut";
+}
+
+TEST(JsonScanUsage, DeepInfrasEstimatedCostInPicodollars)
+{
+    const auto cost = [](std::string_view v) {
+        return oai::scan_usage(R"({"usage":{"prompt_tokens":1,"estimated_cost":)" +
+                               std::string(v) + "}}").venue_cost_pdollars;
+    };
+    EXPECT_EQ(cost("0.0000268"), 26'800'000);
+    EXPECT_EQ(cost("2.68e-05"), 26'800'000);
+    EXPECT_EQ(cost("2.68E-5"), 26'800'000);
+    EXPECT_EQ(cost("1.5"), 1'500'000'000'000);
+    EXPECT_EQ(cost("0"), 0);
+    EXPECT_EQ(cost("4.5e-13"), 0);
+    EXPECT_EQ(cost("5.5e-12"), 6) << "rounded half up";
+    EXPECT_EQ(cost("-0.1"), -1);
+    EXPECT_EQ(cost("\"0.1\""), -1);
+    EXPECT_EQ(cost("1e400"), -1);
+    EXPECT_EQ(cost("1.2.3"), -1);
+}
+
+TEST(JsonScanUsage, ResponsesSearchCallsAreCountedFromTheOutput)
+{
+    oai::Usage u;
+    oai::count_search_calls(
+        R"({"output":[{"type":"web_search_call","id":"ws_1","status":"completed"},)"
+        R"({"type": "web_search_call","id":"ws_2"},{"type":"file_search_call","id":"fs_1"},)"
+        R"({"type":"message","content":[{"type":"output_text",)"
+        R"("text":"the \"web_search_call\" item"}]}],"tools":[{"type":"web_search"}]})",
+        false, u);
+    EXPECT_EQ(u.web_search, 2) << "prompt text cannot forge an item";
+    EXPECT_EQ(u.file_search, 1);
+    oai::Usage none;
+    oai::count_search_calls(R"({"output":[{"type":"message"}]})", false, none);
+    EXPECT_EQ(none.web_search, -1) << "none counted is not a count of zero";
+}
+
+TEST(JsonScanStream, ResponsesSearchEventsCountOnceAtEverySplit)
+{
+    const std::string s =
+        "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\","
+        "\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\n"
+        "event: response.web_search_call.completed\n"
+        "data: {\"type\":\"response.web_search_call.completed\",\"item_id\":\"ws_1\"}\n\n"
+        "event: response.file_search_call.completed\n"
+        "data: {\"type\":\"response.file_search_call.completed\",\"item_id\":\"fs_1\"}\n\n"
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{"
+        "\"output\":[{\"type\":\"web_search_call\"},{\"type\":\"file_search_call\"}],"
+        "\"usage\":{\"input_tokens\":30,\"output_tokens\":4}}}\n\n";
+    for (size_t cut = 0; cut <= s.size(); ++cut)
+        for (size_t cut2 = cut; cut2 <= s.size(); cut2 += 7)
+        {
+            oai::StreamUsage u;
+            u.reset(true);
+            u.feed(std::string_view(s).substr(0, cut));
+            u.feed(std::string_view(s).substr(cut, cut2 - cut));
+            u.feed(std::string_view(s).substr(cut2));
+            ASSERT_EQ(u.usage().web_search, 1) << cut << "," << cut2;
+            ASSERT_EQ(u.usage().file_search, 1) << cut << "," << cut2;
+            ASSERT_EQ(u.usage().in, 30) << cut << "," << cut2;
+        }
+    oai::StreamUsage bytes;
+    bytes.reset(true);
+    for (const char c : s) bytes.feed(std::string_view(&c, 1));
+    EXPECT_EQ(bytes.usage().web_search, 1) << "a byte a read";
+    oai::StreamUsage off;
+    off.feed(s);
+    EXPECT_EQ(off.usage().web_search, -1) << "counted only where asked";
+}
+
+TEST(JsonScanStream, AnthropicsLastDeltaStatesToolsAndAttempts)
+{
+    oai::StreamUsage s;
+    s.feed("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,"
+           "\"output_tokens\":1,\"speed\":\"fast\",\"inference_geo\":\"us\"}}}\n\n");
+    s.feed("data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":900,"
+           "\"output_tokens\":40,\"server_tool_use\":{\"web_search_requests\":1}}}\n\n");
+    s.feed("data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":1500,"
+           "\"output_tokens\":80,\"server_tool_use\":{\"web_search_requests\":2},"
+           "\"iterations\":[{\"type\":\"message\",\"model\":\"claude-fable-5\","
+           "\"input_tokens\":700,\"output_tokens\":30},{\"type\":\"fallback_message\","
+           "\"model\":\"claude-opus-4-8\",\"input_tokens\":1500,\"output_tokens\":80}]}}\n\n");
+    EXPECT_EQ(s.usage().web_search, 2) << "cumulative: the last statement";
+    EXPECT_EQ(s.usage().speed.view(), "fast") << "message_start's, which the deltas leave out";
+    EXPECT_EQ(s.usage().inference_geo.view(), "us");
+    EXPECT_EQ(s.usage().prior_in, 700);
+    EXPECT_EQ(s.usage().prior_out, 30);
+    EXPECT_EQ(s.usage().prior_model.view(), "claude-fable-5");
+    EXPECT_EQ(s.usage().in, 1500);
+}
+
 TEST(JsonScanUsage, ANullDetailsBlockIsNotTheNextOne)
 {
     const oai::Usage u = oai::scan_usage(
@@ -1827,7 +2024,7 @@ TEST(JsonScanStream, EverySplitOfAStreamGivesTheSameCounts)
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\","
         "\"text\":\"\\\"usage\\\":{\\\"output_tokens\\\":99}\"}}\n\n"
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"
-        "\"usage\":{\"output_tokens\":42}}\n\n";
+        "\"usage\":{\"output_tokens\":42,\"output_tokens_details\":{\"thinking_tokens\":30}}}\n\n";
     const std::string openai =
         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n"
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,"
@@ -1854,16 +2051,38 @@ TEST(JsonScanStream, EverySplitOfAStreamGivesTheSameCounts)
     }
     oai::StreamUsage a;
     a.feed(anthropic);
-    EXPECT_EQ(a.usage().in, 47) << "first statement wins";
+    EXPECT_EQ(a.usage().in, 47) << "a delta stating output alone leaves the prompt alone";
     EXPECT_EQ(a.usage().out, 42) << "last statement wins";
     EXPECT_EQ(a.usage().cached, 30);
     EXPECT_EQ(a.usage().cache_write_5m, 5);
+    EXPECT_EQ(a.usage().reasoning, 30) << "thinking arrives on the last message_delta";
     oai::StreamUsage o;
     o.feed(openai);
     EXPECT_EQ(o.usage().in, 7);
     EXPECT_EQ(o.usage().reasoning, 1);
     o.reset();
     EXPECT_EQ(o.usage().in, -1);
+}
+
+TEST(JsonScanStream, AnthropicsCumulativePromptOnTheLastDeltaWins)
+{
+    // Server tools grow the prompt after message_start; message_delta restates it.
+    oai::StreamUsage s;
+    s.feed("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2679,"
+           "\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":20,"
+           "\"cache_creation\":{\"ephemeral_5m_input_tokens\":20},\"output_tokens\":3}}}\n\n");
+    s.feed("data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":10682,"
+           "\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":20,"
+           "\"output_tokens\":510}}\n\n");
+    EXPECT_EQ(s.usage().in, 10802);
+    EXPECT_EQ(s.usage().cached, 100);
+    EXPECT_EQ(s.usage().cache_write_5m, 20) << "the split is message_start's alone";
+    EXPECT_EQ(s.usage().out, 510);
+    // A restatement without the cache fields reads them as zero; it must not shrink.
+    s.feed("data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":10682,"
+           "\"output_tokens\":511}}\n\n");
+    EXPECT_EQ(s.usage().in, 10802);
+    EXPECT_EQ(s.usage().cached, 100);
 }
 
 TEST(JsonScanStream, CarriesOnlyWhatAnUnfinishedObjectNeeds)
@@ -1916,6 +2135,15 @@ TEST(TranslateEnvelope, TranslatorsReturnTheCountsTheyWrote)
     EXPECT_EQ(u.cache_write, 2);
     EXPECT_EQ(u.cache_write_1h, 2);
     EXPECT_EQ(oai::scan_usage(out).in, u.in) << "the body and the counts agree";
+    ASSERT_TRUE(llmbridge::provider::anthropic_to_openai_response(
+        R"({"content":[{"type":"text","text":"x"}],"usage":{"input_tokens":5,"output_tokens":9,)"
+        R"("output_tokens_details":{"thinking_tokens":6},)"
+        R"("server_tool_use":{"web_search_requests":1},"inference_geo":"us"}})",
+        out, u));
+    EXPECT_EQ(u.reasoning, 6) << "Anthropic's thinking, as OpenAI's reasoning";
+    EXPECT_EQ(oai::scan_usage(out).reasoning, 6) << "and in the body the client reads";
+    EXPECT_EQ(u.web_search, 1);
+    EXPECT_EQ(u.inference_geo.view(), "us");
     ASSERT_TRUE(llmbridge::provider::gemini_to_openai_response(
         R"({"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,)"
         R"("thoughtsTokenCount":2,"toolUsePromptTokenCount":1}})",

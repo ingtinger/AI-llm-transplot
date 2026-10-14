@@ -81,15 +81,15 @@ namespace llmbridge::provider
         bool finish(std::string& out);
 
         /// Provider-reported token counts so far; final only once the stream ends.
-        [[nodiscard]] long long input_tokens() const noexcept { return _in_tok; }
-        [[nodiscard]] long long output_tokens() const noexcept { return _out_tok; }
-        /// usage.cache_read_input_tokens from message_start; 0 when none was reported.
-        [[nodiscard]] long long cached_tokens() const noexcept { return _cached_tok; }
+        [[nodiscard]] long long input_tokens() const noexcept { return at_least_zero(_u.in); }
+        [[nodiscard]] long long output_tokens() const noexcept { return at_least_zero(_u.out); }
+        /// usage.cache_read_input_tokens; 0 when none was reported.
+        [[nodiscard]] long long cached_tokens() const noexcept { return at_least_zero(_u.cached); }
         /// usage.cache_creation_input_tokens: billed above the input rate, so kept apart.
-        [[nodiscard]] long long cache_write_tokens() const noexcept { return _cache_write_tok; }
+        [[nodiscard]] long long cache_write_tokens() const noexcept { return at_least_zero(_u.cache_write); }
         /// The cache write split by entry lifetime, from usage.cache_creation.
-        [[nodiscard]] long long cache_write_5m_tokens() const noexcept { return _cw_5m; }
-        [[nodiscard]] long long cache_write_1h_tokens() const noexcept { return _cw_1h; }
+        [[nodiscard]] long long cache_write_5m_tokens() const noexcept { return _u.cache_write_5m; }
+        [[nodiscard]] long long cache_write_1h_tokens() const noexcept { return _u.cache_write_1h; }
 
         /// The counts above as one usage; the details Anthropic does not state stay -1.
         [[nodiscard]] openai::Usage usage() const noexcept;
@@ -136,11 +136,7 @@ namespace llmbridge::provider
         // Usage passthrough (only emitted when _include_usage).
         bool _include_usage = false;
         bool _usage_emitted = false;
-        long long _in_tok = 0;  // message_start:  usage.input_tokens
-        long long _out_tok = 0; // message_delta:  usage.output_tokens (cumulative)
-        long long _cached_tok = 0; // message_start: usage.cache_read_input_tokens
-        long long _cache_write_tok = 0; // message_start: usage.cache_creation_input_tokens
-        long long _cw_5m = -1; // usage.cache_creation.ephemeral_5m_input_tokens
-        long long _cw_1h = -1; // usage.cache_creation.ephemeral_1h_input_tokens
+        openai::Usage _u; // every statement so far, merged by openai::merge_stated
+        static long long at_least_zero(long long v) noexcept { return v > 0 ? v : 0; }
     };
 } // namespace llmbridge::provider

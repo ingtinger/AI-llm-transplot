@@ -70,23 +70,27 @@ namespace llmbridge::provider
     TopLevelFacts top_level_facts(std::string_view body) noexcept
     {
         // First occurrence of each key, as the single-key readers below report it.
-        std::string_view model, stream, options;
-        bool have_model = false, have_stream = false, have_options = false;
+        std::string_view model, stream, options, cache;
+        bool have_model = false, have_stream = false, have_options = false, have_cache = false;
         KeyTally t;
         (void)for_each_member(body, [&](std::string_view k, std::string_view v) {
             t.add(k);
             if (k == "model" && !have_model) { model = v; have_model = true; }
             else if (k == "stream" && !have_stream) { stream = v; have_stream = true; }
             else if (k == "stream_options" && !have_options) { options = v; have_options = true; }
+            else if (k == "prompt_cache_options" && !have_cache) { cache = v; have_cache = true; }
             return true;
         });
         TopLevelFacts f;
         f.model = json_scan::plain_string(model);
         f.stream = stream == "true";
         f.include_usage = json_scan::first_member(options, "include_usage") == "true";
+        f.cache_ttl = json_scan::plain_string(json_scan::first_member(cache, "ttl"));
         f.keys = t.result();
-        // stream_options is read one level down, so its keys carry the same risk.
+        // stream_options and prompt_cache_options are read one level down, so their keys
+        // carry the same risk: a repeated `ttl` would price one lifetime and buy another.
         if (f.keys == KeyCheck::Ok) f.keys = check_keys(options);
+        if (f.keys == KeyCheck::Ok) f.keys = check_keys(cache);
         return f;
     }
 

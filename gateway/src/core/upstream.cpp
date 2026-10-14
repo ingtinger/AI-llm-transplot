@@ -28,10 +28,15 @@ namespace llmbridge::detail
     // What the provider said about its own limits, kept from the response head.
     // Shared by both backends and by the streaming and non-streaming paths, so the
     // four cannot disagree about what a refusal meant.
-    void Engine::note_quota(ClientConn* client, const net::http::ResponseHead& h) noexcept
+    void Engine::note_quota(ClientConn* client, const net::http::ResponseHead& h,
+                            std::string_view head) noexcept
     {
         client->req.f.quota_exhausted = static_cast<uint8_t>(h.quota_exhausted);
         client->req.f.retry_after_s = h.retry_after_s;
+        // Bedrock states the tier it served only here, and an earlier attempt's must not
+        // stand for this one; a body's own is read after, when this is empty.
+        client->req.f.served_tier.set(head.substr(h.bedrock_tier_at, h.bedrock_tier_len));
+        client->req.f.served_latency.set(head.substr(h.bedrock_latency_at, h.bedrock_latency_len));
     }
 
     // Bedrock is first: a Claude-via-Bedrock response carries x-amzn and
@@ -310,7 +315,7 @@ namespace llmbridge::detail
             // t4 for a stream is the head, not the first token: LATENCY.md 3.
             client->req.f.ts_up_recvd = now_ns();
             note_upstream_rtt(client, u);
-            note_quota(client, h);
+            note_quota(client, h, std::string_view(u->rbuf.data(), h.header_len));
             note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
             return begin_stream(u, h);
         }
@@ -320,7 +325,7 @@ namespace llmbridge::detail
         if (!r.complete()) return;
         client->req.f.ts_up_recvd = t4;
         note_upstream_rtt(client, u);
-        note_quota(client, h);
+        note_quota(client, h, std::string_view(u->rbuf.data(), h.header_len));
         note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
         note_upstream_error(client, h, r.body);
         note_served_tier(client, r.body, /*tail=*/true);
@@ -371,6 +376,7 @@ namespace llmbridge::detail
                 append_relayed_reply(client->out.stage(), h.status ? h.status : 200, up_head, body, true);
             else client->out.stage().append(u->rbuf.data(), total_len);
             client->req.f.tok = scan_usage(body); // a byte-forward reports its counts too
+            if (client->req.f.responses_api) provider::openai::count_search_calls(body, false, client->req.f.tok);
         }
         client->req.f.phase = Phase::Replying;
         unpair(u);
