@@ -8,6 +8,33 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.101.0]. 2026-10-15
+
+A policy hears what each venue answered, not only which ones failed: a venue's own 503 is
+relayed to the client as sent and never reached `on_failure`, so a policy ejecting venues
+on their 5xx replies could not see them, and the client's status cannot tell a venue's 502
+from the gateway's after a failure already counted. DESIGN.md "When a venue answers".
+
+### Added
+
+- **`Policy::on_reply(const ReplyFacts&) noexcept`**, appended last in `Policy`, default a
+  no-op. `ReplyFacts` carries the venue (`upstream_index`), the `status` it sent, `attempt`,
+  `tag` and `seq` as `FailureFacts` carries them, and `streamed`. Once per venue response,
+  on the loop thread, before any of it reaches the client, and it cannot change the reply:
+  a whole response once it is whole, byte-forwarded or translated (a translated venue's
+  error keeps its own status here, as it does for the client); a 200 event stream at its
+  head; after a failover, only the venue that answered, with its attempt. Never a status
+  the gateway made up, and a response cut short before it was whole goes to `on_failure`
+  instead, so each attempt reaches at most one of the two hooks. Not for a reply to a
+  client already gone, whose venue connection is closed unread. Without a policy nothing
+  is called; with one, the cost is one virtual call per response.
+
+### Changed
+
+- **ABI: rebuild a policy against this header.** A new virtual changes `Policy`'s vtable, so a
+  policy compiled against 0.100.0 must not be linked into 0.101.0. Source compatible: no
+  existing override changes.
+
 ## [0.100.0]. 2026-10-14
 
 The rest of what each venue states about a request's usage, read in the passes that
