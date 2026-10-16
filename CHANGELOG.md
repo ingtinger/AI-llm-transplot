@@ -23,11 +23,14 @@ from the gateway's after a failure already counted. DESIGN.md "When a venue answ
   on the loop thread, before any of it reaches the client, and it cannot change the reply:
   a whole response once it is whole, byte-forwarded or translated (a translated venue's
   error keeps its own status here, as it does for the client); a 200 event stream at its
-  head; after a failover, only the venue that answered, with its attempt. Never a status
-  the gateway made up, and a response cut short before it was whole goes to `on_failure`
-  instead, so each attempt reaches at most one of the two hooks. Not for a reply to a
-  client already gone, whose venue connection is closed unread. Without a policy nothing
-  is called; with one, the cost is one virtual call per response.
+  head; after a failover, only the venue that answered, with its attempt. A head whose body
+  cannot be framed (close-delimited, a broken chunk, over the cap) is reported with the
+  venue's status while the client gets the gateway's 502. Never a status the gateway made
+  up, and a response cut short before it was whole goes to `on_failure` instead, so each
+  attempt reaches at most one of the two hooks; a head the gateway refuses (a bad status
+  line, both framings, a length over the cap) and an interim 1xx reach neither. Not for a
+  reply to a client already gone, whose venue connection is closed unread. Without a policy
+  nothing is called; with one, the cost is one virtual call per response.
 
 ### Changed
 
