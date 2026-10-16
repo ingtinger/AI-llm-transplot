@@ -7463,6 +7463,79 @@ TEST_P(ProxyRoute, AGatewayStatusAfterAFailureIsNotAReply)
     EXPECT_TRUE(pol.replies().empty()) << "the gateway's 502 was reported as the venue's reply";
 }
 
+// A reply whose head framed but whose body cannot be (close-delimited, as a load
+// balancer's error page often is; or a broken chunk) is still the venue's answer: its
+// status is reported, and the client gets the gateway's 502, which is no failure.
+TEST_P(ProxyRoute, AVenueReplyWhoseBodyCannotBeFramedIsReported)
+{
+    TestBackend busy;
+    busy.set_responses({"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
+                        "Content-Type: text/html\r\n\r\n<html>busy</html>",
+                        "HTTP/1.1 504 Gateway Timeout\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"});
+    busy.start();
+    NamedBackend other;
+    other.start("bravo");
+    ReplyPolicy pol(1, {0});
+    start({{"127.0.0.1", other.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", busy.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_port));
+        ASSERT_TRUE(c.send(make_request()));
+        EXPECT_NE(c.recv_response().find("502"), std::string::npos);
+        c.close();
+    }
+    shutdown();
+    busy.stop();
+    other.stop();
+
+    const auto rs = pol.replies();
+    ASSERT_EQ(rs.size(), 2u) << "an unframeable reply reached neither hook";
+    EXPECT_EQ(rs[0].status, 503);
+    EXPECT_EQ(rs[1].status, 504);
+    for (const auto& r : rs)
+    {
+        EXPECT_EQ(r.upstream_index, 1);
+        EXPECT_EQ(r.attempt, 0);
+        EXPECT_EQ(r.tag, 77u);
+        EXPECT_FALSE(r.streamed);
+    }
+    EXPECT_EQ(rs[1].seq, pol.last_seq.load());
+    EXPECT_NE(rs[0].seq, rs[1].seq);
+    EXPECT_EQ(pol.failures.load(), 0) << "a venue that answered is no failure";
+    EXPECT_EQ(other.seen(), 0);
+}
+
+// What reaches neither hook: an interim 1xx is no answer, and a head the gateway cannot
+// parse (both framings here) has no status it can trust. The client gets a 502.
+TEST_P(ProxyRoute, AnInterimOrUnparseableHeadReachesNeitherHook)
+{
+    TestBackend odd;
+    odd.set_responses({"HTTP/1.1 100 Continue\r\n\r\n",
+                       "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n"
+                       "Transfer-Encoding: chunked\r\n\r\nbusy"});
+    odd.start();
+    ReplyPolicy pol(0, {});
+    start({{"127.0.0.1", odd.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_port));
+        ASSERT_TRUE(c.send(make_request()));
+        EXPECT_NE(c.recv_response().find("502"), std::string::npos);
+        c.close();
+    }
+    shutdown();
+    odd.stop();
+
+    EXPECT_EQ(odd.requests_seen(), 2);
+    EXPECT_TRUE(pol.replies().empty()) << "an interim 1xx or an unparseable head was reported";
+    EXPECT_EQ(pol.failures.load(), 0);
+}
+
 // After a failover only the venue that answered is reported, with the attempt it was.
 TEST_P(ProxyRoute, AReplyAfterAFailoverCarriesItsAttempt)
 {

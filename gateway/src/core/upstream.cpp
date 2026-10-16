@@ -331,7 +331,14 @@ namespace llmbridge::detail
         }
 
         const net::http::ParsedResponse r = u->framer.message(u->rbuf);
-        if (r.failed()) return error_respond(client, 502, "upstream response framing");
+        if (r.failed())
+        {
+            // The head framed, so its status is the venue's answer even when the body
+            // cannot be framed: a close-delimited 503 must still count against it. An
+            // interim 1xx is not an answer.
+            if (h.status >= 200) note_reply(client, h.status, /*streamed=*/false);
+            return error_respond(client, 502, "upstream response framing");
+        }
         if (!r.complete()) return;
         client->req.f.ts_up_recvd = t4;
         note_upstream_rtt(client, u);

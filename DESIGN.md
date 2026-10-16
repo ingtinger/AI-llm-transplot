@@ -717,15 +717,20 @@ relayed to the client and never reaches `on_failure`. `ReplyFacts` carries what
 first venue, more after a failover), the decision's tag and the request's seq; and whether it was a
 stream. A policy that ejects venues counts the replies it chooses (kottos: 502, 503, 504
 and 529) beside the failures, and a gateway status is never among them, so the 502 a client
-gets after a failure already counted is not counted twice.
+gets after a failure or a reply already counted is not counted twice.
 
 It fires once per venue response on the loop thread, before any of it reaches the client,
 and cannot change it: a whole response once it is whole, byte-forwarded or translated, a
-venue error a stream request got included; a 200 event stream at its head. A response cut
+venue error a stream request got included; a 200 event stream at its head. A head whose
+body cannot be framed (no length and not chunked, as a load balancer's close-delimited error
+page often is; a broken chunk; a body over the cap) is still the venue's answer: its status
+is reported when that is found, and the client gets the gateway's 502. A response cut
 short before it was whole is reported to `on_failure` instead, so each attempt reaches at
-most one of the two hooks. A reply to a client already gone is not reported: the gateway
-closes that venue's connection unread, and the venue's verdict on a request nobody waits
-for says nothing it would act on. Nothing is reported without a policy, and the default
+most one of the two hooks. Two reach neither, and the client gets the gateway's 502: a
+head the gateway refuses (a bad status line, both framings, a length over the cap), whose
+status it does not trust, and an interim 1xx, which is not an answer. A reply to a client
+already gone is not reported: the gateway closes that venue's connection unread, and the
+venue's verdict on a request nobody waits for says nothing it would act on. Nothing is reported without a policy, and the default
 does nothing; the cost is one virtual call per response.
 
 A `RequestRecord` field holding the venue's own status was the alternative. It was turned

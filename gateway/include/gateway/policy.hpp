@@ -186,10 +186,10 @@ namespace llmbridge
         bool retryable = true;   ///< false: the gateway gives up whatever on_failure returns
     };
 
-    /// A venue answered: the status line of a response the gateway framed and will relay or
-    /// translate, a venue's own 503 as much as its 200. Never a status the gateway made up
-    /// (that venue's failure went to on_failure instead), so a policy counting a venue's
-    /// 5xx replies can tell them from the gateway's 502 after a failure it already counted.
+    /// A venue answered: the status of a response head the gateway parsed, its 503 as much as
+    /// its 200, even when the body then cannot be framed and the client gets the gateway's 502.
+    /// Never a status the gateway made up. A head it refuses, or an interim 1xx, reaches
+    /// neither this nor on_failure: DESIGN.md "When a venue answers".
     struct ReplyFacts
     {
         int upstream_index = -1; ///< the venue that answered
