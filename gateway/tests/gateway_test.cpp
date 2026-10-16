@@ -7334,6 +7334,246 @@ TEST_P(ProxyStream, ReasoningIsStampedApartFromTheFirstTokenShown)
     EXPECT_GE(r.ts_done, r.ts_first_token);
 }
 
+// ── on_reply: the policy hears the status each venue answered with ───────────
+//
+// A venue's own 503 is relayed to the client as it is and never reaches on_failure,
+// so a policy that ejects a venue on its 5xx replies needs this. The gateway's own
+// statuses are not replies: a venue that did not answer goes to on_failure only.
+
+namespace
+{
+    /// Routes to `first`, fails over through `order`, and records every reply.
+    class ReplyPolicy final : public llmbridge::Policy
+    {
+      public:
+        ReplyPolicy(int first, std::vector<int> order) : _first(first), _order(std::move(order)) {}
+
+        llmbridge::Decision decide(const llmbridge::RequestFacts& f) noexcept override
+        {
+            last_seq.store(f.seq, std::memory_order_relaxed);
+            return {.allow = true, .upstream_index = _first, .tag = 77};
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            failures.fetch_add(1, std::memory_order_relaxed);
+            if (f.attempt >= static_cast<int>(_order.size())) return {};
+            return {.retry = true, .upstream_index = _order[static_cast<size_t>(f.attempt)]};
+        }
+        void on_reply(const llmbridge::ReplyFacts& r) noexcept override
+        {
+            const std::lock_guard<std::mutex> lk(_mu);
+            _replies.push_back(r);
+        }
+        std::vector<llmbridge::ReplyFacts> replies()
+        {
+            const std::lock_guard<std::mutex> lk(_mu);
+            return _replies;
+        }
+
+        std::atomic<int> failures{0};
+        std::atomic<uint64_t> last_seq{0};
+
+      private:
+        int _first;
+        std::vector<int> _order;
+        std::mutex _mu;
+        std::vector<llmbridge::ReplyFacts> _replies;
+    };
+} // namespace
+
+// A venue's 503, relayed verbatim, is reported once, with the venue, the attempt, the
+// decision's tag and the request's seq, and is no failure. Trickled, so the response
+// spans many reads and is still reported once.
+TEST_P(ProxyRoute, AVenueReplyIsReportedOnceWithItsVenueAndSeq)
+{
+    TestBackend busy;
+    const std::string body = R"({"error":{"type":"overloaded","message":"busy"}})";
+    busy.set_response("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                      "Connection: keep-alive\r\nContent-Length: " + std::to_string(body.size()) +
+                      "\r\n\r\n" + body);
+    busy.set_trickle(7);
+    busy.start();
+    NamedBackend other;
+    other.start("bravo");
+    ReplyPolicy pol(1, {0});
+    start({{"127.0.0.1", other.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", busy.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("503"), std::string::npos);
+    c.close();
+    shutdown();
+    busy.stop();
+    other.stop();
+
+    const auto rs = pol.replies();
+    ASSERT_EQ(rs.size(), 1u) << "a venue's reply must be reported exactly once";
+    EXPECT_EQ(rs[0].upstream_index, 1);
+    EXPECT_EQ(rs[0].status, 503);
+    EXPECT_EQ(rs[0].attempt, 0);
+    EXPECT_EQ(rs[0].tag, 77u);
+    EXPECT_EQ(rs[0].seq, pol.last_seq.load());
+    EXPECT_FALSE(rs[0].streamed);
+    EXPECT_EQ(pol.failures.load(), 0) << "a venue that answered is no failure";
+    EXPECT_EQ(other.seen(), 0) << "a venue's 503 was failed over";
+}
+
+TEST_P(ProxyRoute, AVenue200IsReported)
+{
+    NamedBackend good;
+    good.start("alpha");
+    ReplyPolicy pol(0, {});
+    start({{"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    good.stop();
+
+    const auto rs = pol.replies();
+    ASSERT_EQ(rs.size(), 2u) << "one report per response";
+    EXPECT_EQ(rs[0].status, 200);
+    EXPECT_EQ(rs[1].status, 200);
+    EXPECT_EQ(rs[0].upstream_index, 0);
+    EXPECT_NE(rs[0].seq, rs[1].seq) << "each reply carries its own request's seq";
+}
+
+// The gateway's own 502 for a venue that refused the connect is a failure, not a reply.
+TEST_P(ProxyRoute, AGatewayStatusAfterAFailureIsNotAReply)
+{
+    const DeadPort dead_sock;
+    ReplyPolicy pol(0, {});
+    start({{"127.0.0.1", dead_sock.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("502"), std::string::npos);
+    c.close();
+    shutdown();
+
+    EXPECT_EQ(pol.failures.load(), 1);
+    EXPECT_TRUE(pol.replies().empty()) << "the gateway's 502 was reported as the venue's reply";
+}
+
+// After a failover only the venue that answered is reported, with the attempt it was.
+TEST_P(ProxyRoute, AReplyAfterAFailoverCarriesItsAttempt)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const DeadPort dead_sock;
+    ReplyPolicy pol(0, {1});
+    start({{"127.0.0.1", dead_sock.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+    good.stop();
+
+    EXPECT_EQ(pol.failures.load(), 1);
+    const auto rs = pol.replies();
+    ASSERT_EQ(rs.size(), 1u);
+    EXPECT_EQ(rs[0].upstream_index, 1);
+    EXPECT_EQ(rs[0].attempt, 1);
+    EXPECT_EQ(rs[0].status, 200);
+    EXPECT_EQ(rs[0].seq, pol.last_seq.load());
+}
+
+// A translated stream is reported at its head, once, however many reads it takes.
+TEST_P(ProxyRoute, ATranslatedStreamIsReportedOnceAtItsHead)
+{
+    TestBackend sse;
+    sse.set_response(sse_chunked_response(5));
+    sse.start();
+    ReplyPolicy pol(0, {});
+    start({{"127.0.0.1", sse.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    EXPECT_EQ(parse_streamed(c.recv_stream()).content, "Hello, world");
+    c.close();
+    shutdown();
+    sse.stop();
+
+    const auto rs = pol.replies();
+    ASSERT_EQ(rs.size(), 1u);
+    EXPECT_EQ(rs[0].status, 200);
+    EXPECT_TRUE(rs[0].streamed);
+    EXPECT_EQ(rs[0].seq, pol.last_seq.load());
+}
+
+// A byte-forwarded stream too.
+TEST_P(ProxyRoute, AForwardedStreamIsReported)
+{
+    TestBackend sse;
+    sse.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                     "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                     sse_chunk_encode("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+                                      "data: [DONE]\n\n", 16));
+    sse.start();
+    ReplyPolicy pol(0, {});
+    start({{"127.0.0.1", sse.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    EXPECT_NE(c.recv_stream().find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+    sse.stop();
+
+    const auto rs = pol.replies();
+    ASSERT_EQ(rs.size(), 1u);
+    EXPECT_EQ(rs[0].status, 200);
+    EXPECT_TRUE(rs[0].streamed);
+}
+
+// A translated venue's 529 is relayed as an OpenAI error with its status, and reported
+// as the venue's 529, streamed or not: a provider error is not a stream.
+TEST_P(ProxyRoute, ATranslatedVenueErrorIsReportedWithItsOwnStatus)
+{
+    TestBackend anth;
+    const std::string body = R"({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})";
+    anth.set_response("HTTP/1.1 529 Overloaded\r\nContent-Type: application/json\r\n"
+                      "Connection: keep-alive\r\nContent-Length: " + std::to_string(body.size()) +
+                      "\r\n\r\n" + body);
+    anth.start();
+    ReplyPolicy pol(0, {});
+    start({{"127.0.0.1", anth.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    EXPECT_NE(c.recv_response().find("529"), std::string::npos);
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    EXPECT_NE(c.recv_response().find("529"), std::string::npos);
+    c.close();
+    shutdown();
+    anth.stop();
+
+    const auto rs = pol.replies();
+    ASSERT_EQ(rs.size(), 2u);
+    for (const auto& r : rs)
+    {
+        EXPECT_EQ(r.status, 529);
+        EXPECT_FALSE(r.streamed);
+        EXPECT_EQ(r.upstream_index, 0);
+    }
+    EXPECT_EQ(pol.failures.load(), 0);
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyRoute,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring),

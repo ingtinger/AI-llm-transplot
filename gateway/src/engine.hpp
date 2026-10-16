@@ -185,6 +185,8 @@ namespace llmbridge::detail
         static void note_venue_req_id(ClientConn* client, std::string_view head) noexcept;
         /// Read the kernel's RTT to the venue that just answered.
         static void note_upstream_rtt(ClientConn* client, const UpstreamConn* u) noexcept;
+        /// Tell the policy which status the venue answered with (Policy::on_reply).
+        void note_reply(const ClientConn* client, int status, bool streamed) const noexcept;
         static void note_upstream_error(ClientConn* client, const net::http::ResponseHead& h,
                                         std::string_view body) noexcept;
         [[nodiscard]] const Upstream& upstream_of(const ClientConn* c) const noexcept; // its request's venue
