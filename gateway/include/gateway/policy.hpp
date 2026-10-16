@@ -186,6 +186,20 @@ namespace llmbridge
         bool retryable = true;   ///< false: the gateway gives up whatever on_failure returns
     };
 
+    /// A venue answered: the status of a response head the gateway parsed, its 503 as much as
+    /// its 200, even when the body then cannot be framed and the client gets the gateway's 502.
+    /// Never a status the gateway made up. A head it refuses, or an interim 1xx, reaches
+    /// neither this nor on_failure: DESIGN.md "When a venue answers".
+    struct ReplyFacts
+    {
+        int upstream_index = -1; ///< the venue that answered
+        int status = 0;          ///< its three-digit status as sent; never an interim 1xx
+        int attempt = 0;         ///< venues already tried for this request, 0 on the first
+        uint64_t tag = 0;        ///< Decision::tag of this request, verbatim; 0 if unset
+        uint64_t seq = 0;        ///< RequestFacts::seq of this request, as RequestRecord::seq carries it
+        bool streamed = false;   ///< a 200 event stream, reported at its head
+    };
+
     /// Value-initialised means give up and let the client see the error.
     struct Retry
     {
@@ -252,6 +266,15 @@ namespace llmbridge
             (void)whole;
             return early;
         }
+
+        /// Once per venue response, before any of it reaches the client; it cannot change
+        /// the reply. A whole response is reported once it is whole, a 200 stream at its
+        /// head, translated or not, and a reply after a failover with its attempt. One cut
+        /// short goes to on_failure instead, so each venue attempt reaches one hook at most.
+        /// Not for a reply to a client already gone: the gateway closes that venue unread.
+        /// The default does nothing; it runs on the loop thread on every response, so keep
+        /// it as cheap as decide().
+        virtual void on_reply(const ReplyFacts&) noexcept {}
 
       protected:
         Policy() = default;

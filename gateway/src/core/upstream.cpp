@@ -73,6 +73,15 @@ namespace llmbridge::detail
         client->req.f.upstream_error.set(scan_error_type(body));
     }
 
+    void Engine::note_reply(const ClientConn* client, int status, bool streamed) const noexcept
+    {
+        if (!_policy) return;
+        const ReqState& f = client->req.f;
+        _policy->on_reply(ReplyFacts{.upstream_index = client->upstream_slot, .status = status,
+                                     .attempt = f.failover_attempts, .tag = f.policy_tag,
+                                     .seq = f.req_seq, .streamed = streamed});
+    }
+
     bool Engine::pool_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept
     {
         using R = UpstreamPool::Refusal;
@@ -317,11 +326,19 @@ namespace llmbridge::detail
             note_upstream_rtt(client, u);
             note_quota(client, h, std::string_view(u->rbuf.data(), h.header_len));
             note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
+            note_reply(client, h.status, /*streamed=*/true);
             return begin_stream(u, h);
         }
 
         const net::http::ParsedResponse r = u->framer.message(u->rbuf);
-        if (r.failed()) return error_respond(client, 502, "upstream response framing");
+        if (r.failed())
+        {
+            // The head framed, so its status is the venue's answer even when the body
+            // cannot be framed: a close-delimited 503 must still count against it. An
+            // interim 1xx is not an answer.
+            if (h.status >= 200) note_reply(client, h.status, /*streamed=*/false);
+            return error_respond(client, 502, "upstream response framing");
+        }
         if (!r.complete()) return;
         client->req.f.ts_up_recvd = t4;
         note_upstream_rtt(client, u);
@@ -330,6 +347,7 @@ namespace llmbridge::detail
         note_upstream_error(client, h, r.body);
         note_served_tier(client, r.body, /*tail=*/true);
         note_served_model(client, r.body, /*streamed=*/false);
+        note_reply(client, h.status, /*streamed=*/false);
         on_response(u, h, r.body, r.total_len);
     }
 

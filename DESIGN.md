@@ -565,6 +565,7 @@ class Policy {
     virtual bool wants_prefix_hash() const noexcept { return false; }
     virtual bool decides_on_head() const noexcept { return false; }
     virtual Decision confirm(const RequestFacts& whole, const Decision& early) noexcept { return early; }
+    virtual void on_reply(const ReplyFacts&) noexcept {}
 };
 ```
 
@@ -707,6 +708,36 @@ re-sent once a byte reached the client.
 **Streaming fails over only before its first byte.** After that the stream is truncated
 honestly, because no LLM API can resume mid-stream and a reconnect would replay tokens
 the client already has.
+
+### When a venue answers (`on_reply`)
+
+`Policy::on_reply` hears the status each venue answered with, since a venue's own 503 is
+relayed to the client and never reaches `on_failure`. `ReplyFacts` carries what
+`FailureFacts` does to attribute it: the venue, the status as sent, the attempt (0 on the
+first venue, more after a failover), the decision's tag and the request's seq; and whether it was a
+stream. A policy that ejects venues counts the replies it chooses (kottos: 502, 503, 504
+and 529) beside the failures, and a gateway status is never among them, so the 502 a client
+gets after a failure or a reply already counted is not counted twice.
+
+It fires once per venue response on the loop thread, before any of it reaches the client,
+and cannot change it: a whole response once it is whole, byte-forwarded or translated, a
+venue error a stream request got included; a 200 event stream at its head. A head whose
+body cannot be framed (no length and not chunked, as a load balancer's close-delimited error
+page often is; a broken chunk; a body over the cap) is still the venue's answer: its status
+is reported when that is found, and the client gets the gateway's 502. A response cut
+short before it was whole is reported to `on_failure` instead, so each attempt reaches at
+most one of the two hooks. Two reach neither, and the client gets the gateway's 502: a
+head the gateway refuses (a bad status line, both framings, a length over the cap), whose
+status it does not trust, and an interim 1xx, which is not an answer. A reply to a client
+already gone is not reported: the gateway closes that venue's connection unread, and the
+venue's verdict on a request nobody waits for says nothing it would act on. Nothing is reported without a policy, and the default
+does nothing; the cost is one virtual call per response.
+
+A `RequestRecord` field holding the venue's own status was the alternative. It was turned
+down because a record is written once the request is over, a stream's minutes after its
+head said 200 or not, and only when a sink is installed; an embedder that ejects in its
+policy, as kottos does, would have to feed its sink back into it. The hook reaches the
+policy where it already counts failures, with the same attribution.
 
 Still not in the seam: the body itself, and anything derived from it beyond the model
 name, the two streaming flags and the opt-in prefix hash.
@@ -1049,8 +1080,8 @@ when this list disagrees with it.
   event-stream framing, and that binary decoder is not built; a streamed request to a
   Bedrock venue is refused.
 - **No vision.** A non-text content part is refused by name. `cache_control` ships.
-- **No failover policy.** `Policy::on_failure` is the mechanism; the default never
-  retries.
+- **No failover policy.** `Policy::on_failure` and `Policy::on_reply` are the mechanism;
+  the default never retries and counts nothing.
 - **No language bindings.** Python, Go and Rust are planned.
 - **No routing policy, no matching, pricing or observability**, by design; that is the
   separate commercial layer.
