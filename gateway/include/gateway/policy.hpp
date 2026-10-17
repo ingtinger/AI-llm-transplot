@@ -189,10 +189,11 @@ namespace llmbridge
         std::string_view substitute_for{};
 
         /// A hedge: the request also goes, at once, to each of `hedge_legs` more venues (at
-        /// most kMaxHedgeLegs), each leg its own request with its own record. The body is
-        /// held to its last byte first, as with `hold`. The decision's own leg serves the
-        /// client, and the others are reset unanswered once its first token arrives. The
-        /// decision names a credential_header too, and makes no substitution, or the
+        /// most kMaxHedgeLegs), each leg, the decision's own included, its own request with
+        /// its own record. The body is held to its last byte first, as with `hold`. The first
+        /// leg to show a token, or a whole 2xx reply when not streamed, serves the client and
+        /// the others are reset unanswered; with no success, the last leg to fail answers it.
+        /// The decision names a credential_header too, and makes no substitution, or the
         /// request is a 500. Valid until decide() returns; the gateway copies the legs.
         const HedgeLeg* hedge = nullptr;
         uint8_t hedge_legs = 0;

@@ -54,8 +54,44 @@ namespace llmbridge::detail
         return true;
     }
 
-    // Each leg gets its own copy of the request, as framed, and is decided and dispatched as
-    // any request is: its own translation, overrides and key, and only its own key.
+    // Leg `i` of `c`'s hedge, 0 being the decision's own: the request as framed and the
+    // client's state (the same arrival: stamps, head facts, captures and model) with the leg's
+    // own seq, venue, overrides and key. Copied from checked values, so nothing here refuses.
+    ClientConn* Engine::new_leg(ClientConn* c, uint8_t i) noexcept
+    {
+        auto* s = new ClientConn();
+        s->shadow = true;
+        s->hedge_of = c;
+        s->id = c->id;
+        s->ever_framed = true;
+        s->ts_accepted = c->ts_accepted;
+        s->ts_client_activity = now_ns();
+        s->msg = c->msg;
+        s->rbuf.assign(c->rbuf, 0, c->msg.total_len);
+        s->req.f = c->req.f;
+        ReqState& f = s->req.f;
+        f.req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+        f.hedge_leg = i;
+        f.hedge_n = 0; // a leg has no legs
+        s->upstream_slot = c->upstream_slot;
+        if (i > 0)
+        {
+            const HedgeLegCopy& l = c->req.f.hedge[i - 1];
+            s->upstream_slot = l.venue;
+            f.model_override = l.model;
+            f.tier_override = l.tier;
+            f.speed_override = l.speed;
+            f.geo_override = l.geo;
+            f.beta_override = l.beta;
+            f.key_header = l.key;
+        }
+        _clients->add(s);
+        ++_stats.hedge_legs;
+        return s;
+    }
+
+    // Every leg, the decision's own included, is a request of its own; the client sends
+    // nothing until one of them wins it (adopt_leg).
     bool Engine::spawn_hedge(ClientConn* c) noexcept
     {
         ReqState& f = c->req.f;
@@ -70,51 +106,74 @@ namespace llmbridge::detail
         }
         f.hedged = true;
         f.hedge_group = f.req_seq;
-        f.hedge_won = true; // the decision's own leg is the one that serves the client
         ++_stats.hedged_requests;
-        for (uint8_t i = 0; i < f.hedge_n; ++i)
-        {
-            auto* s = new ClientConn();
-            s->shadow = true;
-            s->hedge_of = c;
-            c->hedge_legs[i] = s;
-            s->id = c->id;
-            s->ever_framed = true;
-            s->ts_accepted = c->ts_accepted;
-            s->ts_client_activity = now_ns();
-            s->msg = c->msg;
-            s->rbuf.assign(c->rbuf, 0, c->msg.total_len);
-            s->req.f = f; // the same arrival: its stamps, head facts, captures and model
-            ReqState& sf = s->req.f;
-            sf.req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);
-            sf.hedge_leg = static_cast<uint8_t>(i + 1);
-            sf.hedge_n = 0; // a leg has no legs
-            sf.hedge_won = false;
-            _clients->add(s);
-            ++_stats.hedge_legs;
-            const HedgeLegCopy& l = f.hedge[i];
-            Decision d{};
-            d.allow = true;
-            d.upstream_index = l.venue;
-            d.model = l.model.view();
-            d.service_tier = l.tier.view();
-            d.speed = l.speed.view();
-            d.inference_geo = l.geo.view();
-            d.anthropic_beta = l.beta.view();
-            d.credential_header = l.key.view();
-            d.tag = f.policy_tag;
-            if (apply_decision(s, d)) dispatch(s);
-        }
+        // All made and linked before any is sent, so a leg failing at once is never taken for
+        // the last one standing.
+        const uint8_t n = static_cast<uint8_t>(f.hedge_n + 1);
+        ClientConn* legs[kMaxHedgeLegs + 1] = {};
+        for (uint8_t i = 0; i < n; ++i) legs[i] = c->hedge_legs[i] = new_leg(c, i);
+        // The request leaves the client's buffer; a pipelined one behind it waits there.
+        c->rbuf.erase(0, c->msg.total_len);
+        f.body_in_rbuf = f.body_parked = false;
+        f.phase = Phase::Dispatched;
+        c->hedge_open = true;
+        c->ever_framed = true;
+        c->ts_client_activity = now_ns();
+        for (ClientConn* s : legs)
+            if (s && !s->doomed) dispatch(s); // doomed: the race was settled while sending
+        return true;
+    }
+
+    // Leg `s` has won: its request, its venue and what it staged become the client's, and
+    // every other leg is cut.
+    ClientConn* Engine::adopt_leg(ClientConn* s) noexcept
+    {
+        ClientConn* c = s->hedge_of;
+        for (ClientConn*& l : c->hedge_legs)
+            if (l == s) l = nullptr;
+        s->hedge_of = nullptr;
+        s->req.f.hedge_won = true;
+        // What the client's connection still owes or drops belongs to it, not to a request.
+        const uint64_t discard = c->req.discard;
+        const bool close_on_drain = c->req.close_on_drain;
+        std::swap(c->req, s->req);
+        c->req.discard = discard;
+        c->req.close_on_drain = close_on_drain;
+        std::swap(c->sse_xlate, s->sse_xlate);
+        c->out.stage().append(s->out.wire()); // a leg holds its bytes until it wins
+        s->out.clear();
+        c->upstream_slot = s->upstream_slot;
+        c->close_after_resp = s->close_after_resp;
+        if (UpstreamConn* u = unpair(s)) pair(c, u);
+        s->req.f.sunk = true; // it holds the client's own state now, no leg's
+        _ops->close(*s);
+        settle_hedge(c);
+        if (c->req.f.error_owed) ++_stats.errors; // the client got the failure
+        LB_DEBUG(ReqId{c->req.f.req_seq}, " hedge leg ", static_cast<int64_t>(c->req.f.hedge_leg), " won on venue ",
+                 static_cast<int64_t>(c->upstream_slot), " for ", *c);
+        return c;
+    }
+
+    bool Engine::leg_alone(const ClientConn* s) noexcept
+    {
+        for (const ClientConn* l : s->hedge_of->hedge_legs)
+            if (l && l != s) return false;
         return true;
     }
 
     void Engine::settle_hedge(ClientConn* c) noexcept
     {
-        c->req.f.hedge_n = 0;
-        ClientConn* legs[kMaxHedgeLegs];
+        c->hedge_open = false;
+        ClientConn* legs[kMaxHedgeLegs + 1];
         std::copy(std::begin(c->hedge_legs), std::end(c->hedge_legs), legs); // each cut unlinks itself
         for (ClientConn* s : legs)
             if (s) cut_leg(s);
+    }
+
+    void Engine::count_error(ClientConn* c) noexcept
+    {
+        if (c->shadow) c->req.f.error_owed = true; // counted only if it wins its client
+        else ++_stats.errors;
     }
 
     void Engine::cut_leg(ClientConn* s) noexcept
@@ -134,7 +193,16 @@ namespace llmbridge::detail
         ReqState& f = s->req.f;
         if (_sink && !f.sunk && f.phase != Phase::Idle)
             sink_emit(s, f.hedge_cut ? 0 : f.streaming ? 200 : 502, f.streaming);
+        ClientConn* c = s->hedge_of;
         if (ConnBase* u = forget(s)) _shadow_io.inner->close(*u);
+        if (!c || !c->hedge_open) return;
+        for (const ClientConn* l : c->hedge_legs)
+            if (l) return;
+        // The last leg gone with nothing to show the client: the gateway's 502, and no record
+        // of it, since every leg left its own.
+        c->hedge_open = false;
+        c->req.f.sunk = true;
+        error_respond(c, 502, "no hedge leg answered");
     }
 
     void Engine::bury_shadows() noexcept

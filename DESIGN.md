@@ -670,8 +670,9 @@ nothing here: which venues, and whether to hedge at all, is the policy's, as eve
 of venue is. What it guarantees is the mechanism. Each leg is rebuilt for its own venue
 with its own key and no other, which is why every leg, the decision included, must name a
 `credential_header`. The body is held to its last byte, so every leg gets all of it. The
-decision's own leg serves the client, and once it has an answer (a reply, or a stream's
-first token) every leg still waiting is reset, never pooled. Each leg leaves its own sink
+first leg with an answer serves the client: a stream's first token, never its head, or a
+whole 2xx reply. Every leg still waiting is then reset, never pooled. A failure waits for
+the others, and only the last leg to fail answers the client. Each leg leaves its own sink
 record, grouped by `hedge_group`, because each was a real request a venue may bill.
 GATEWAY-INTERNALS.md 13.
 

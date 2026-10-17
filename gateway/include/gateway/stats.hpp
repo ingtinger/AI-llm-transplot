@@ -88,8 +88,8 @@ namespace llmbridge
         uint64_t streamed_override_redone = 0;
         uint64_t upstream_unresolved = 0; // acquires refused: the venue's name had no address yet
         uint64_t upstream_local_failures = 0; // connects this host could not make, answered 503
-        /// Decision::hedge: requests hedged, legs sent beside each decision's own, and legs
-        /// reset unanswered. No leg counts in `requests` or `errors`, which count what clients got.
+        /// Decision::hedge: requests hedged, legs sent (the decision's own included), and legs
+        /// reset unanswered. Only the leg a client got counts in `requests` or `errors`.
         uint64_t hedged_requests = 0;
         uint64_t hedge_legs = 0;
         uint64_t hedge_legs_cut = 0;

@@ -8,6 +8,45 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.103.0]. 2026-10-17
+
+A hedge is now a race: the first leg with an answer serves the client, whichever venue it
+went to, and 0.102.0's rule that the decision's own leg always served is gone.
+GATEWAY-INTERNALS.md 13.
+
+### Changed
+
+- **The first leg to answer wins.** Every leg, the decision's own included, is a request of
+  its own, and the client sends none until one wins: a stream with its first token or
+  thinking delta, never its head, or a whole 2xx reply. The winner's request state, staged
+  bytes, venue connection and SSE translator move to the client mid-flight, and every other
+  leg is reset as before. In 0.102.0 the decision's leg served the client, and its stream
+  head reached the client before any leg had a token.
+- **A failure waits for the others.** A leg's non-2xx reply, or a stream that ends without a
+  token, is recorded and closed while another leg may still answer. The last leg to fail
+  answers the client with its own status and body. A last leg that ends with nothing to
+  show (aborted mid-stream, or closed by the sweep) gets the client the gateway's 502.
+- **The decision's own leg has its own seq**, like every leg: `hedge_group` (the client
+  request's seq) is on no leg's record, and the client's own state leaves none. A client
+  leaving mid-request now cuts and records every leg, the decision's included.
+- **`Stats::hedge_legs` counts every leg**, the decision's own included. Only the leg a
+  client got counts in `requests` or `errors`.
+
+### Tests
+
+- `ProxyHedge.*`: the fastest leg serving the client while the decision's own is reset; a
+  stream winning at its first token, the losing head never reaching the client; a winner's
+  head held from its arrival to its token; the last failure answering the client, with
+  every failure recorded; a failure waiting for a success; every venue closing unanswered;
+  a request pipelined behind a hedge; an Anthropic client's legs to two Anthropic-dialect
+  venues, each with its own `x-api-key`; a translated stream winning with its translator
+  mid-stream; a leg to a SigV4 venue failing alone and reaching nothing.
+  `GatewayCrossVenueTls.EachHedgeLegIsVerifiedAgainstItsOwnVenue`: a leg to a venue
+  presenting the wrong certificate fails, sends nothing, and the verified leg serves.
+  Seven mutations each fail the tests that guard them: only leg 0 allowed to win, a head
+  winning, a failure winning, a held head dropped, staged bytes left behind, the translator
+  left behind, and the decision's leg not reset.
+
 ## [0.102.0]. 2026-10-17
 
 A request can go to several venues at once. The decision's own venue serves the client, and

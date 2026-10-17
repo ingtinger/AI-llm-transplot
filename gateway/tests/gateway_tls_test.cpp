@@ -1499,6 +1499,60 @@ TEST_P(GatewayCrossVenueTls, AFailoverTargetIsStillVerified)
     if (_gt.joinable()) _gt.join();
 }
 
+namespace
+{
+    /// Hedges venue 0 to venue 1, each leg with its own key (Decision::hedge).
+    class TlsHedgePolicy final : public Policy
+    {
+      public:
+        Decision decide(const RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = 0, .credential_header = "x-kottos-key-a",
+                    .hedge = &_leg, .hedge_legs = 1};
+        }
+
+      private:
+        llmbridge::HedgeLeg _leg{.upstream_index = 1, .credential_header = "x-kottos-key-b"};
+    };
+} // namespace
+
+// A hedge leg is a TLS session of its own, verified against its own venue's name: venue 1
+// presents venue 0's certificate, so its leg fails before any request is sent, and the leg
+// to venue 0, verified, serves the client.
+TEST_P(GatewayCrossVenueTls, EachHedgeLegIsVerifiedAgainstItsOwnVenue)
+{
+    _b0.start(_id0, "json");
+    _b1.start(_id0, "json"); // wrong identity for kHostTwo
+    TlsConfig tls;
+    tls.ca_file = write_ca_bundle(_id0, _id1);
+    std::vector<Upstream> table = {
+        Upstream{.ip = "127.0.0.1", .port = _b0.port(), .tls = true, .sni_host = kHost,
+                 .dialect = UpstreamDialect::OpenAI},
+        Upstream{.ip = "127.0.0.1", .port = _b1.port(), .tls = true, .sni_host = kHostTwo,
+                 .dialect = UpstreamDialect::OpenAI},
+    };
+    TlsHedgePolicy pol;
+    _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),
+                                    Gateway::kDefaultUpstreamIdleNs, tls, false, &pol,
+                                    std::vector<std::string>{});
+    _port = _gw->bound_port();
+    _gt = std::thread([this] { _gw->run(); });
+
+    const std::string body = R"({"model":"gpt","messages":[]})";
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nx-kottos-key-a: KEY-A\r\n"
+                       "x-kottos-key-b: KEY-B\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200) << "the verified leg did not serve: " << r.substr(0, 200);
+    c.close();
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+    EXPECT_EQ(_b0.requests(), 1);
+    EXPECT_EQ(_b1.requests(), 0) << "a request reached a venue that failed verification";
+    EXPECT_EQ(_gw->stats().hedge_legs, 2u);
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, GatewayCrossVenueTls,
                          ::testing::Values(llmbridge::IoBackend::Epoll
 #ifdef LLMBRIDGE_HAVE_URING

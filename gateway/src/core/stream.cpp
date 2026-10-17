@@ -109,9 +109,16 @@ namespace llmbridge::detail
     // drained finalizes.
     void Engine::stream_flush(ClientConn* client) noexcept
     {
-        // A hedge is settled by the first token, not by the head: a head can precede an error.
-        const ReqState& f = client->req.f;
-        if (f.hedge_n && (f.ts_first_token || f.ts_first_thinking || f.stream_ended)) settle_hedge(client);
+        // A hedge leg streaming while its client waits holds its bytes: its first token wins
+        // the client, never its head, which can precede an error. One that ends without a
+        // token has lost, unless no other leg is left (GATEWAY-INTERNALS.md 13).
+        if (client->shadow && client->hedge_of && client->hedge_of->hedge_open)
+        {
+            const ReqState& f = client->req.f;
+            const bool token = f.ts_first_token || f.ts_first_thinking;
+            if (!token && !f.stream_ended) return;
+            if (token || leg_alone(client)) client = adopt_leg(client);
+        }
         const uint64_t sent = client->sent_bytes;
         const Sent s = _ops->send(*client);
         // A client draining a paused stream is progress, though the upstream is silent.
@@ -177,7 +184,7 @@ namespace llmbridge::detail
             ++_stats.requests;
             stream_record_latency(client);
         }
-        if (_sink) sink_emit(client, 200, /*streamed=*/true);
+        if (_sink && !client->req.f.sunk) sink_emit(client, 200, /*streamed=*/true);
 
         // Keep the connection when the framing gave the body an end marker.
         if (client->shadow || !stream_client_reusable(client))
@@ -203,7 +210,7 @@ namespace llmbridge::detail
                 " on ", *client);
         client->req.f.stream_ended = true;      // no more output will be produced
         client->close_after_resp = true;  // close once the client drains what we have
-        if (!client->shadow) ++_stats.errors; // and it counts as a failure, not a finish
+        count_error(client);              // and it counts as a failure, not a finish
     }
 
 } // namespace llmbridge::detail

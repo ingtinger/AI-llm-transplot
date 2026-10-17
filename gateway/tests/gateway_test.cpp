@@ -12537,8 +12537,8 @@ TEST_P(ProxyKeyHeader, AfterANamedRetryAnUnnamedOneGivesUp)
 // ── A hedged request (Decision::hedge) ───────────────────────────────────────────────
 //
 // One request goes to several venues at once, each leg rebuilt for its venue with its own
-// key and no other. The decision's own leg serves the client; once it answers, every leg
-// still open is reset, and each leg leaves its own record in one group.
+// key and no other. The first leg to show a token, or a whole 2xx reply, serves the client;
+// every other leg still open is then reset, and each leg leaves its own record in one group.
 namespace
 {
     /// Decides `d` hedged to `legs`, which live as long as the policy.
@@ -12597,6 +12597,24 @@ namespace
         for (int i = 0; i < 200 && !done(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         return done();
     }
+
+    std::string raw_reply(const std::string& status_line, const std::string& body)
+    {
+        return status_line + "\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+
+    /// An OpenAI event stream whose head names `id` and whose one content chunk says `word`.
+    std::string sse_head(const std::string& id)
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nx-request-id: " + id +
+               "\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n";
+    }
+    std::string sse_role() { return "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"; }
+    std::string sse_word(const std::string& word)
+    {
+        return "data: {\"choices\":[{\"delta\":{\"content\":\"" + word + "\"}}]}\n\ndata: [DONE]\n\n";
+    }
 } // namespace
 
 class ProxyHedge : public ProxyKeyHeader
@@ -12646,9 +12664,9 @@ TEST_P(ProxyHedge, EveryLegCarriesOnlyItsOwnKey)
     for (TestBackend* t : {&a, &b, &c}) t->stop();
 }
 
-// The decision's leg answers and the others, still waiting on their venues, are reset: a
-// connection mid-request is never pooled, and a reset is how a venue learns to stop.
-TEST_P(ProxyHedge, TheOtherLegsAreResetOnceTheFirstLegAnswers)
+// One leg answers and the others, still waiting on their venues, are reset: a connection
+// mid-request is never pooled, and a reset is how a venue learns to stop.
+TEST_P(ProxyHedge, TheOtherLegsAreResetOnceOneAnswers)
 {
     std::atomic<bool> go{false};
     TestBackend a, b, c;
@@ -12673,14 +12691,16 @@ TEST_P(ProxyHedge, TheOtherLegsAreResetOnceTheFirstLegAnswers)
     EXPECT_EQ(c.resets(), 1) << "closed with a FIN, not reset";
     EXPECT_EQ(_gw->pooled_upstream_count(), 1u) << "only the winning leg's connection may be pooled";
     EXPECT_EQ(_gw->stats().hedged_requests, 1u);
-    EXPECT_EQ(_gw->stats().hedge_legs, 2u);
+    EXPECT_EQ(_gw->stats().hedge_legs, 3u);
     EXPECT_EQ(_gw->stats().hedge_legs_cut, 2u);
-    EXPECT_EQ(_gw->stats().requests, 1u) << "a leg is not a client request";
+    EXPECT_EQ(_gw->stats().requests, 1u) << "only the leg the client got is its request";
+    EXPECT_EQ(_gw->stats().errors, 0u);
     for (TestBackend* t : {&a, &b, &c}) t->stop();
 }
 
 // One record per leg, each with its own seq, all in the group named by the client
-// request's: the winner with its status and tokens, a cut leg with status 0 and none.
+// request's seq, which no leg carries: the winner with its status and tokens, a cut leg with
+// status 0 and none.
 TEST_P(ProxyHedge, EveryLegIsRecordedInOneGroup)
 {
     std::atomic<bool> go{false};
@@ -12714,7 +12734,7 @@ TEST_P(ProxyHedge, EveryLegIsRecordedInOneGroup)
         ASSERT_NE(l, nullptr) << "a leg left no record";
         EXPECT_TRUE(l->hedged) << "a seq may be 0, so hedge_group alone cannot mark a hedge";
     }
-    EXPECT_EQ(leg[0]->hedge_group, leg[0]->seq);
+    EXPECT_NE(leg[0]->hedge_group, leg[0]->seq) << "the decision's own leg is a request of its own";
     EXPECT_TRUE(leg[0]->hedge_won);
     EXPECT_FALSE(leg[0]->hedge_cut);
     EXPECT_EQ(leg[0]->status, 200);
@@ -12722,7 +12742,8 @@ TEST_P(ProxyHedge, EveryLegIsRecordedInOneGroup)
     for (int i = 1; i < 3; ++i)
     {
         SCOPED_TRACE(i);
-        EXPECT_EQ(leg[i]->hedge_group, leg[0]->seq);
+        EXPECT_EQ(leg[i]->hedge_group, leg[0]->hedge_group);
+        EXPECT_NE(leg[i]->seq, leg[0]->hedge_group);
         EXPECT_NE(leg[i]->seq, leg[0]->seq);
         EXPECT_TRUE(leg[i]->hedge_cut);
         EXPECT_FALSE(leg[i]->hedge_won);
@@ -12736,8 +12757,8 @@ TEST_P(ProxyHedge, EveryLegIsRecordedInOneGroup)
     for (TestBackend* t : {&a, &b, &c}) t->stop();
 }
 
-// A stream wins at its first token, not at its head: the legs are cut then, and the client
-// gets the whole stream from the decision's venue.
+// A stream wins at its first token: the other legs are cut then, and the client gets the
+// whole stream from the leg that won.
 TEST_P(ProxyHedge, AStreamCutsTheOtherLegsAtItsFirstToken)
 {
     std::atomic<bool> go{false};
@@ -12923,7 +12944,8 @@ TEST_P(ProxyHedge, ABodyDecidedOnItsHeadReachesEveryLegWhole)
     }
 }
 
-// The client leaving mid-request ends every leg: each is reset and recorded as cut.
+// The client leaving mid-request ends every leg, the decision's own too: each is reset and
+// recorded as cut, and nothing else is recorded.
 TEST_P(ProxyHedge, AClientThatLeavesCutsEveryLeg)
 {
     TestBackend a, b, c;
@@ -12940,14 +12962,335 @@ TEST_P(ProxyHedge, AClientThatLeavesCutsEveryLeg)
     ASSERT_TRUE(cl.send(openai_request_hdrs("hi", hedge_keys())));
     ASSERT_TRUE(within_2s([&] { return a.requests_seen() + b.requests_seen() + c.requests_seen() == 3; }));
     cl.close();
-    EXPECT_TRUE(within_2s([&] { return b.closed_by_gateway() == 1 && c.closed_by_gateway() == 1; }));
+    EXPECT_TRUE(within_2s([&] {
+        return a.closed_by_gateway() == 1 && b.closed_by_gateway() == 1 && c.closed_by_gateway() == 1;
+    }));
     shutdown();
-    EXPECT_EQ(b.resets(), 1);
-    EXPECT_EQ(c.resets(), 1);
-    size_t cut = 0;
-    for (const auto& r : sink.records()) cut += r.r.hedge_cut;
-    EXPECT_EQ(cut, 2u);
+    for (TestBackend* t : {&a, &b, &c}) EXPECT_EQ(t->resets(), 1);
+    const auto recs = sink.records();
+    EXPECT_EQ(recs.size(), 3u);
+    for (const auto& r : recs) EXPECT_TRUE(r.r.hedge_cut && !r.r.hedge_won) << "leg " << int{r.r.hedge_leg};
     for (TestBackend* t : {&a, &b, &c}) t->stop();
+}
+
+// The race proper: the decision's own leg is slow, another answers first and serves the
+// client, and every other leg, the decision's included, is reset.
+TEST_P(ProxyHedge, TheFastestLegServesTheClient)
+{
+    std::atomic<bool> go{false};
+    TestBackend a, b, c;
+    a.set_stall(3);
+    b.set_response(http_ok(R"({"who":"bravo"})"));
+    b.hold_first_reply(&go); // until the slow legs have their requests
+    c.set_stall(3);
+    for (TestBackend* t : {&a, &b, &c}) t->start();
+    RecordingSink sink;
+    HedgePolicy pol(hedged("x-kottos-key-a"), legs_bc());
+    start({oai_venue(a.port()), oai_venue(b.port()), oai_venue(c.port())}, &pol, &sink);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(openai_request_hdrs("hi", hedge_keys())));
+    ASSERT_TRUE(within_2s([&] { return a.requests_seen() == 1 && c.requests_seen() == 1; }));
+    go = true;
+    const std::string resp = cl.recv_response();
+    EXPECT_EQ(Client::status_of(resp), 200) << resp;
+    EXPECT_NE(resp.find("bravo"), std::string::npos) << resp;
+    EXPECT_TRUE(within_2s([&] { return a.closed_by_gateway() == 1 && c.closed_by_gateway() == 1; }));
+    cl.close();
+    shutdown();
+    EXPECT_EQ(a.resets(), 1) << "the decision's own leg lost and was not reset";
+    EXPECT_EQ(c.resets(), 1);
+    EXPECT_EQ(_gw->stats().requests, 1u);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 3u);
+    for (const auto& r : recs)
+    {
+        SCOPED_TRACE(int{r.r.hedge_leg});
+        EXPECT_EQ(r.r.hedge_won, r.r.hedge_leg == 1);
+        EXPECT_EQ(r.r.hedge_cut, r.r.hedge_leg != 1);
+        EXPECT_EQ(r.r.status, r.r.hedge_leg == 1 ? 200 : 0);
+    }
+    for (TestBackend* t : {&a, &b, &c}) t->stop();
+}
+
+// A stream wins at its first token, never at its head. The decision's own venue sends its
+// head at once and its token late; another leg's token comes first and the client gets
+// that leg's stream, head included, and not a byte of the first.
+TEST_P(ProxyHedge, AStreamWinsAtItsFirstTokenNotItsHead)
+{
+    std::atomic<bool> go{false};
+    TestBackend a, b;
+    a.set_response(sse_head("req-alpha") + sse_chunk_open(sse_role()));
+    a.set_late_bytes(sse_chunk_open(sse_word("alpha")) + "0\r\n\r\n", 600);
+    b.set_response(sse_head("req-bravo") + sse_chunk_encode(sse_role() + sse_word("bravo"), 4096));
+    b.hold_first_reply(&go); // until the first venue's head is out
+    for (TestBackend* t : {&a, &b}) t->start();
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({oai_venue(a.port()), oai_venue(b.port())}, &pol);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(openai_stream_request_hdrs(hedge_keys())));
+    ASSERT_TRUE(within_2s([&] { return a.requests_seen() == 1 && b.requests_seen() == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the first venue's head has landed
+    go = true;
+    const std::string resp = cl.recv_stream();
+    EXPECT_NE(resp.find("bravo"), std::string::npos) << resp;
+    EXPECT_NE(resp.find("req-bravo"), std::string::npos) << "the head is the winner's: " << resp;
+    EXPECT_EQ(resp.find("req-alpha"), std::string::npos) << "the losing head reached the client: " << resp;
+    EXPECT_EQ(resp.find("alpha"), std::string::npos) << resp;
+    cl.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().hedge_legs_cut, 1u);
+    EXPECT_EQ(_gw->pooled_upstream_count(), 1u) << "the cut leg's connection was pooled mid-stream";
+    for (TestBackend* t : {&a, &b}) t->stop();
+}
+
+// The winner's own head arrived long before its token: it is held, not dropped, and reaches
+// the client in front of the stream.
+TEST_P(ProxyHedge, AWinnersHeadIsHeldUntilItsToken)
+{
+    TestBackend a, b;
+    a.set_response(sse_head("req-alpha") + sse_chunk_open(sse_role()));
+    a.set_late_bytes(sse_chunk_open(sse_word("alpha")) + "0\r\n\r\n", 300);
+    b.set_stall(3);
+    for (TestBackend* t : {&a, &b}) t->start();
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({oai_venue(a.port()), oai_venue(b.port())}, &pol);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(openai_stream_request_hdrs(hedge_keys())));
+    const std::string resp = cl.recv_stream();
+    cl.close();
+    shutdown();
+    EXPECT_EQ(resp.rfind("HTTP/1.1 200", 0), 0u) << "the winner's head was lost: " << resp;
+    EXPECT_NE(resp.find("req-alpha"), std::string::npos) << resp;
+    EXPECT_NE(resp.find("alpha\""), std::string::npos) << resp;
+    EXPECT_NE(resp.find("[DONE]"), std::string::npos) << resp;
+    for (TestBackend* t : {&a, &b}) t->stop();
+}
+
+// No success anywhere: each failure is recorded as it comes, and the last leg to fail
+// answers the client with its own status and body.
+TEST_P(ProxyHedge, WhenEveryLegFailsTheClientGetsTheLastFailure)
+{
+    std::atomic<bool> go{false};
+    TestBackend a, b;
+    a.set_response(raw_reply("HTTP/1.1 529 Overloaded", R"({"error":{"type":"overloaded_error"}})"));
+    b.set_response(raw_reply("HTTP/1.1 503 Service Unavailable", R"({"error":{"type":"bravo_down"}})"));
+    b.hold_first_reply(&go); // until the first has failed
+    for (TestBackend* t : {&a, &b}) t->start();
+    RecordingSink sink;
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({oai_venue(a.port()), oai_venue(b.port())}, &pol, &sink);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(openai_request_hdrs("hi", hedge_keys())));
+    ASSERT_TRUE(within_2s([&] { return a.requests_seen() == 1 && b.requests_seen() == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    go = true;
+    const std::string resp = cl.recv_response();
+    cl.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 503) << resp;
+    EXPECT_NE(resp.find("bravo_down"), std::string::npos) << resp;
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    for (const auto& r : recs)
+    {
+        SCOPED_TRACE(int{r.r.hedge_leg});
+        EXPECT_EQ(r.r.status, r.r.hedge_leg == 0 ? 529 : 503);
+        EXPECT_EQ(r.r.hedge_won, r.r.hedge_leg == 1) << "the leg that answered the client";
+        EXPECT_FALSE(r.r.hedge_cut);
+    }
+    for (TestBackend* t : {&a, &b}) t->stop();
+}
+
+// A failure never serves the client while another leg may still succeed.
+TEST_P(ProxyHedge, AFailureWaitsForTheOtherLegs)
+{
+    std::atomic<bool> go{false};
+    TestBackend a, b;
+    a.set_response(raw_reply("HTTP/1.1 503 Service Unavailable", R"({"error":{"type":"alpha_down"}})"));
+    b.set_response(http_ok(R"({"who":"bravo"})"));
+    b.hold_first_reply(&go);
+    for (TestBackend* t : {&a, &b}) t->start();
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({oai_venue(a.port()), oai_venue(b.port())}, &pol);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(openai_request_hdrs("hi", hedge_keys())));
+    ASSERT_TRUE(within_2s([&] { return a.requests_seen() == 1 && b.requests_seen() == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    go = true;
+    const std::string resp = cl.recv_response();
+    cl.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 200) << resp;
+    EXPECT_NE(resp.find("bravo"), std::string::npos) << resp;
+    EXPECT_EQ(_gw->stats().errors, 0u) << "the client got no failure";
+    for (TestBackend* t : {&a, &b}) t->stop();
+}
+
+// Every venue closes unanswered: the last leg's failure is the client's 502, and each leg
+// has its record, one of them marked as the one the client got.
+TEST_P(ProxyHedge, WhenNoVenueAnswersTheClientGetsA502)
+{
+    TestBackend a, b, c;
+    for (TestBackend* t : {&a, &b, &c})
+    {
+        t->set_response(venue_reply(UpstreamDialect::OpenAI));
+        t->set_close_unanswered(true);
+        t->start();
+    }
+    RecordingSink sink;
+    HedgePolicy pol(hedged("x-kottos-key-a"), legs_bc());
+    start({oai_venue(a.port()), oai_venue(b.port()), oai_venue(c.port())}, &pol, &sink);
+    const std::string resp = exchange(openai_request_hdrs("hi", hedge_keys()));
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 502) << resp;
+    EXPECT_EQ(_gw->stats().errors, 1u) << "one failure reached the client";
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 3u);
+    size_t won = 0;
+    for (const auto& r : recs)
+    {
+        EXPECT_EQ(r.r.status, 502);
+        won += r.r.hedge_won;
+    }
+    EXPECT_EQ(won, 1u);
+    for (TestBackend* t : {&a, &b, &c}) t->stop();
+}
+
+// A request pipelined behind a hedged one waits for it, then is served on the same
+// connection: the client's buffer keeps what follows the hedged request.
+TEST_P(ProxyHedge, ARequestPipelinedBehindAHedgeIsServedAfterIt)
+{
+    TestBackend a, b;
+    a.set_response(http_ok(R"({"who":"alpha"})"));
+    b.set_response(http_ok(R"({"who":"bravo"})"));
+    for (TestBackend* t : {&a, &b}) t->start();
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({oai_venue(a.port()), oai_venue(b.port())}, &pol);
+    const std::string one = openai_request_hdrs("first", hedge_keys());
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(one + one));
+    const std::string r1 = cl.recv_response();
+    const std::string r2 = cl.recv_response();
+    cl.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(r1), 200) << r1;
+    EXPECT_EQ(Client::status_of(r2), 200) << r2;
+    EXPECT_EQ(_gw->stats().hedged_requests, 2u);
+    EXPECT_EQ(_gw->stats().requests, 2u);
+    for (TestBackend* t : {&a, &b}) t->stop();
+}
+
+// Claude Code's case: an Anthropic client hedged across two Anthropic-dialect venues (as
+// Anthropic direct and Bedrock's Anthropic surface are), each byte-forwarded with its own
+// x-api-key and no other, the client's anthropic-version kept.
+TEST_P(ProxyHedge, AnAnthropicClientsLegsEachCarryOnlyTheirOwnKey)
+{
+    std::atomic<bool> go{false};
+    TestBackend a, b;
+    a.set_response(http_ok(R"({"id":"msg_a","type":"message","role":"assistant","content":[{"type":"text","text":"alpha"}]})"));
+    a.hold_first_reply(&go);
+    b.set_stall(3);
+    for (TestBackend* t : {&a, &b}) t->start();
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::Anthropic, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}},
+          &pol);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(anthropic_request_hdrs("hi", hedge_keys() + "anthropic-version: 2023-06-01\r\n")));
+    ASSERT_TRUE(within_2s([&] { return b.requests_seen() == 1; }));
+    go = true;
+    const std::string resp = cl.recv_response();
+    cl.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 200) << resp;
+    EXPECT_NE(resp.find("alpha"), std::string::npos) << resp;
+    const std::pair<TestBackend*, std::string> want[] = {{&a, "KEY-ALPHA"}, {&b, "KEY-BRAVO"}};
+    for (const auto& [t, key] : want)
+    {
+        SCOPED_TRACE(key);
+        const std::string up = t->last_request();
+        EXPECT_EQ(up.rfind("POST /v1/messages HTTP/1.1\r\n", 0), 0u) << "not byte-forwarded: " << up;
+        EXPECT_NE(up.find("\r\nx-api-key: " + key + "\r\n"), std::string::npos) << up;
+        EXPECT_NE(up.find("\r\nanthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
+        EXPECT_TRUE(only_the_named_key(up, key));
+        for (const char* other : {"KEY-ALPHA", "KEY-BRAVO", "KEY-CHARLIE"})
+            EXPECT_TRUE(key == other || up.find(other) == std::string::npos) << other << " reached this leg:\n" << up;
+    }
+    for (TestBackend* t : {&a, &b}) t->stop();
+}
+
+// Legs of different dialects: an OpenAI client's leg translated for an Anthropic venue
+// streams against one byte-forwarded to an OpenAI venue. The translated leg wins at its
+// first token with the rest of its stream still to come, so its translator, mid-stream,
+// has to move to the client with it.
+TEST_P(ProxyHedge, ATranslatedStreamWinsWithItsTranslator)
+{
+    std::atomic<bool> go{false};
+    TestBackend a, b;
+    const std::string ev = anthropic_sse_events();
+    const size_t rest = ev.find("event: content_block_delta", ev.find("Hello")); // after the first token
+    a.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n"
+                   "Connection: keep-alive\r\n\r\n" + sse_chunk_open(ev.substr(0, rest)));
+    a.set_late_bytes(sse_chunk_open(ev.substr(rest)) + "0\r\n\r\n", 200);
+    a.hold_first_reply(&go); // until the other leg has its request
+    b.set_stall(3);
+    for (TestBackend* t : {&a, &b}) t->start();
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::Anthropic, ""}, oai_venue(b.port())}, &pol);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(openai_stream_request_hdrs(hedge_keys())));
+    ASSERT_TRUE(within_2s([&] { return b.requests_seen() == 1; }));
+    go = true;
+    const std::string resp = cl.recv_stream();
+    cl.close();
+    shutdown();
+    EXPECT_NE(resp.find("Hello"), std::string::npos) << resp;
+    EXPECT_NE(resp.find(", world"), std::string::npos) << "the stream after the win was lost: " << resp;
+    // The model came in message_start, before the win: only the leg's own translator knows it.
+    const size_t later = resp.find(", world");
+    const std::string chunk = later == std::string::npos ? "" : resp.substr(resp.rfind("data:", later), 400);
+    EXPECT_NE(chunk.find("claude-3-5-sonnet-20241022"), std::string::npos) << "a fresh translator: " << chunk;
+    EXPECT_NE(resp.find("chat.completion.chunk"), std::string::npos) << "not translated: " << resp;
+    EXPECT_NE(resp.find("[DONE]"), std::string::npos) << resp;
+    EXPECT_NE(a.last_request().find("\r\nx-api-key: KEY-ALPHA\r\n"), std::string::npos) << a.last_request();
+    EXPECT_TRUE(only_the_named_key(a.last_request(), "KEY-ALPHA"));
+    EXPECT_TRUE(only_the_named_key(b.last_request(), "KEY-BRAVO"));
+    for (TestBackend* t : {&a, &b}) t->stop();
+}
+
+// A SigV4 venue signs with a key pair and takes no named key, so a leg sent there fails
+// alone, before reaching it, and another leg serves the client.
+TEST_P(ProxyHedge, ALegToASignedVenueFailsAloneAndReachesNothing)
+{
+    TestBackend signed_venue, b;
+    signed_venue.set_response(venue_reply(UpstreamDialect::Anthropic));
+    b.set_response(http_ok(R"({"who":"bravo"})"));
+    for (TestBackend* t : {&signed_venue, &b}) t->start();
+    RecordingSink sink;
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({llmbridge::Upstream{.ip = "127.0.0.1", .port = signed_venue.port(),
+                               .sni_host = "bedrock-runtime.us-east-1.amazonaws.com",
+                               .dialect = UpstreamDialect::Bedrock},
+           oai_venue(b.port())},
+          &pol, &sink);
+    const std::string resp = exchange(openai_request_hdrs("hi", hedge_keys()));
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 200) << resp;
+    EXPECT_NE(resp.find("bravo"), std::string::npos) << resp;
+    EXPECT_EQ(signed_venue.accepted(), 0) << signed_venue.last_request();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    for (const auto& r : recs)
+        EXPECT_EQ(r.r.status, r.r.hedge_leg == 0 ? 400 : 200) << "the signed leg is refused, and recorded";
+    for (TestBackend* t : {&signed_venue, &b}) t->stop();
 }
 
 // ── What a relayed response keeps, and what a forwarded request drops ─────────────
