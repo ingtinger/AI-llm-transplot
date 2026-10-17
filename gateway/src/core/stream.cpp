@@ -109,6 +109,9 @@ namespace llmbridge::detail
     // drained finalizes.
     void Engine::stream_flush(ClientConn* client) noexcept
     {
+        // A hedge is settled by the first token, not by the head: a head can precede an error.
+        const ReqState& f = client->req.f;
+        if (f.hedge_n && (f.ts_first_token || f.ts_first_thinking || f.stream_ended)) settle_hedge(client);
         const uint64_t sent = client->sent_bytes;
         const Sent s = _ops->send(*client);
         // A client draining a paused stream is progress, though the upstream is silent.
@@ -167,8 +170,9 @@ namespace llmbridge::detail
                  " tokens_in=", stream_tokens(client).in,
                  " tokens_out=", stream_tokens(client).out,
                  " on ", *client);
-        // Only a clean end is a served request; an abort was counted in errors.
-        if (!client->close_after_resp)
+        // Only a clean end is a served request; an abort was counted in errors. A hedge
+        // leg is no client's request.
+        if (!client->close_after_resp && !client->shadow)
         {
             ++_stats.requests;
             stream_record_latency(client);
@@ -176,7 +180,7 @@ namespace llmbridge::detail
         if (_sink) sink_emit(client, 200, /*streamed=*/true);
 
         // Keep the connection when the framing gave the body an end marker.
-        if (!stream_client_reusable(client))
+        if (client->shadow || !stream_client_reusable(client))
         {
             _ops->close(*client);
             return;
@@ -199,7 +203,7 @@ namespace llmbridge::detail
                 " on ", *client);
         client->req.f.stream_ended = true;      // no more output will be produced
         client->close_after_resp = true;  // close once the client drains what we have
-        ++_stats.errors;                  // and it counts as a failure, not a finish
+        if (!client->shadow) ++_stats.errors; // and it counts as a failure, not a finish
     }
 
 } // namespace llmbridge::detail

@@ -33,6 +33,7 @@ namespace llmbridge::detail
     // client sees a truncated stream, not a fabricated clean finish.
     void Engine::sweep_idle() noexcept
     {
+        bury_shadows(); // every backend calls this between events, where nothing holds a leg
         const int64_t now = now_ns();
         if (now - _last_sweep_ns < 50'000'000LL) return;
         _last_sweep_ns = now;
@@ -62,7 +63,9 @@ namespace llmbridge::detail
         resolve_unaddressed();
 
         // Backwards, so the swap a close makes in the registry moves an already-visited
-        // client into this slot. A teardown removes at most its own client.
+        // client into this slot. A teardown removes its own client, and a hedged one its legs
+        // (GATEWAY-INTERNALS.md 13), whose swaps can move a visited client below `i`: it is
+        // looked at twice, and every check is a deadline the first look already settled.
         for (size_t i = _clients->size(); i-- > 0;)
         {
             if (i >= _clients->size()) continue;

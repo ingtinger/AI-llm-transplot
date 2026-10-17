@@ -9,6 +9,7 @@ add_library(gateway STATIC
         src/resolve.cpp
         src/core/body.cpp
         src/core/client.cpp
+        src/core/hedge.cpp
         src/core/pool.cpp
         src/core/sink.cpp
         src/core/stream.cpp
@@ -17,6 +18,7 @@ add_library(gateway STATIC
         src/core/upstream.cpp
         src/facade.cpp
         src/io/epoll_io.cpp
+        src/io/shadow_io.cpp
         src/io/uring_io.cpp
         src/request.cpp
         src/response.cpp

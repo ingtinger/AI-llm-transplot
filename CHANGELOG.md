@@ -8,6 +8,57 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.102.0]. 2026-10-17
+
+A request can go to several venues at once. The decision's own venue serves the client, and
+every other leg still waiting when it answers is reset; each leg is a request of its own,
+with its own key and its own record. GATEWAY-INTERNALS.md 13.
+
+### Added
+
+- **`Decision::hedge` and `Decision::hedge_legs`**, appended last: up to `kMaxHedgeLegs` (3)
+  more venues, each a `HedgeLeg` with its own `upstream_index`, `model`, `service_tier`,
+  `speed`, `inference_geo`, `anthropic_beta` and a required `credential_header`. Every leg
+  is sent the same request at once, rebuilt for its venue with its own key and no other.
+  The body is held to its last byte first, on a decision taken on the head too, and a
+  confirm that adds a hedge to a body already streaming redoes it held.
+- **The legs are cut once the decision's own leg has its answer**: a whole reply, a
+  stream's first token or thinking delta (not its head), or the client leaving. A cut leg's
+  venue is reset (`SO_LINGER` 0) and never pooled, the only way HTTP/1.1 tells a venue to
+  stop generating. A leg that answers first runs to its end, its reply dropped.
+- **`RequestRecord::hedged`, `hedge_group`, `hedge_leg`, `hedge_won` and `hedge_cut`**,
+  appended: one record per leg, each `hedged` and with its own `seq`, grouped by the client
+  request's seq. A process's first request has seq 0, so `hedged`, never the group, marks a
+  hedge. A cut leg has status 0 and no token counts, since its usage never arrived.
+- **`Stats::hedged_requests`, `hedge_legs` and `hedge_legs_cut`**. No leg counts in
+  `requests` or `errors`.
+
+### Security
+
+- **No leg goes without a key of its own.** A hedge whose decision or any leg names no
+  `credential_header` is a 500 before any venue is contacted: the client's own key would
+  otherwise reach every leg's venue, companies it was never meant for. So is a leg past the table,
+  which never falls back to venue 0, and an over-long override or a beta that is not a
+  token. Tested with three venues and three keys, each venue receiving its own once and
+  neither other.
+- **A leg is never failed over**: the policy hears its failure with `retryable` false.
+
+### Changed
+
+- **ABI: rebuild a policy and a sink against these headers.** `Decision` and
+  `RequestRecord` grew. Source compatible: existing designated initializers are unchanged.
+
+### Tests
+
+- `ProxyHedge.*` on both backends: each leg's key alone at its venue; the losing legs reset
+  and unpooled, counted, and no leg in `requests`; one record per leg in one group, cut
+  legs with status 0 and no tokens; a stream cutting at its first token; nine malformed
+  hedges each a 500 that reaches no venue; a failing leg heard and never failed over; a
+  body decided on its head reaching every leg whole and none before; a client leaving
+  cutting every leg. Five mutations each fail the tests that guard them: a leg sending the
+  decision's key, a cut without a reset, failover left on, the body not held, and no cut
+  when the client leaves.
+
 ## [0.101.0]. 2026-10-15
 
 A policy hears what each venue answered, not only which ones failed: a venue's own 503 is

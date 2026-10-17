@@ -455,8 +455,9 @@ namespace llmbridge::detail
         // routes only those that are safe to redo. Every precondition here is about safety,
         // not policy: a response byte in means the venue may have acted, so a re-send could
         // duplicate it; re-sending one we no longer hold is impossible; and an unbounded
-        // chain turns one dead provider into a latency multiplier.
-        const bool retryable = _upstreams.size() >= 2 && client->req.can_redispatch() &&
+        // chain turns one dead provider into a latency multiplier. A hedge is its own
+        // redundancy: a leg that fails is counted, never sent again.
+        const bool retryable = _upstreams.size() >= 2 && !rf.hedged && client->req.can_redispatch() &&
                                (!client->req.saved.empty() || rf.body_in_rbuf) &&
                                rf.failover_attempts < kMaxFailoverAttempts - 1;
         const FailureFacts f{.upstream_index = client->upstream_slot, .status = status, .reason = why,

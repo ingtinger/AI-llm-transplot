@@ -1044,3 +1044,59 @@ own tier the splice blanked, as a held rewrite records the one it replaced.
 
 **Not done.** The held rewrite parses with unique keys at every depth, so it refuses a body
 that repeats a key inside a nested object; spliced, as substituted (12d), that body streams.
+
+## 13. Hedged requests (`Decision::hedge`)
+
+A decision may name up to `kMaxHedgeLegs` more venues, its legs. Each is sent the same
+request at once, as a request of its own: its own seq, venue, overrides, key and record.
+
+**A leg is a client connection with no socket.** `spawn_hedge` (`core/hedge.cpp`) makes a
+`ClientConn` per leg with `shadow` set, copies the framed request into its `rbuf` and the
+client's `ReqState` into its own (the same arrival: stamps, head facts, captured headers,
+model), gives it a seq, applies the leg through `apply_decision` and dispatches it. From
+there it is an ordinary request: its venue's translation, its overrides, `named_key` for
+its own key header and no other, the pool, the stale-connection retry, the sweep's
+timeouts, `on_reply` and `on_failure`. The cost is one copy of the request per leg, besides
+the send buffer every request is built into.
+
+**The seam.** `Engine::_ops` is a `ShadowIo` (`io/shadow_io.cpp`), which hands every call
+to the running backend except a shadow's: its send marks the staged bytes sent and returns
+`Done`, its `set_read` does nothing, and its close is `close_shadow`. So the lifecycle runs
+unchanged for a leg and no backend ever sees one. A closed leg is unlinked from its client
+and freed at the next `sweep_idle`, between events: a caller up the stack may still hold
+it, and no completion will ever arrive to free it.
+
+**Which leg serves.** The decision's own leg is the client's request and serves it. Once it
+has its answer, a reply staged (`respond`) or a stream's first token or thinking delta, or
+its end (`stream_flush`), `settle_hedge` cuts every leg still open; so does the client
+closing (`forget`). A leg that answers before then runs to its own end, its reply dropped.
+
+**A cut.** `cut_leg` marks the leg cut, resets its venue (`reset_venue`: `SO_LINGER` 0,
+never pooled), records it and closes it. A connection mid-request cannot be pooled, and a
+reset is the only way HTTP/1.1 tells a venue to stop generating.
+
+**Records.** One per leg, each `hedged`: its own seq, `hedge_group` the client request's
+seq, `hedge_leg` 0 for the decision's own. The first request a process frames has seq 0, so
+`hedged` marks a hedge and never a group of 0; failover is turned off by the same flag. `hedge_won` marks the leg that served; `hedge_cut` a cut one,
+with status 0 and no token counts, since a cut stream never reaches its usage. A leg that
+ends with no record, a stream cut short, is recorded by `close_shadow`. The client's own leg
+leaves none if the client leaves mid-request, as no request does.
+
+**Refused, a 500 with no venue contacted.** More than `kMaxHedgeLegs` legs, or a count with
+no legs; a decision with no `credential_header`, since one client key would reach every
+leg's venue; a substitution; a leg past the table (no leg falls back to venue 0); a leg
+with no usable key header, an override longer than the gateway holds, or a beta that is not
+a token.
+
+**Held.** A hedge holds the body to its last byte: `decide_on_head` sets `held`, and a
+confirm that adds a hedge to a body already streaming redoes it held (12c). `spawn_hedge`
+refuses a body that reached dispatch incomplete with a 500; nothing reaches that.
+
+**Never failed over.** `failover_target` offers no leg a retry: the policy hears each
+failure with `retryable` false, counts it, and its answer is ignored.
+
+**Counted.** `hedged_requests`, `hedge_legs` and `hedge_legs_cut`. No leg counts in
+`requests` or `errors`, which count what clients got.
+
+**Not done.** Any leg serving the client, the first to answer winning. The body streamed to
+every leg as it arrives.

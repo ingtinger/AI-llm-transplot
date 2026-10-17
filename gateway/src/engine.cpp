@@ -209,6 +209,7 @@ namespace llmbridge::detail
         _clients->clear(release);
         _upconns->clear(release);
         _doomed->clear(release);
+        bury_shadows();
         if (_listen_fd >= 0) ::close(_listen_fd);
     }
 
@@ -280,6 +281,9 @@ namespace llmbridge::detail
                << " model_padded=" << _stats.streamed_model_padded
                << " override_spliced=" << _stats.streamed_override_spliced
                << " override_redone=" << _stats.streamed_override_redone << "\n";
+        if (_stats.hedged_requests > 0)
+            os << "hedged_requests=" << _stats.hedged_requests << " hedge_legs=" << _stats.hedge_legs
+               << " hedge_legs_cut=" << _stats.hedge_legs_cut << "\n";
         std::fputs(os.str().c_str(), out);
     }
 
@@ -348,7 +352,8 @@ namespace llmbridge::detail
 
     void Engine::attach(IoOps* io, const IoCaps& caps) noexcept
     {
-        _ops = io;
+        _shadow_io.inner = io;
+        _ops = io ? &_shadow_io : nullptr;
         _caps = caps;
     }
 

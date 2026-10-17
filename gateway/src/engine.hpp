@@ -46,6 +46,23 @@ namespace llmbridge
 namespace llmbridge::detail
 {
     struct NamedKey;
+    class Engine;
+
+    /// The backend seam with hedge legs in front of it (GATEWAY-INTERNALS.md 13): a leg has
+    /// no socket, so what would be written to it is dropped and its close is the engine's.
+    class ShadowIo final : public IoOps
+    {
+      public:
+        explicit ShadowIo(Engine& e) noexcept : _e(e) {}
+        Sent send(ConnBase& c) noexcept override;
+        int connect(UpstreamConn& u) noexcept override;
+        void set_read(ConnBase& c, bool on) noexcept override;
+        void close(ConnBase& c) noexcept override;
+        IoOps* inner = nullptr; ///< the running backend
+
+      private:
+        Engine& _e;
+    };
 
     /// One per worker thread. Internal: the facade, the backends and core/ reach in.
     class Engine
@@ -141,7 +158,8 @@ namespace llmbridge::detail
         [[nodiscard]] size_t decide_want(const net::http::Message& m) const noexcept;
         void decide_on_head(ClientConn* c, const net::http::Message& m, const HeadFacts& f,
                             int64_t t0) noexcept;
-        [[nodiscard]] Decision decision_in_effect(const ClientConn* c) const noexcept;
+        /// `legs` holds kMaxHedgeLegs, the decision's hedge views into the request's copies.
+        [[nodiscard]] Decision decision_in_effect(const ClientConn* c, HedgeLeg* legs) const noexcept;
         bool confirm_body(ClientConn* c, int64_t t) noexcept; // true: the last byte goes as decided
         /// The bookkeeping half of a close: unpaired, deregistered, doomed. Returns a
         /// client's upstream, which the backend closes too.
@@ -212,6 +230,18 @@ namespace llmbridge::detail
         static void stream_warn_if_encoded(const ClientConn* client, const net::http::ResponseHead& h) noexcept;
         void stream_record_latency(const ClientConn* client) noexcept;
         void stream_truncate(ClientConn* client) noexcept; // no [DONE]: the three mutations together
+
+        // Hedges (core/hedge.cpp): GATEWAY-INTERNALS.md 13.
+        bool apply_hedge(ClientConn* c, const Decision& d) noexcept; // false: refused, replied
+        bool spawn_hedge(ClientConn* c) noexcept;  // a leg per venue named, sent now; false: refused, replied
+        void settle_hedge(ClientConn* c) noexcept; // its own leg has an answer: cut the rest
+        void cut_leg(ClientConn* s) noexcept;      // recorded as cut, its venue reset
+        void close_shadow(ClientConn* s) noexcept; // a leg is over, recorded if it was not
+        void bury_shadows() noexcept;              // free the legs closed since the last call
+        ShadowIo _shadow_io{*this};
+        /// Closed legs, freed at the next bury_shadows(): a caller up the stack may still
+        /// hold one, and no backend event ever reaches one to free it.
+        std::vector<ClientConn*> _dead_shadows;
 
         // The sink (core/sink.cpp) and the sweep (core/sweep.cpp).
         void sink_capture(ClientConn* c) noexcept;
