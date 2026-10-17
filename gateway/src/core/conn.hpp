@@ -114,6 +114,12 @@ namespace llmbridge
         int upstream_slot = -1;
         bool close_after_resp = false; ///< an error reply, or a truncated stream: close once flushed
         bool ever_framed = false;
+        /// A hedge leg's own request (GATEWAY-INTERNALS.md 13): no socket, and what it would
+        /// write to a client is dropped. `hedge_of` is the client it was sent for, which keeps
+        /// its live legs in `hedge_legs`; whichever goes first clears the link.
+        bool shadow = false;
+        ClientConn* hedge_of = nullptr;
+        ClientConn* hedge_legs[kMaxHedgeLegs] = {};
         int64_t ts_accepted = 0;
         int64_t ts_first_byte = 0; ///< the first byte of the request being buffered
         /// When this connection last completed a request, for the idle deadline; the

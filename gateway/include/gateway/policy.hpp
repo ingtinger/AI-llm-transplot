@@ -117,6 +117,24 @@ namespace llmbridge
         return true;
     }
 
+    /// At most this many venues besides the decision's own hear a hedged request.
+    inline constexpr size_t kMaxHedgeLegs = 3;
+
+    /// One more venue a hedged request goes to (Decision::hedge), each field as Decision's
+    /// own and copied like them: GATEWAY-INTERNALS.md 13.
+    struct HedgeLeg
+    {
+        int upstream_index = -1; ///< in range, or the request is a 500: a leg never falls back to venue 0
+        std::string_view model{};
+        std::string_view service_tier{};
+        std::string_view speed{};
+        std::string_view inference_geo{};
+        std::string_view anthropic_beta{};
+        /// Required, key_header_ok: a client's own key sent to several venues would reach
+        /// companies it was never meant for.
+        std::string_view credential_header{};
+    };
+
     struct Decision
     {
         /// `= false` so `Decision d;` refuses too; `Decision{}` zeroes it either way.
@@ -169,6 +187,15 @@ namespace llmbridge
         /// Copied, like `model`. kottos sets `"auto"` and the model it routes "auto" to.
         std::string_view substitute_model{};
         std::string_view substitute_for{};
+
+        /// A hedge: the request also goes, at once, to each of `hedge_legs` more venues (at
+        /// most kMaxHedgeLegs), each leg its own request with its own record. The body is
+        /// held to its last byte first, as with `hold`. The decision's own leg serves the
+        /// client, and the others are reset unanswered once its first token arrives. The
+        /// decision names a credential_header too, and makes no substitution, or the
+        /// request is a 500. Valid until decide() returns; the gateway copies the legs.
+        const HedgeLeg* hedge = nullptr;
+        uint8_t hedge_legs = 0;
     };
 
     /// A venue did not answer (refused connect, failed write, EOF or silence before the

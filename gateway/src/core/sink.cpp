@@ -192,6 +192,12 @@ namespace llmbridge::detail
         r.service_tier_spliced = (c->req.f.members_spliced & provider::BodyScan::kServiceTier) != 0;
         r.speed_spliced = (c->req.f.members_spliced & provider::BodyScan::kSpeed) != 0;
         r.inference_geo_spliced = (c->req.f.members_spliced & provider::BodyScan::kInferenceGeo) != 0;
+        r.hedged = c->req.f.hedged;
+        r.hedge_group = c->req.f.hedge_group;
+        r.hedge_leg = c->req.f.hedge_leg;
+        r.hedge_won = c->req.f.hedge_won;
+        r.hedge_cut = c->req.f.hedge_cut;
+        c->req.f.sunk = true;
         _sink->on_request(r);
     }
 

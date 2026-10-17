@@ -196,7 +196,7 @@ namespace llmbridge::detail
             return error_respond(c, 400, kWhyKeyUnusable, refuse::kKeyHeaderUnusable), false;
         f.key_header.set(d.credential_header);
         f.policy_tag = d.tag;
-        return true;
+        return apply_hedge(c, d);
     }
 
     size_t Engine::decide_want(const net::http::Message& m) const noexcept
@@ -231,15 +231,25 @@ namespace llmbridge::detail
             return error_respond(c, d.deny_status, d.reason, d.message, /*keep=*/true);
         }
         if (!apply_decision(c, d)) return;
-        f.held = d.hold;
-        start_body(c, !d.hold && overrides_stream(c, /*at_head=*/true) &&
+        f.held = d.hold || f.hedge_n != 0; // every hedge leg is sent the whole body
+        start_body(c, !f.held && overrides_stream(c, /*at_head=*/true) &&
                           venue_streams(client_dialect_of(c->rbuf), c->upstream_slot));
     }
 
     // The decision in force, as confirm() is handed it: the venue serving now, never -1.
-    Decision Engine::decision_in_effect(const ClientConn* c) const noexcept
+    Decision Engine::decision_in_effect(const ClientConn* c, HedgeLeg* legs) const noexcept
     {
+        const ReqState& f = c->req.f;
+        for (uint8_t i = 0; i < f.hedge_n; ++i)
+        {
+            const HedgeLegCopy& k = f.hedge[i];
+            legs[i] = HedgeLeg{.upstream_index = k.venue, .model = k.model.view(), .service_tier = k.tier.view(),
+                               .speed = k.speed.view(), .inference_geo = k.geo.view(),
+                               .anthropic_beta = k.beta.view(), .credential_header = k.key.view()};
+        }
         Decision d{};
+        d.hedge = f.hedge_n ? legs : nullptr;
+        d.hedge_legs = f.hedge_n;
         d.allow = true;
         d.upstream_index = c->upstream_slot;
         d.model = c->req.f.model_override.view();
@@ -263,7 +273,8 @@ namespace llmbridge::detail
         ReqState& f = c->req.f;
         f.confirm_pending = false;
         const RequestFacts whole = facts_of(c, /*whole=*/true);
-        const Decision d = _policy->confirm(whole, decision_in_effect(c));
+        HedgeLeg legs[kMaxHedgeLegs];
+        const Decision d = _policy->confirm(whole, decision_in_effect(c, legs));
         if (!d.allow)
         {
             f.confirm_outcome = ConfirmOutcome::Refused;
@@ -294,8 +305,10 @@ namespace llmbridge::detail
             return v.empty() && f.splice ? client_member(c, bit) : v;
         };
         using provider::BodyScan;
+        // A hedge sends every leg the whole body, so one that went streaming is redone held.
         const bool same =
-            slot == c->upstream_slot && served(d.model, d.substitute_model, d.substitute_for) == now &&
+            (d.hedge_legs == 0 || f.body_parked) && slot == c->upstream_slot &&
+            served(d.model, d.substitute_model, d.substitute_for) == now &&
             member(d.service_tier, BodyScan::kServiceTier) == member(f.tier_override.view(), BodyScan::kServiceTier) &&
             member(d.speed, BodyScan::kSpeed) == member(f.speed_override.view(), BodyScan::kSpeed) &&
             member(d.inference_geo, BodyScan::kInferenceGeo) == member(f.geo_override.view(), BodyScan::kInferenceGeo) &&
@@ -315,6 +328,7 @@ namespace llmbridge::detail
                 if (f.members_spliced & BodyScan::kServiceTier) f.asked_tier.set(client_member(c, BodyScan::kServiceTier));
             }
             if (!f.body_parked) return true;
+            if (!apply_hedge(c, d)) return false; // the legs the confirm named, or the ones in force
         }
         else
         {
@@ -374,6 +388,8 @@ namespace llmbridge::detail
 
     void Engine::dispatch(ClientConn* c) noexcept
     {
+        // The legs first, while the request is still whole at the front of rbuf.
+        if (c->req.f.hedge_n && !c->req.f.hedged && !spawn_hedge(c)) return;
         // Resolved per attempt: a failover may land on a venue of another dialect. The
         // client dialect is read off the request line, back in rbuf for a failover.
         const Upstream& up = upstream_of(c);
@@ -503,7 +519,8 @@ namespace llmbridge::detail
         // with nothing owed, is no request: counting one wiped the real one's state.
         if (c->req.f.phase != Phase::Replying) return;
         // An error reply is counted in errors; its stamps are unset, so not in a histogram.
-        if (!c->close_after_resp && !c->req.f.reply_kept)
+        // A hedge leg is no client's request.
+        if (!c->close_after_resp && !c->req.f.reply_kept && !c->shadow)
         {
             const int64_t ts_resp_sent = now_ns(); // t6
             if (ts_resp_sent - _t_start >= _warmup_ns)
@@ -526,7 +543,7 @@ namespace llmbridge::detail
                  " tokens_out=", c->req.f.tok.out, " keep_alive=", c->msg.keep_alive, " on ", *c);
         c->out.clear();
         c->req.f.phase = Phase::Idle;
-        const bool close_now = c->close_after_resp || !c->msg.keep_alive;
+        const bool close_now = c->shadow || c->close_after_resp || !c->msg.keep_alive;
         c->msg = net::http::Message{};
         if (close_now && c->req.discard) c->req.close_on_drain = true; // after the body it still sends
         else if (close_now) return _ops->close(*c);
@@ -535,6 +552,7 @@ namespace llmbridge::detail
 
     void Engine::respond(ClientConn* client) noexcept
     {
+        if (client->req.f.hedge_n) settle_hedge(client); // its own leg has the answer
         switch (_ops->send(*client))
         {
             case Sent::Done: finish(client); return;
@@ -552,7 +570,17 @@ namespace llmbridge::detail
         _clients->remove(c);
         LB_DEBUG("close ", *c, " clients=", _clients->size());
         c->doomed = true;
+        if (c->shadow)
+        {
+            if (ClientConn* p = c->hedge_of)
+                for (ClientConn*& l : p->hedge_legs)
+                    if (l == c) l = nullptr;
+            c->hedge_of = nullptr;
+            _dead_shadows.push_back(c);
+            return u;
+        }
         _doomed->add(c);
+        if (c->req.f.hedge_n) settle_hedge(c); // a client gone takes its legs with it
         return u;
     }
 
@@ -575,8 +603,9 @@ namespace llmbridge::detail
     void Engine::abort_pair(ClientConn* client) noexcept
     {
         if (!client) return;
+        const bool leg = client->shadow; // read first: a close may free the client at once
         _ops->close(*client); // and its upstream
-        ++_stats.errors;
+        if (!leg) ++_stats.errors;
     }
 
     void Engine::fail_request(ClientConn* client, int code, const char* why) noexcept
@@ -614,7 +643,7 @@ namespace llmbridge::detail
         // Closes once the reply flushes; kept, once the rest of the body is dropped.
         client->req.f.reply_kept = keep;
         client->close_after_resp = !keep;
-        ++_stats.errors;
+        if (!client->shadow) ++_stats.errors;
         respond(client);
     }
 

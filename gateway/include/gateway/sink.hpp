@@ -176,6 +176,16 @@ namespace llmbridge
         bool service_tier_spliced = false;
         bool speed_spliced = false;
         bool inference_geo_spliced = false;
+        /// A hedged request (Decision::hedge) leaves one record per leg, each `hedged` and with
+        /// its own `seq`. `hedge_group` is the client request's seq on every one of them, read
+        /// only when `hedged` (a seq may be 0), and `hedge_leg` 0 is the decision's own venue.
+        /// `hedge_won`: the leg that served the client. `hedge_cut`: reset unanswered, with
+        /// `status` 0 and no token counts, because another leg won.
+        bool hedged = false;
+        uint64_t hedge_group = 0;
+        uint8_t hedge_leg = 0;
+        bool hedge_won = false;
+        bool hedge_cut = false;
     };
 
     /// Called on the loop thread once per completed request, streams included.

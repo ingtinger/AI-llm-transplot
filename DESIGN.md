@@ -662,6 +662,19 @@ traffic and crossing the idle line far more often, and every crossing costs the 
 request a reconnect and a TLS handshake. That is what `--pool-idle` exists to tune, and
 its 30 s default was chosen when there was one pool.
 
+### Several venues at once (`Decision::hedge`)
+
+A decision may also name up to three more venues, each a `HedgeLeg` with its own venue,
+overrides and key header, and the request goes to all of them at once. The gateway decides
+nothing here: which venues, and whether to hedge at all, is the policy's, as every choice
+of venue is. What it guarantees is the mechanism. Each leg is rebuilt for its own venue
+with its own key and no other, which is why every leg, the decision included, must name a
+`credential_header`. The body is held to its last byte, so every leg gets all of it. The
+decision's own leg serves the client, and once it has an answer (a reply, or a stream's
+first token) every leg still waiting is reset, never pooled. Each leg leaves its own sink
+record, grouped by `hedge_group`, because each was a real request a venue may bill.
+GATEWAY-INTERNALS.md 13.
+
 ### Venue addresses
 
 A venue is dialled at `Upstream::ip`. Given a list (`ips`), a failed connect moves it to

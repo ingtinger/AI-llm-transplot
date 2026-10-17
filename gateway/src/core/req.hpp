@@ -90,6 +90,16 @@ namespace llmbridge
         uint8_t anthropic_betas = 0;
     };
 
+    /// A hedge leg as Decision::hedge named it, copied: GATEWAY-INTERNALS.md 13.
+    struct HedgeLegCopy
+    {
+        int venue = -1;
+        FixedStr<255> model;
+        FixedStr<32> tier, speed, geo;
+        FixedStr<kMaxBetaToken> beta;
+        FixedStr<kMaxKeyHeaderName> key;
+    };
+
     /// Everything a request owns that is trivially copyable. Never assigned field by
     /// field to reset it: begin() constructs a fresh one in place.
     struct ReqState
@@ -222,6 +232,20 @@ namespace llmbridge
         /// those the venue got spliced, at a confirm that kept the body.
         uint8_t members_tracked = 0;
         uint8_t members_spliced = 0;
+
+        /// A hedge (GATEWAY-INTERNALS.md 13): the legs a decision named beside its own, sent
+        /// once the body is whole, and from then `hedged` on every leg, the client's own
+        /// included. On each leg's record: the client request's seq (which may be 0, so
+        /// never the mark of a hedge), the leg, and whether it served the client or was cut.
+        /// `sunk`: this request's record has gone to the sink.
+        HedgeLegCopy hedge[kMaxHedgeLegs];
+        uint64_t hedge_group = 0;
+        uint8_t hedge_n = 0;
+        uint8_t hedge_leg = 0;
+        bool hedged = false;
+        bool hedge_won = false;
+        bool hedge_cut = false;
+        bool sunk = false;
 
         /// BodyScan's bits for the service_tier, speed and inference_geo overrides in force.
         [[nodiscard]] uint8_t member_overrides() const noexcept
