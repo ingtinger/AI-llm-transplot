@@ -234,10 +234,11 @@ namespace llmbridge
         uint8_t members_spliced = 0;
 
         /// A hedge (GATEWAY-INTERNALS.md 13): the legs a decision named beside its own, sent
-        /// once the body is whole, and from then `hedged` on every leg, the client's own
-        /// included. On each leg's record: the client request's seq (which may be 0, so
-        /// never the mark of a hedge), the leg, and whether it served the client or was cut.
-        /// `sunk`: this request's record has gone to the sink.
+        /// once the body is whole, and from then `hedged` on every leg. On each leg's record:
+        /// the client request's seq (which may be 0, so never the mark of a hedge), the leg,
+        /// and whether it served the client or was cut. `error_owed`: a leg failed, counted in
+        /// `errors` only if it reaches the client. `sunk`: this request's record has gone, or
+        /// is not to go, to the sink.
         HedgeLegCopy hedge[kMaxHedgeLegs];
         uint64_t hedge_group = 0;
         uint8_t hedge_n = 0;
@@ -245,6 +246,7 @@ namespace llmbridge
         bool hedged = false;
         bool hedge_won = false;
         bool hedge_cut = false;
+        bool error_owed = false;
         bool sunk = false;
 
         /// BodyScan's bits for the service_tier, speed and inference_geo overrides in force.

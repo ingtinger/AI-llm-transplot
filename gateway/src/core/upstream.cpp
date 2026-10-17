@@ -365,7 +365,7 @@ namespace llmbridge::detail
             // as a completion would fail and reach the client as a generic 502.
             append_relayed_reply(client->out.stage(), h.status, up_head,
                                  provider::upstream_error_to_openai(body, "upstream_error"), false);
-            ++_stats.errors;
+            count_error(client);
         }
         else if (client->req.f.translate_body)
         {

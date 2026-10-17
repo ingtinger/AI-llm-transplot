@@ -388,8 +388,9 @@ namespace llmbridge::detail
 
     void Engine::dispatch(ClientConn* c) noexcept
     {
-        // The legs first, while the request is still whole at the front of rbuf.
-        if (c->req.f.hedge_n && !c->req.f.hedged && !spawn_hedge(c)) return;
+        // A hedge sends its legs instead, each a request of its own, while the request is
+        // still whole at the front of rbuf.
+        if (c->req.f.hedge_n && !c->req.f.hedged) return (void)spawn_hedge(c);
         // Resolved per attempt: a failover may land on a venue of another dialect. The
         // client dialect is read off the request line, back in rbuf for a failover.
         const Upstream& up = upstream_of(c);
@@ -537,7 +538,7 @@ namespace llmbridge::detail
                 ++_stats.requests;
             }
         }
-        if (_sink) sink_emit(c, status_of(c->out.bytes()), /*streamed=*/false);
+        if (_sink && !c->req.f.sunk) sink_emit(c, status_of(c->out.bytes()), /*streamed=*/false);
         LB_DEBUG(ReqId{c->req.f.req_seq}, " status=", status_of(c->out.bytes()),
                  " bytes=", c->out.bytes().size(), " tokens_in=", c->req.f.tok.in,
                  " tokens_out=", c->req.f.tok.out, " keep_alive=", c->msg.keep_alive, " on ", *c);
@@ -552,7 +553,13 @@ namespace llmbridge::detail
 
     void Engine::respond(ClientConn* client) noexcept
     {
-        if (client->req.f.hedge_n) settle_hedge(client); // its own leg has the answer
+        // A hedge leg's reply while its client waits wins the client if it is a success, or if
+        // no other leg is left to answer; any other is only recorded (GATEWAY-INTERNALS.md 13).
+        if (client->shadow && client->hedge_of && client->hedge_of->hedge_open)
+        {
+            const int status = status_of(client->out.bytes());
+            if ((status >= 200 && status < 300) || leg_alone(client)) client = adopt_leg(client);
+        }
         switch (_ops->send(*client))
         {
             case Sent::Done: finish(client); return;
@@ -580,7 +587,7 @@ namespace llmbridge::detail
             return u;
         }
         _doomed->add(c);
-        if (c->req.f.hedge_n) settle_hedge(c); // a client gone takes its legs with it
+        if (c->hedge_open) settle_hedge(c); // a client gone takes its legs with it
         return u;
     }
 
@@ -643,7 +650,7 @@ namespace llmbridge::detail
         // Closes once the reply flushes; kept, once the rest of the body is dropped.
         client->req.f.reply_kept = keep;
         client->close_after_resp = !keep;
-        if (!client->shadow) ++_stats.errors;
+        count_error(client);
         respond(client);
     }
 

@@ -234,8 +234,12 @@ namespace llmbridge::detail
         // Hedges (core/hedge.cpp): GATEWAY-INTERNALS.md 13.
         bool apply_hedge(ClientConn* c, const Decision& d) noexcept; // false: refused, replied
         bool spawn_hedge(ClientConn* c) noexcept;  // a leg per venue named, sent now; false: refused, replied
-        void settle_hedge(ClientConn* c) noexcept; // its own leg has an answer: cut the rest
+        [[nodiscard]] ClientConn* new_leg(ClientConn* c, uint8_t i) noexcept; // made and linked, not sent
+        ClientConn* adopt_leg(ClientConn* s) noexcept; // `s` won: the client it serves, now holding it
+        [[nodiscard]] static bool leg_alone(const ClientConn* s) noexcept; // no other leg is still live
+        void settle_hedge(ClientConn* c) noexcept; // the race is over: cut every leg still live
         void cut_leg(ClientConn* s) noexcept;      // recorded as cut, its venue reset
+        void count_error(ClientConn* c) noexcept;  // in `errors`, or on a leg once it reaches its client
         void close_shadow(ClientConn* s) noexcept; // a leg is over, recorded if it was not
         void bury_shadows() noexcept;              // free the legs closed since the last call
         ShadowIo _shadow_io{*this};

@@ -70,9 +70,11 @@ namespace llmbridge::detail
         {
             if (i >= _clients->size()) continue;
             ClientConn* c = (*_clients)[i];
-            const bool busy = c->up != nullptr || c->req.f.streaming || c->req.f.body_parked;
+            const bool busy = c->up != nullptr || c->req.f.streaming || c->req.f.body_parked || c->hedge_open;
             in_flight += busy;
-            sweep_client(c, now, busy);
+            // A client waiting on its hedge has no venue of its own: each leg keeps its own
+            // deadlines, and the last to go answers the client.
+            if (!c->hedge_open) sweep_client(c, now, busy);
         }
 
         if (beat)
