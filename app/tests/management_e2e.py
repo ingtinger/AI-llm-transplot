@@ -142,6 +142,19 @@ def main(binary: Path) -> None:
             with socket.create_connection(("127.0.0.1", admin_port), timeout=5) as oversized:
                 oversized.sendall(b"GET /health HTTP/1.1\r\nX-Large: " + b"a" * 2100 + b"\r\n\r\n")
                 assert b"431 Request Header Fields Too Large" in oversized.recv(256)
+            # 请求体与短请求头同批到达时，大小限制只应计算头部。
+            with socket.create_connection(("127.0.0.1", admin_port), timeout=5) as body_request:
+                body_request.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" + b"x" * 3000)
+                assert b"200 OK" in body_request.recv(256)
+            # 分段发送的未完成请求头必须在固定期限内释放管理线程。
+            with socket.create_connection(("127.0.0.1", admin_port), timeout=5) as slow_header:
+                slow_header.sendall(b"GET /health HTTP/1.1\r\nX-Slow: ")
+                for _ in range(2):
+                    time.sleep(0.6)
+                    slow_header.sendall(b"a")
+                time.sleep(1.0)
+                assert b"408 Request Timeout" in slow_header.recv(256)
+            assert get(admin_port, "/health") == (200, "ok\n")
             with socket.socket() as sock:
                 sock.settimeout(0.2)
                 assert sock.connect_ex(("127.0.0.2", admin_port)) != 0

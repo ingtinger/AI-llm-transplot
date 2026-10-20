@@ -1,0 +1,30 @@
+# AI-llm-transplot 扩展：单机 systemd 服务示例，遵循 Apache-2.0 许可证。
+[Unit]
+Description=AI-llm-transplot gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-gateway
+Group=ai-gateway
+EnvironmentFile=/etc/ai-llm-transplot/credentials.env
+ExecStart=/usr/local/bin/llmbridge --config /etc/ai-llm-transplot/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

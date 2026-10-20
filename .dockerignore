@@ -1,5 +1,7 @@
 .git
 build*
+deploy/.env
+deploy/certs
 cmake-build-*
 bench/.enterpilot
 bench/.litellm-venv*

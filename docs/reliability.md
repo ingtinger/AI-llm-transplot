@@ -70,3 +70,9 @@ TSan 要单独构建，不能与 ASan 同时链接。**本机 WSL2** 下直接�
 - TLS 测试使用本地证书与 Mock，仍需在部署环境验证证书来源、有效期、权限和轮换。
 - 单机内存限额不提供多实例精确计费；显式开启不安全重放可能重复执行上游请求。
 - Docker/Compose、systemd、压力基准和生产网络限制属于阶段五后续任务。
+
+## 2026-10-20 续开发验证
+
+修复管理端点的请求头长度判定和慢速请求头占用问题后，普通 Release / `LLMBRIDGE_WERROR=ON` 构建通过，完整 CTest **2216/2216 通过**。`AppManagement` 新增短请求头与大请求体同批到达、慢速请求头两种真实进程场景。独立的 `LLMBRIDGE_TLS=ON` / `LLMBRIDGE_BUILD_TESTS=OFF` / `LLMBRIDGE_WERROR=ON` 构建也通过，网关二进制可执行 `--help`。
+
+新增的 Docker Compose、镜像与 systemd 样例已完成 JSON/YAML 语法及配置解析检查；本机无 Docker，未执行容器启动或故障切换演示。systemd 静态检查只提示示例路径 `/usr/local/bin/llmbridge` 尚未在本机安装，部署时须先安装二进制、配置与证书。

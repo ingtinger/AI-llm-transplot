@@ -95,7 +95,8 @@ if (LLMBRIDGE_BUILD_TESTS)
     add_executable(app_options_test tests/config_test.cpp tests/cli_test.cpp tests/routing_policy_test.cpp)
     target_link_libraries(app_options_test PRIVATE llmbridge_options GTest::gtest_main)
     target_compile_definitions(app_options_test PRIVATE
-            LLMBRIDGE_EXAMPLE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/llmbridge.example.json")
+            LLMBRIDGE_EXAMPLE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/llmbridge.example.json"
+            LLMBRIDGE_DEMO_CONFIG="${PROJECT_SOURCE_DIR}/deploy/config.demo.json")
     gtest_discover_tests(app_options_test)
 
     # 手动运行的选路微基准，不作为有时序阈值的 CTest。

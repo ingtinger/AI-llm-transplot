@@ -2,8 +2,10 @@
 
 #include "management_server.hpp"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <poll.h>
@@ -23,6 +25,7 @@ namespace llmbridge::app
         {
             const char* status = code == 200 ? "200 OK" : code == 503 ? "503 Service Unavailable"
                                  : code == 405 ? "405 Method Not Allowed"
+                                 : code == 408 ? "408 Request Timeout"
                                  : code == 431 ? "431 Request Header Fields Too Large"
                                                : "404 Not Found";
             const std::string head = "HTTP/1.1 " + std::string(status) +
@@ -105,14 +108,39 @@ namespace llmbridge::app
         try
         {
             std::string head;
-            while (head.find("\r\n\r\n") == std::string::npos && head.size() < kMaxRequestHead)
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            size_t header_end = std::string::npos;
+            for (;;)
             {
+                header_end = head.find("\r\n\r\n");
+                if (header_end != std::string::npos) break;
+                if (head.size() >= kMaxRequestHead)
+                {
+                    send_reply(client, 431, "text/plain; charset=utf-8", "request headers too large\n");
+                    return;
+                }
+                pollfd pfd{client, POLLIN, 0};
+                int ready = 0;
+                for (;;)
+                {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()).count();
+                    if (remaining <= 0) break;
+                    ready = ::poll(&pfd, 1, static_cast<int>(remaining));
+                    if (ready >= 0 || errno != EINTR) break;
+                }
+                if (ready == 0)
+                {
+                    send_reply(client, 408, "text/plain; charset=utf-8", "request timeout\n");
+                    return;
+                }
+                if (ready < 0 || !(pfd.revents & POLLIN)) return;
                 char buf[512];
-                const ssize_t n = ::recv(client, buf, sizeof(buf), 0);
+                const ssize_t n = ::recv(client, buf, std::min(sizeof(buf), kMaxRequestHead - head.size()), 0);
                 if (n <= 0) return;
                 head.append(buf, static_cast<size_t>(n));
             }
-            if (head.size() >= kMaxRequestHead)
+            if (header_end + 4 > kMaxRequestHead)
             {
                 send_reply(client, 431, "text/plain; charset=utf-8", "request headers too large\n");
                 return;

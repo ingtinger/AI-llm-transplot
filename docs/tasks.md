@@ -136,7 +136,7 @@ ctest --test-dir build-wsl -R '^AppStatusRetry$' \
 
 **可靠性补充验收（2026-10-20）：**独立 Debug ASan/UBSan 构建及选定测试 **48/48 通过**；WSL2 下以 `setarch x86_64 -R` 运行 TSan，路由策略 **21/21** 和真实进程热加载 **1/1** 通过，未报告数据竞争。普通启动 TSan 会因 WSL 内存映射布局在测试前失败，原生 Linux/CI 仍需复测。sanitizer 结果仅覆盖选定路径，不是全量消毒器验收；Fuzz、部署与性能任务保持未完成。
 
-- [ ] 提供可复现的 Dockerfile、Compose 和 systemd 示例；明确 TLS 终止、管理端点绑定、日志轮转、密钥注入和优雅停止方式。
+- [ ] 提供可复现的 Dockerfile、Compose 和 systemd 示例；明确 TLS 终止、管理端点绑定、日志轮转、密钥注入和优雅停止方式。已提交本机双 Mock TLS Compose、Dockerfile、systemd 单元及操作文档；当前环境无 Docker，尚未完成容器实际启动验收。
 - [ ] 增加 AddressSanitizer、ThreadSanitizer 验证；针对网络解析和配置输入考虑 Fuzz 测试。
 - [ ] 建立固定硬件/编译参数/Mock 行为的吞吐、P50/P99、SSE 并发与故障注入基准；同时报告失败率和资源占用，不只报告最高 QPS。
 - [ ] 整理架构图、配置示例、演示脚本及“一个上游失效后请求转移”的可复现录像/操作步骤。

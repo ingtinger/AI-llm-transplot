@@ -12,6 +12,8 @@ compile_commands.json
 # (Handoff doc, exchange thesis, GTM/discovery scripts, briefing, AI-assistant
 # instructions.) Keep these out of the public history entirely.
 /private/
+/deploy/.env
+/deploy/certs/
 /CLAUDE.md
 **/.claude/
 

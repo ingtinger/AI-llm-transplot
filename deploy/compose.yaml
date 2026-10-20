@@ -1,0 +1,44 @@
+# AI-llm-transplot 扩展：仅供本机复现的双 Mock TLS 示例，遵循 Apache-2.0 许可证。
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    user: "${GATEWAY_UID:?请在 deploy/.env 设置 GATEWAY_UID}:${GATEWAY_GID:?请在 deploy/.env 设置 GATEWAY_GID}"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      PROVIDER_PRIMARY_KEY: "${PROVIDER_PRIMARY_KEY:?请在 deploy/.env 设置测试密钥}"
+      PROVIDER_BACKUP_KEY: "${PROVIDER_BACKUP_KEY:?请在 deploy/.env 设置测试密钥}"
+      GATEWAY_ALICE_KEY: "${GATEWAY_ALICE_KEY:?请在 deploy/.env 设置测试密钥}"
+    volumes:
+      - ./config.demo.json:/etc/ai-llm-transplot/config.json:ro
+      - ./certs:/run/tls:ro
+    ports:
+      - "127.0.0.1:8088:8088"
+    command: ["--config", "/etc/ai-llm-transplot/config.json"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  mock-primary:
+    image: python:3.12-slim
+    network_mode: service:gateway
+    depends_on: [gateway]
+    volumes:
+      - ../bench/mock_provider.py:/mock_provider.py:ro
+    command: ["python3", "/mock_provider.py", "--port", "9001", "--latency-ms", "10"]
+    restart: unless-stopped
+
+  mock-backup:
+    image: python:3.12-slim
+    network_mode: service:gateway
+    depends_on: [gateway]
+    volumes:
+      - ../bench/mock_provider.py:/mock_provider.py:ro
+    command: ["python3", "/mock_provider.py", "--port", "9002", "--latency-ms", "10"]
+    restart: unless-stopped

@@ -50,6 +50,8 @@ ALLOW = {
     # Bearer value) is what makes the measurement representative of a real request.
     "gateway/tests/request_perf_test.cpp",
     "gateway/tests/request_test.cpp",
+    # 路由策略认证单测使用固定的演示 Bearer 值验证权限和配额。
+    "app/tests/routing_policy_test.cpp",
     # SECURITY.md documents what a leaked key looks like.
     "SECURITY.md",
 }

@@ -1,0 +1,47 @@
+{
+  "_说明": "AI-llm-transplot 扩展：仅供回环地址上的双 Mock 演示。密钥从环境变量读取。",
+  "listen": {
+    "port": 8088,
+    "tls": true,
+    "cert": "/run/tls/cert.pem",
+    "key": "/run/tls/key.pem"
+  },
+  "upstream": [
+    {
+      "url": "127.0.0.1:9001",
+      "dialect": "openai",
+      "credential_env": "PROVIDER_PRIMARY_KEY",
+      "models": ["chat-default"]
+    },
+    {
+      "url": "127.0.0.1:9002",
+      "dialect": "openai",
+      "credential_env": "PROVIDER_BACKUP_KEY",
+      "models": ["chat-default"]
+    }
+  ],
+  "security": {
+    "enabled": true,
+    "users": [
+      {
+        "id": "alice",
+        "tenant": "demo",
+        "key_env": "GATEWAY_ALICE_KEY",
+        "models": ["chat-default"],
+        "upstreams": [0, 1],
+        "requests_per_minute": 60,
+        "max_concurrent": 4,
+        "daily_tokens": 100000,
+        "monthly_tokens": 1000000
+      }
+    ]
+  },
+  "routing": {
+    "mode": "first",
+    "max_attempts": 2,
+    "failure_threshold": 1,
+    "cooldown_s": 2
+  },
+  "management": {"port": 9091},
+  "runtime": {"workers": 2, "io": "epoll", "log_level": "info"}
+}

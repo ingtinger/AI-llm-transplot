@@ -155,6 +155,6 @@ curl http://127.0.0.1:9091/metrics
 - 按 Provider/模型价格核算费用、处理重试中先前尝试的费用。
 - 跨 Provider 的请求幂等与每次尝试的可靠计费；显式开启不安全重放后仍可能重复执行。
 - Redis 共享的多实例限流、会话粘性和健康状态。
-- 完整配置热替换、持久化审计日志和完整部署脚本；当前仅上游摘除列表可热加载。
+- 完整配置热替换、持久化审计日志和经过容器实测的生产部署方案；当前仅上游摘除列表可热加载，仓库提供本机部署示例。
 
-第一次阅读代码可从 [开发者导读](docs/development.md) 开始；详细设计见 [docs/design.md](docs/design.md)，测试方法见 [可靠性验证](docs/reliability.md)，任务进度见 [docs/tasks.md](docs/tasks.md)。上游原始设计资料仍保留在 `DESIGN.md`、`GATEWAY-INTERNALS.md` 和 `LATENCY.md` 中。
+第一次阅读代码可从 [开发者导读](docs/development.md) 开始；详细设计见 [docs/design.md](docs/design.md)，测试方法见 [可靠性验证](docs/reliability.md)，本机双 Mock 与 systemd 示例见 [部署说明](docs/deployment.md)，任务进度见 [docs/tasks.md](docs/tasks.md)。上游原始设计资料仍保留在 `DESIGN.md`、`GATEWAY-INTERNALS.md` 和 `LATENCY.md` 中。

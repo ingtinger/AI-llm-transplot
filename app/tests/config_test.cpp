@@ -338,6 +338,25 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
     }
 }
 
+TEST(Config, DemoDeploymentConfigParses)
+{
+    // 演示配置参与实际解析测试，避免部署样例在字段调整后悄悄失效。
+    std::ifstream in(LLMBRIDGE_DEMO_CONFIG, std::ios::binary);
+    ASSERT_TRUE(in) << "cannot read " << LLMBRIDGE_DEMO_CONFIG;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    Settings c;
+    std::string err;
+    ASSERT_TRUE(parse_config(ss.str(), c, err)) << err;
+    EXPECT_TRUE(c.listen_tls);
+    EXPECT_TRUE(c.security_enabled);
+    EXPECT_FALSE(c.allow_insecure_http);
+    EXPECT_EQ(c.upstream, "127.0.0.1:9001");
+    ASSERT_EQ(c.more_upstreams.size(), 1U);
+    EXPECT_EQ(c.more_upstreams[0].url, "127.0.0.1:9002");
+    EXPECT_EQ(c.management_port, 9091);
+}
+
 // ── The venue dialect: its name, its old name, and its old value ─────────────
 //
 // "translate" named an action the gateway may not even perform, since a matching
