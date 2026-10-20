@@ -56,16 +56,19 @@ if [ "${#STREAM_LIST[@]}" -eq 1 ]; then read -r -a STREAM_LIST <<< "${STREAM_LIS
 MOCK_PORT=9601
 GW_PORT=8601
 LL_PORT=8602
-VENV=bench/.litellm-venv
+VENV="${LITELLM_VENV:-bench/.litellm-venv}"
 RESDIR=bench/results
 mkdir -p "$RESDIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SUMMARY="$RESDIR/stream-headtohead-$STAMP.txt"
 CSV="$RESDIR/stream-comparison.csv"
 IO="${IO:-auto}"
+PROVIDER="${PROVIDER:-fast}"
+CSV_TMP=""
 
 cleanup() {
   [ -n "${LL_CFG:-}" ] && rm -f "$LL_CFG"
+  [ -n "$CSV_TMP" ] && rm -f -- "$CSV_TMP"
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
   [ -n "${GW_PID:-}"   ] && kill "$GW_PID"   2>/dev/null
   [ -n "${LL_PID:-}"   ] && kill "$LL_PID"   2>/dev/null
@@ -80,22 +83,24 @@ if [ -z "$BIN" ]; then
   done
 fi
 [ -z "$BIN" ] && { echo "No built llmbridge+streamgen; build first or set BIN=path" >&2; exit 1; }
+[ -x "$VENV/bin/litellm" ] || { echo "LiteLLM 环境不存在：$VENV/bin/litellm" >&2; exit 1; }
+[ "$PROVIDER" != fast ] || [ -x "$BIN/faststream" ] || { echo "缺少 faststream：$BIN/faststream" >&2; exit 1; }
 echo "Using binaries in $BIN"
 
 # A stale binary silently benchmarks the wrong code; streaming lands in v0.3.0, so
 # refuse to run against a gateway that can't stream.
-if ! "$BIN/llmbridge" --help 2>&1 | grep -q 'upstream-timeout'; then
+help_output=$("$BIN/llmbridge" --help 2>&1) || { echo "无法读取网关帮助信息：$BIN/llmbridge" >&2; exit 1; }
+if ! grep -q 'upstream-timeout' <<< "$help_output"; then
   echo "ERROR: $BIN/llmbridge looks stale (no --upstream-timeout). Rebuild before benchmarking." >&2
   exit 1
 fi
 
-wait_port() { for _ in $(seq 1 120); do (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3<&-; return 0; }; sleep 0.5; done; return 1; }
+wait_port() { for _ in $(seq 1 120); do kill -0 "$2" 2>/dev/null || return 1; (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3<&-; return 0; }; sleep 0.5; done; return 1; }
 
 # Provider=fast (default): the C++ faststream. The Python mock saturates near
 # 45-50k chunks/s, below llmbridge, so it would cap the comparison. faststream is
 # wire-identical (same events, framing and emission stamps), so both gateways see
 # exactly the same upstream, and neither is measured against a limited provider.
-PROVIDER="${PROVIDER:-fast}"
 echo "Starting provider=$PROVIDER (anthropic SSE: ${TOKENS} tokens @ ${INTERVAL}ms) ..."
 if [ "$PROVIDER" = "fast" ]; then
   "$BIN/faststream" --port "$MOCK_PORT" --tokens "$TOKENS" \
@@ -106,13 +111,13 @@ else
         --tokens "$TOKENS" --token-interval-ms "$INTERVAL" >"$RESDIR/stream-mock-$STAMP.log" 2>&1 &
 fi
 MOCK_PID=$!
-wait_port "$MOCK_PORT" || { echo "mock failed to start" >&2; exit 1; }
+wait_port "$MOCK_PORT" "$MOCK_PID" || { echo "mock failed to start" >&2; exit 1; }
 
 echo "Starting llmbridge (1 worker, io=$IO) ..."
 "$BIN/llmbridge" --legacy-mode --listen "$GW_PORT" --upstream "127.0.0.1:$MOCK_PORT" \
         --upstream-dialect anthropic --workers 1 --io "$IO" >"$RESDIR/stream-gw-$STAMP.log" 2>&1 &
 GW_PID=$!
-wait_port "$GW_PORT" || { echo "llmbridge failed to start" >&2; exit 1; }
+wait_port "$GW_PORT" "$GW_PID" || { echo "llmbridge failed to start" >&2; exit 1; }
 
 echo "Starting LiteLLM (1 worker) ..."
 # The checked-in config hardcodes the mock's default port; point it at this run's
@@ -125,7 +130,7 @@ sed "s#api_base: http://127.0.0.1:9001#api_base: http://127.0.0.1:$MOCK_PORT#" \
 "$VENV/bin/litellm" --config "$LL_CFG" --port "$LL_PORT" \
         >"$RESDIR/stream-litellm-$STAMP.log" 2>&1 &
 LL_PID=$!
-wait_port "$LL_PORT" || { echo "LiteLLM failed to start; see $RESDIR/stream-litellm-$STAMP.log" >&2; exit 1; }
+wait_port "$LL_PORT" "$LL_PID" || { echo "LiteLLM failed to start; see $RESDIR/stream-litellm-$STAMP.log" >&2; exit 1; }
 sleep 3   # let LiteLLM finish its lazy imports before the first measured run
 
 # Fairness control 8: unmeasured discard round so neither gateway's first measured
@@ -136,22 +141,35 @@ echo "Discard round (warming both gateways; results discarded) ..."
 "$BIN/streamgen" --port "$LL_PORT" --streams 16 --duration 15 --warmup 0 \
       --header "Authorization: Bearer sk-dummy" --label discard >/dev/null 2>&1
 
-if [ ! -s "$CSV" ]; then
-  echo "label,streams,chunks,completed,chunk_p50_us,chunk_p99_us,chunk_p999_us,chunk_max_us,ttft_p50_ms,ttft_p99_ms,gap_p50_ms,gap_p99_ms" > "$CSV"
+CSV_TMP=$(mktemp "${CSV}.tmp.XXXXXX") || exit 1
+if [ -s "$CSV" ]; then
+  cp -- "$CSV" "$CSV_TMP" || exit 1
+else
+  echo "label,streams,chunks,completed,chunk_p50_us,chunk_p99_us,chunk_p999_us,chunk_max_us,ttft_p50_ms,ttft_p99_ms,gap_p50_ms,gap_p99_ms" > "$CSV_TMP"
 fi
 
 run_one() { # label port -> echoes "p50 p99 p999 chunks completed"
   local label="$1" port="$2" streams="$3" log="$RESDIR/stream-$1-$3-$STAMP.log"
   "$BIN/streamgen" --port "$port" --streams "$streams" --duration "$DUR" --warmup "$WARMUP" \
         --header "Authorization: Bearer sk-dummy" \
-        --label "$label" --csv "$CSV" >"$log" 2>&1
-  local p50 p99 p999 chunks completed
+        --label "$label" --csv "$CSV_TMP" >"$log" 2>&1 || { echo "streamgen 执行失败：$log" >&2; return 1; }
+  local p50 p99 p999 chunks measured completed failures
   p50=$(sed -n 's/.*p50=\([0-9]*\) p99=.*/\1/p' "$log" | head -1)
   p99=$(sed -n 's/.*p99=\([0-9]*\) p99\.9=.*/\1/p' "$log" | head -1)
   p999=$(sed -n 's/.*p99\.9=\([0-9]*\) max=.*/\1/p' "$log" | head -1)
   chunks=$(sed -n 's/^chunks=\([0-9]*\).*/\1/p' "$log" | head -1)
+  measured=$(sed -n 's/^chunks=[0-9]*  measured=\([0-9]*\).*/\1/p' "$log" | head -1)
   completed=$(sed -n 's/.*completed_streams=\([0-9]*\).*/\1/p' "$log" | head -1)
-  echo "${p50:-0} ${p99:-0} ${p999:-0} ${chunks:-0} ${completed:-0}"
+  failures=$(sed -n 's/.*failures=\([0-9]*\).*/\1/p' "$log" | head -1)
+  if [ -z "$p50" ] || [ -z "$p99" ] || [ -z "$p999" ] ||
+     [ -z "$chunks" ] || [ -z "$measured" ] || [ -z "$completed" ] ||
+     [ -z "$failures" ] || [ "$measured" = 0 ] || [ "$completed" = 0 ] ||
+     [ "$failures" != 0 ] ||
+     grep -q 'WARNING: histogram overflow' "$log"; then
+    echo "SSE 测量缺少有效样本、发生失败或直方图溢出：$log" >&2
+    return 1
+  fi
+  echo "$p50 $p99 $p999 $chunks $completed"
 }
 
 {
@@ -164,15 +182,18 @@ run_one() { # label port -> echoes "p50 p99 p999 chunks completed"
 } | tee "$SUMMARY"
 
 for S in "${STREAM_LIST[@]}"; do
-  read -r d50 d99 d999 dch dcs <<< "$(run_one direct "$MOCK_PORT" "$S")"      # baseline first
+  D=$(run_one direct "$MOCK_PORT" "$S") || exit 1
+  read -r d50 d99 d999 dch dcs <<< "$D"      # baseline first
   # Fairness control 7: alternate which gateway is measured first at each level.
   if [ $(( S % 2 )) -eq 0 ]; then
-    read -r k50 k99 k999 kch kcs <<< "$(run_one llmbridge "$GW_PORT" "$S")"
-    read -r l50 l99 l999 lch lcs <<< "$(run_one litellm  "$LL_PORT" "$S")"
+    K=$(run_one llmbridge "$GW_PORT" "$S") || exit 1
+    L=$(run_one litellm "$LL_PORT" "$S") || exit 1
   else
-    read -r l50 l99 l999 lch lcs <<< "$(run_one litellm  "$LL_PORT" "$S")"
-    read -r k50 k99 k999 kch kcs <<< "$(run_one llmbridge "$GW_PORT" "$S")"
+    L=$(run_one litellm "$LL_PORT" "$S") || exit 1
+    K=$(run_one llmbridge "$GW_PORT" "$S") || exit 1
   fi
+  read -r k50 k99 k999 kch kcs <<< "$K"
+  read -r l50 l99 l999 lch lcs <<< "$L"
 
   ka50=$(( k50 - d50 )); ka99=$(( k99 - d99 ))
   la50=$(( l50 - d50 )); la99=$(( l99 - d99 ))
@@ -192,6 +213,8 @@ for S in "${STREAM_LIST[@]}"; do
     "$S" "$ka50" "$ka99" "$la50" "$la99" "$dch" "$kch" "$lch" "$note" | tee -a "$SUMMARY"
 done
 
+mv -- "$CSV_TMP" "$CSV" || exit 1
+CSV_TMP=""
 {
   echo
   echo "Added latency = (path per-chunk latency) - (direct-to-mock per-chunk latency) at the"
