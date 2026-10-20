@@ -1097,6 +1097,7 @@ TEST(ProviderHeads, RetryAfterAcceptsOnlyValidImfFixdate)
     EXPECT_EQ(retry_after_seconds("999999"), 65535);
     EXPECT_EQ(retry_after_seconds("Sun, 06 Nov 1994 08:49:37 GMT"), 0);
     EXPECT_EQ(retry_after_seconds("Sat, 06 Nov 2094 08:49:37 GMT"), 65535);
+    EXPECT_EQ(retry_after_seconds("Fri, 31 Dec 9999 23:59:59 GMT"), 65535);
     EXPECT_EQ(retry_after_seconds("Sun, 06 Nov 2094 08:49:37 GMT"), 0);
     EXPECT_EQ(retry_after_seconds("Foo, 06 Nov 2094 08:49:37 GMT"), 0);
     EXPECT_EQ(retry_after_seconds("Sun, 31 Feb 2094 08:49:37 GMT"), 0);

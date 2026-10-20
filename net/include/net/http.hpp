@@ -430,7 +430,8 @@ namespace llmbridge::net::http
         if (!date.ok()) return 0;
         if (value.substr(0, 3) != kWeekdays[weekday{sys_days{date}}.c_encoding()]) return 0;
         const auto target = sys_days{date} + hours{hour} + minutes{minute} + seconds{second};
-        const auto remaining = ceil<std::chrono::seconds>(target - system_clock::now()).count();
+        // 先把当前时间降到秒精度，避免远期 HTTP 日期转为纳秒时溢出。
+        const auto remaining = (target - floor<seconds>(system_clock::now())).count();
         return static_cast<uint16_t>(std::clamp<decltype(remaining)>(remaining, 0, 65535));
     }
 
