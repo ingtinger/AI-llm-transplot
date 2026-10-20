@@ -23,7 +23,8 @@ cd "$(dirname "$0")/.."
 DUR="${1:-6}"
 WARMUP="${2:-2}"
 shift $(( $# < 2 ? $# : 2 )) || true
-RPS_LIST=(${@:-20000 40000 60000 80000 100000 120000})
+RPS_LIST=("${@:-20000 40000 60000 80000 100000 120000}")
+if [ "${#RPS_LIST[@]}" -eq 1 ]; then read -r -a RPS_LIST <<< "${RPS_LIST[0]}"; fi
 BODY="${BODY:-64}" # request body size in bytes (loadgen --body-bytes)
 WORKERS="${WORKERS:-1}" # number of SO_REUSEPORT worker threads
 IO="${IO:-uring}"        # event-loop backend (auto|epoll|uring)
@@ -72,6 +73,7 @@ for pid in "${BACK_PIDS[@]}"; do
 done
 
 extract() { sed -n 's/.*achieved=\([0-9]*\) .*p50_us=\([0-9]*\) p99_us=\([0-9]*\) p999_us=\([0-9]*\) max_us=\([0-9]*\).*/\1 \2 \3 \4 \5/p'; }
+extract_counts() { sed -n 's/.*completed=\([0-9]*\) errors=\([0-9]*\) .*/\1 \2/p'; }
 backlog_of() { sed -n 's/.*max_backlog=\([0-9]*\).*/\1/p' "$1" | tail -1; }
 
 {
@@ -86,23 +88,40 @@ for RPS in "${RPS_LIST[@]}"; do
   # direct-to-backend control
   D=$($BIN/loadgen --target 127.0.0.1:$BACK_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --conns "$CONNS" --body-bytes "$BODY" 2>/dev/null)
   read -r da d_p50 d_p99 d_p999 d_max <<< "$(echo "$D" | extract)"
+  read -r d_completed d_errors <<< "$(echo "$D" | extract_counts)"
 
   # fresh proxy per level
   $BIN/llmbridge --legacy-mode --listen $PROXY_PORT --upstream 127.0.0.1:$BACK_PORT --io "$IO" --workers "$WORKERS" \
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/sat-proxy-$RPS-$STAMP.log" 2>&1 &
   PP=$!
   sleep 0.7
+  if ! kill -0 "$PP" 2>/dev/null; then
+    echo "网关启动失败或端口 $PROXY_PORT 已占用" >&2
+    exit 1
+  fi
   PLOG="$RESDIR/sat-loadgen-$RPS-$STAMP.log"
   P=$($BIN/loadgen --target 127.0.0.1:$PROXY_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --conns "$CONNS" --body-bytes "$BODY" 2>"$PLOG")
   read -r pa p_p50 p_p99 p_p999 p_max <<< "$(echo "$P" | extract)"
+  read -r p_completed p_errors <<< "$(echo "$P" | extract_counts)"
   bl=$(backlog_of "$PLOG")
   kill -TERM "$PP" 2>/dev/null; wait "$PP" 2>/dev/null
   PP=""
 
-  : "${da:=0}" "${d_p99:=0}" "${pa:=0}" "${p_p50:=0}" "${p_p99:=0}" "${p_p999:=0}" "${p_max:=0}" "${bl:=0}"
+  if [ -z "$da" ] || [ -z "$d_p50" ] || [ -z "$d_p99" ] ||
+     [ -z "$d_p999" ] || [ -z "$d_max" ] || [ -z "$pa" ] ||
+     [ -z "$p_p50" ] || [ -z "$p_p99" ] || [ -z "$p_p999" ] ||
+     [ -z "$p_max" ] || [ -z "$bl" ] ||
+     [ -z "$d_completed" ] || [ -z "$d_errors" ] ||
+     [ -z "$p_completed" ] || [ -z "$p_errors" ] ||
+     [ "$d_completed" = 0 ] || [ "$p_completed" = 0 ]; then
+    echo "饱和度测量缺少有效样本或统计字段，拒绝生成结果" >&2
+    exit 1
+  fi
   printf "%-9s | %-22s | %-38s | %s\n" "$RPS" \
     "$da ($d_p99)" \
     "$pa / $p_p50 / $p_p99 / $p_p999 / $p_max" \
     "$bl" | tee -a "$OUT"
+  printf "          completed/errors: direct=%s/%s proxy=%s/%s\n" \
+    "$d_completed" "$d_errors" "$p_completed" "$p_errors" | tee -a "$OUT"
 done
 echo "Logs in $RESDIR/ (stamp $STAMP)" | tee -a "$OUT"

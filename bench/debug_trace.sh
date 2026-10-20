@@ -62,6 +62,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$PROVIDER" in anthropic|gemini|cohere|none) ;; *) echo "bad --provider: $PROVIDER" >&2; exit 1;; esac
+if [ -n "$REQFILE" ] && { [ ! -f "$REQFILE" ] || [ ! -r "$REQFILE" ]; }; then
+  echo "请求文件不存在或不可读：$REQFILE" >&2
+  exit 1
+fi
 
 # ── locate the gateway binary (same discovery as the bench scripts) ──────────
 if [ -z "$BIN_DIR" ]; then
@@ -72,13 +76,16 @@ fi
 GWBIN="$BIN_DIR/llmbridge"
 [ -x "$GWBIN" ] || { echo "No llmbridge binary found. Build it, or pass --bin DIR." >&2; exit 1; }
 
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d)" || exit 1
 MOCK_PID=""; GW_PID=""
 cleanup() {
-  [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null
-  [ -n "$GW_PID" ]   && kill "$GW_PID"   2>/dev/null
-  pkill -f "$WORK/dbgmock.py" 2>/dev/null
-  if [ "$KEEP" = 1 ]; then echo "(artifacts kept in $WORK)"; else rm -rf "$WORK"; fi
+  for pid in "$GW_PID" "$MOCK_PID"; do
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  if [ "$KEEP" = 1 ]; then echo "(artifacts kept in $WORK)"; else rm -rf -- "$WORK"; fi
 }
 trap cleanup EXIT
 
@@ -98,7 +105,7 @@ case "$PROVIDER" in
   none)      REQ_MODEL="gpt-4o-mini";;
 esac
 if [ -n "$REQFILE" ]; then
-  cp "$REQFILE" "$WORK/request.json"
+  cp "$REQFILE" "$WORK/request.json" || exit 1
 else
   cat > "$WORK/request.json" <<JSON
 {
@@ -178,7 +185,9 @@ DBG_PORT=$MOCK_PORT DBG_FORMAT=$PROVIDER DBG_OUT="$WORK" python3 "$WORK/dbgmock.
 MOCK_PID=$!
 sleep 0.4
 
-GW_ARGS=(--legacy-mode --listen "$GW_PORT" --upstream "127.0.0.1:$MOCK_PORT" --upstream-dialect "$PROVIDER" --workers 1)
+GW_DIALECT="$PROVIDER"
+[ "$PROVIDER" = none ] && GW_DIALECT=openai
+GW_ARGS=(--legacy-mode --listen "$GW_PORT" --upstream "127.0.0.1:$MOCK_PORT" --upstream-dialect "$GW_DIALECT" --workers 1)
 
 case "$MODE" in
   trace)
@@ -232,14 +241,28 @@ HTTP_CODE=$(curl -s -o "$WORK/response.json" -D "$WORK/resp_hdr.txt" -w '%{http_
   "http://127.0.0.1:$GW_PORT/v1/chat/completions" || echo "000")
 sleep 0.3
 
+if [ "$HTTP_CODE" != 200 ] || [ ! -s "$WORK/upstream_body.json" ]; then
+  echo "调试请求失败（HTTP $HTTP_CODE），查看网关与 Mock 日志：" >&2
+  sed -n '1,30p' "$WORK/gateway.log" >&2
+  sed -n '1,20p' "$WORK/mock.log" >&2
+  exit 1
+fi
+
 # stop the gateway so it prints its added-latency profile
-[ -n "$GW_PID" ] && { kill -TERM "$GW_PID" 2>/dev/null; wait "$GW_PID" 2>/dev/null; }
+[ -n "$GW_PID" ] && { kill -TERM "$GW_PID" 2>/dev/null; wait "$GW_PID" 2>/dev/null; GW_PID=""; }
 
 # ── report ───────────────────────────────────────────────────────────────────
+if [ "$PROVIDER" = none ]; then
+  REQUEST_STAGE="OpenAI-compatible passthrough"
+  RESPONSE_STAGE="OpenAI-compatible passthrough"
+else
+  REQUEST_STAGE="after openai_to_${PROVIDER}_request()"
+  RESPONSE_STAGE="after ${PROVIDER}_to_openai_response()"
+fi
 hr "1 · CLIENT → GATEWAY   (OpenAI request, you sent this)"
 pp "$WORK/request.json"
 
-hr "2 · GATEWAY → UPSTREAM  (after openai_to_${PROVIDER}_request, the translation)"
+hr "2 · GATEWAY → UPSTREAM  ($REQUEST_STAGE)"
 [ "$PROVIDER" = none ] && echo "${D}(translate=none: byte-forwarded, identical to stage 1)${R}"
 [ -f "$WORK/upstream_body.json" ] && pp "$WORK/upstream_body.json" || echo "${Y}(no upstream request captured: the gateway never forwarded)${R}"
 [ "$PROVIDER" != none ] && echo "${D}note: the format is translated (system extracted, params renamed, blocks restructured); the \"model\" string is passed through verbatim; model-name mapping is a routing decision, not part of dialect translation. (Omit \"model\" entirely and the translator falls back to a provider default.)${R}"
@@ -247,7 +270,7 @@ hr "2 · GATEWAY → UPSTREAM  (after openai_to_${PROVIDER}_request, the transla
 hr "3 · UPSTREAM → GATEWAY  (canned ${PROVIDER} response)"
 pp "$WORK/upstream_resp.json"
 
-hr "4 · GATEWAY → CLIENT    (after ${PROVIDER}_to_openai_response, translated back)"
+hr "4 · GATEWAY → CLIENT    ($RESPONSE_STAGE)"
 echo "${D}$(head -1 "$WORK/resp_hdr.txt" 2>/dev/null)  [curl http_code=$HTTP_CODE]${R}"
 if [ -s "$WORK/response.json" ]; then pp "$WORK/response.json"; else echo "${Y}(empty response body)${R}"; fi
 
