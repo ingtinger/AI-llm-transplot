@@ -28,7 +28,8 @@
 Ubuntu/WSL 首次构建 HTTPS 版本时需安装 OpenSSL 开发包：`sudo apt-get install libssl-dev`。运行库中的 `openssl` 命令不能代替此开发包。
 
 ```bash
-cd /home/zzf/AI-llm-transplot
+git clone https://github.com/ingtinger/AI-llm-transplot.git
+cd AI-llm-transplot
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DLLMBRIDGE_WERROR=ON -DLLMBRIDGE_TLS=ON
 cmake --build build -j"$(nproc)"
