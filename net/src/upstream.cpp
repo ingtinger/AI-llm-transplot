@@ -213,6 +213,11 @@ namespace llmbridge::net
         {
             host = rest.substr(0, colon);
             port_sv = rest.substr(colon + 1);
+            if (port_sv.empty())
+            {
+                spec.error = "invalid port";
+                return spec;
+            }
         }
 
         if (!valid_host_chars(host))

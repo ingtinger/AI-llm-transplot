@@ -126,6 +126,8 @@ TEST(UpstreamParse, RejectsBadPorts)
     EXPECT_FALSE(parse_upstream("host:65536").ok());
     EXPECT_FALSE(parse_upstream("host:80x").ok());   // atoi would have taken this
     EXPECT_FALSE(parse_upstream("host:").ok());
+    EXPECT_FALSE(parse_upstream("http://host:").ok());
+    EXPECT_FALSE(parse_upstream("https://host:/v1").ok());
     EXPECT_FALSE(parse_upstream("host:-1").ok());
 }
 
