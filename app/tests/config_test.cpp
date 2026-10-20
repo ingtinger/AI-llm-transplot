@@ -24,6 +24,17 @@
 using llmbridge::app::Settings;
 using llmbridge::app::parse_config;
 
+TEST(Config, OversizedConfigurationIsRejectedBeforeParsing)
+{
+    // 文件加载同样需要有界；/dev/zero 可验证读取不会等到 EOF 或耗尽内存。
+    Settings s;
+    std::string err;
+    EXPECT_FALSE(parse_config(std::string(4 * 1024 * 1024 + 1, ' '), s, err));
+    EXPECT_NE(err.find("4 MiB"), std::string::npos);
+    EXPECT_FALSE(llmbridge::app::load_config("/dev/zero", s, err));
+    EXPECT_NE(err.find("4 MiB"), std::string::npos);
+}
+
 TEST(Config, SecurityUsersAndEnvironmentNamesAreStrict)
 {
     Settings s;

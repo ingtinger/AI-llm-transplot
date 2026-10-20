@@ -15,7 +15,6 @@
 #include <charconv>
 #include <cstdlib>
 #include <fstream>
-#include <sstream>
 #include <unordered_set>
 
 namespace llmbridge::app
@@ -23,6 +22,7 @@ namespace llmbridge::app
     namespace
     {
         namespace json = llmbridge::provider::json;
+        constexpr size_t kMaxConfigBytes = 4 * 1024 * 1024;
 
         constexpr std::string_view kBackends[] = {"auto", "epoll", "uring"};
         constexpr std::string_view kOnOff[] = {"on", "off"};
@@ -534,6 +534,8 @@ namespace llmbridge::app
 
     bool parse_config(std::string_view text, Settings& s, std::string& err)
     {
+        if (text.size() > kMaxConfigBytes)
+            return fail(err, "config: exceeds 4 MiB size limit");
         bool ok = false;
         const json::Value root = json::parse(text, ok);
         if (!ok)
@@ -561,9 +563,17 @@ namespace llmbridge::app
     {
         std::ifstream in(path, std::ios::binary);
         if (!in) return fail(err, "config: cannot read " + path);
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        const std::string text = ss.str();
+        std::string text;
+        char chunk[4096];
+        while (in)
+        {
+            in.read(chunk, sizeof(chunk));
+            const size_t n = static_cast<size_t>(in.gcount());
+            if (n > kMaxConfigBytes - text.size())
+                return fail(err, "config: exceeds 4 MiB size limit (" + path + ")");
+            text.append(chunk, n);
+        }
+        if (!in.eof()) return fail(err, "config: cannot read " + path);
         if (text.empty()) return fail(err, "config: " + path + " is empty");
         if (!parse_config(text, s, err)) return fail(err, err + " (" + path + ")");
         return true;
