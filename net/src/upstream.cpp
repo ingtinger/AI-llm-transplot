@@ -56,7 +56,7 @@ namespace llmbridge::net
             if (in.empty() || in == "/") return true; // nothing to prefix
             if (in.front() != '/')
             {
-                err = "base path '" + std::string(in) + "' must start with '/'";
+                err = "base path must start with '/'";
                 return false;
             }
             // Named separately from the charset check below, because this is the
@@ -64,8 +64,7 @@ namespace llmbridge::net
             // outside [...]" would not tell them which character or why.
             if (in.find('#') != std::string_view::npos)
             {
-                err = "base path '" + std::string(in) +
-                      "' has a fragment, which never travels on the wire";
+                err = "base path has a fragment, which never travels on the wire";
                 return false;
             }
             std::string_view p = in;
@@ -77,8 +76,7 @@ namespace llmbridge::net
                                 c == '.' || c == '_' || c == '~' || c == ':';
                 if (!ok)
                 {
-                    err = "base path '" + std::string(in) + "' has a character outside "
-                          "[A-Za-z0-9-._~:/]";
+                    err = "base path has a character outside [A-Za-z0-9-._~:/]";
                     return false;
                 }
             }
@@ -88,7 +86,7 @@ namespace llmbridge::net
                 (p.size() >= 2 && p.compare(p.size() - 2, 2, "/.") == 0) ||
                 (p.size() >= 3 && p.compare(p.size() - 3, 3, "/..") == 0))
             {
-                err = "base path '" + std::string(in) + "' has an empty or dot segment";
+                err = "base path has an empty or dot segment";
                 return false;
             }
             out.assign(p);
@@ -124,7 +122,7 @@ namespace llmbridge::net
             if (scheme == "https") spec.tls = true;
             else if (scheme != "http")
             {
-                spec.error = "unsupported scheme '" + std::string(scheme) + "' (use http:// or https://)";
+                spec.error = "unsupported scheme (use http:// or https://)";
                 return spec;
             }
             have_scheme = true;
@@ -203,7 +201,7 @@ namespace llmbridge::net
 
         if (!valid_host_chars(host))
         {
-            spec.error = "invalid host '" + std::string(host) + "'";
+            spec.error = "invalid host";
             return spec;
         }
         spec.host.assign(host);
@@ -212,7 +210,7 @@ namespace llmbridge::net
         {
             if (!parse_port(port_sv, spec.port))
             {
-                spec.error = "invalid port '" + std::string(port_sv) + "'";
+                spec.error = "invalid port";
                 return spec;
             }
         }

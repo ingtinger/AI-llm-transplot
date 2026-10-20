@@ -168,7 +168,7 @@ namespace llmbridge::app
         {
             const auto range = [&](double d) {
                 return (d >= o.lo && d <= o.hi) ||
-                       fail(err, where + " out of range: " + std::string(v) + " (allowed " +
+                       fail(err, where + " out of range (allowed " +
                                      bounds(o.lo) + ".." + bounds(o.hi) + ")");
             };
             if (o.kind == Kind::Int)
@@ -177,7 +177,7 @@ namespace llmbridge::app
                 const auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
                 if (ec == std::errc::result_out_of_range) return range(o.hi + 1);
                 if (v.empty() || ec != std::errc{} || p != v.data() + v.size())
-                    return fail(err, where + " must be an integer: " + std::string(v));
+                    return fail(err, where + " must be an integer");
                 if (!range(static_cast<double>(n))) return false;
                 s.*std::get<int Settings::*>(o.field) = static_cast<int>(n);
                 return true;
@@ -190,7 +190,7 @@ namespace llmbridge::app
                 const bool blank = t.empty() || std::isspace(static_cast<unsigned char>(t[0]));
                 const double d = blank ? 0 : std::strtod(t.c_str(), &end);
                 if (end == nullptr || end == t.c_str() || *end != '\0')
-                    return fail(err, where + " is not a valid number: " + t);
+                    return fail(err, where + " is not a valid number");
                 if (!range(d)) return false; // NaN fails both comparisons
                 s.*std::get<double Settings::*>(o.field) = d;
                 return true;
@@ -205,7 +205,7 @@ namespace llmbridge::app
                 {
                     std::string m = where + " must be one of:";
                     for (std::string_view c : o.choices) m += " " + std::string(c);
-                    return fail(err, m + " (got \"" + std::string(v) + "\")");
+                    return fail(err, m);
                 }
             }
             s.*std::get<std::string Settings::*>(o.field) = std::string(v);
@@ -497,8 +497,7 @@ namespace llmbridge::app
             if (a != "--config") continue;
             if (missing(i)) return refuse(err, "--config needs a path");
             if (path)
-                return refuse(err, "--config given twice (" + std::string(path) + " and " +
-                                       args[i + 1] + "); pass it once");
+                return refuse(err, "--config given twice; pass it once");
             path = args[++i];
         }
         if (path && !load_config(path, s, err)) return Cli::Refused;
@@ -514,11 +513,10 @@ namespace llmbridge::app
                 return refuse(err, std::string(a) + " " + std::string(retired(a)));
             if (!o)
             {
-                std::string m = "unknown argument '" + std::string(a) + "'";
                 if (const size_t eq = a.find('='); eq != std::string_view::npos)
-                    m += "; flags take a separate value, so write '" + std::string(a.substr(0, eq)) +
-                         " " + std::string(a.substr(eq + 1)) + "'";
-                return refuse(err, m + ". Run --help for the accepted flags.");
+                    return refuse(err, "unknown argument; flags take a separate value, not '='. "
+                                       "Run --help for the accepted flags.");
+                return refuse(err, "unknown argument. Run --help for the accepted flags.");
             }
             if (o->kind == Kind::Bool)
             {

@@ -191,7 +191,7 @@ static int run(int argc, char** argv)
     const llmbridge::net::UpstreamSpec up = llmbridge::net::parse_upstream(upstream_arg);
     if (!up.ok())
     {
-        return refuse("bad --upstream '" + upstream_arg + "': " + up.error);
+        return refuse("bad --upstream: " + up.error);
     }
 #ifndef LLMBRIDGE_HAVE_TLS
     if (up.tls)
@@ -205,7 +205,7 @@ static int run(int argc, char** argv)
     const std::vector<std::string> ips = llmbridge::net::resolve_host_ipv4(up.host, &resolve_err);
     if (ips.empty())
     {
-        return refuse("cannot resolve upstream host '" + up.host + "': " + resolve_err);
+        return refuse("cannot resolve upstream host: " + resolve_err);
     }
     const std::string& upstream_ip = ips.front();
     const uint16_t upstream_port = up.port;
@@ -258,7 +258,7 @@ static int run(int argc, char** argv)
         const llmbridge::net::UpstreamSpec s2 = llmbridge::net::parse_upstream(e.url);
         if (!s2.ok())
         {
-            return refuse("bad upstream '" + e.url + "': " + s2.error);
+            return refuse("bad upstream " + std::to_string(upstream_table.size()) + ": " + s2.error);
         }
 #ifndef LLMBRIDGE_HAVE_TLS
         if (s2.tls)
@@ -270,7 +270,7 @@ static int run(int argc, char** argv)
         const std::vector<std::string> ips2 = llmbridge::net::resolve_host_ipv4(s2.host, &e2);
         if (ips2.empty())
         {
-            return refuse("cannot resolve upstream host '" + s2.host + "': " + e2);
+            return refuse("cannot resolve upstream host " + std::to_string(upstream_table.size()) + ": " + e2);
         }
         if (cfg.security_enabled && !s2.tls &&
             !std::all_of(ips2.begin(), ips2.end(), [](const std::string& ip) {

@@ -144,6 +144,21 @@ INSTANTIATE_TEST_SUITE_P(
                        "given twice"),
         std::make_pair(Args{"--config", "/nonexistent/a"}, "cannot read")));
 
+TEST(Cli, RefusalsDoNotEchoSuppliedValues)
+{
+    // 值可能被误填成凭据，拒绝启动时不能把原值写入日志。
+    constexpr const char* kMarker = "sk-secret-marker";
+    const auto check = [&](std::initializer_list<const char*> args) {
+        Settings s;
+        std::string err;
+        EXPECT_EQ(parse(args, s, err), Cli::Refused);
+        EXPECT_EQ(err.find(kMarker), std::string::npos) << err;
+    };
+    check({"--listen", kMarker});
+    check({"--upstream-dialect", kMarker});
+    check({"--upstream=sk-secret-marker"});
+}
+
 // Every flag bench/*.sh and bench/enterpilot pass, spelled as they spell them.
 TEST(Cli, TheBenchFlagsStillParse)
 {

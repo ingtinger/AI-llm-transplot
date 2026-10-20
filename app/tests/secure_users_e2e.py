@@ -59,7 +59,41 @@ def request(port: int, token: str | None, model: str) -> tuple[int, bytes]:
     return status, body
 
 
+def rejected_upstream_errors_hide_input(binary: Path) -> None:
+    """错误原因可见，但误填在上游地址中的凭据不能进入进程输出。"""
+    marker = "sk-secret-marker"
+    primary = subprocess.run(
+        [str(binary), "--legacy-mode", "--listen", "0", "--upstream",
+         f"https://host/{marker}#fragment"],
+        capture_output=True, timeout=5, check=False)
+    assert primary.returncode != 0
+    assert b"bad --upstream" in primary.stderr
+    assert marker.encode() not in primary.stdout + primary.stderr
+
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp) / "config.json"
+        path.write_text(json.dumps({"security": {"legacy_mode": True},
+                                    "upstream": [{"url": "127.0.0.1:9"},
+                                                 {"url": f"https://host/{marker}#fragment"}]}),
+                        encoding="utf-8")
+        secondary = subprocess.run([str(binary), "--config", str(path)],
+                                   capture_output=True, timeout=5, check=False)
+    assert secondary.returncode != 0
+    assert b"bad upstream 1" in secondary.stderr
+    assert marker.encode() not in secondary.stdout + secondary.stderr
+
+    for args, reason in [([f"--upstream={marker}"], b"flags take a separate value"),
+                         (["--listen", marker], b"must be an integer"),
+                         (["--upstream-dialect", marker], b"must be one of")]:
+        result = subprocess.run([str(binary), *args], capture_output=True,
+                                timeout=5, check=False)
+        assert result.returncode != 0
+        assert reason in result.stderr
+        assert marker.encode() not in result.stdout + result.stderr
+
+
 def main(binary: Path) -> None:
+    rejected_upstream_errors_hide_input(binary)
     port, dead, live = free_port(), free_port(), free_port()
     mock = http.server.ThreadingHTTPServer(("127.0.0.1", live), Mock)
     thread = threading.Thread(target=mock.serve_forever, daemon=True)

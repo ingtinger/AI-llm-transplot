@@ -98,6 +98,21 @@ TEST(UpstreamParse, RejectsUnsupportedScheme)
     EXPECT_FALSE(parse_upstream("ws://host:80").ok());
 }
 
+TEST(UpstreamParse, ErrorMessagesDoNotEchoRejectedUrlPieces)
+{
+    // 被拒绝的 URL 可能误含凭据，错误原因不能把原文带进启动日志。
+    const std::string marker = "sk-secret-marker";
+    for (const std::string& url : {
+             marker + "://host", "https://host/" + marker + "#fragment",
+             "https://host/" + marker + "%", "https://bad_" + marker + ".example",
+             "https://host:" + marker})
+    {
+        const auto s = parse_upstream(url);
+        ASSERT_FALSE(s.ok()) << url;
+        EXPECT_EQ(s.error.find(marker), std::string::npos) << s.error;
+    }
+}
+
 TEST(UpstreamParse, RejectsBarePortlessHost)
 {
     // The legacy contract was IP:PORT; a bare host with no scheme has no port to
