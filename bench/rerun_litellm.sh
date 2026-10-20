@@ -63,15 +63,15 @@ if [ -z "$VERSION" ]; then
             python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null)
   [ -n "$VERSION" ] || { echo "could not reach PyPI; pass --version" >&2; exit 1; }
 fi
-VENV=bench/.litellm-venv-current
+VENV=$(mktemp -d "$RES/litellm-venv-$STAMP.XXXXXX") || exit 1
 echo "target: litellm $VERSION, arms: $ARMS" | tee -a "$LOG"
+echo "venv: $VENV (保留供复核，不覆盖旧环境)" | tee -a "$LOG"
 
 # Installing unpinned is the point: the 1.95.0 pin exists because a newer LiteLLM
 # once pulled a FastAPI that removed get_flat_dependant. If that still breaks, it
 # is the finding and it gets recorded instead of worked around.
-rm -rf "$VENV"
-python3 -m venv "$VENV" >>"$LOG" 2>&1
-"$VENV/bin/pip" install --quiet --upgrade pip >>"$LOG" 2>&1
+python3 -m venv "$VENV" >>"$LOG" 2>&1 || { echo "创建 LiteLLM 环境失败：$VENV" >&2; exit 1; }
+"$VENV/bin/pip" install --quiet --upgrade pip >>"$LOG" 2>&1 || { echo "升级 pip 失败，查看 $LOG" >&2; exit 1; }
 if ! "$VENV/bin/pip" install --quiet "litellm[proxy]==$VERSION" >>"$LOG" 2>&1; then
     echo "install of litellm[proxy]==$VERSION FAILED, see $LOG" >&2; exit 1
 fi
@@ -95,8 +95,11 @@ fi
 for arm in $ARMS; do
   echo "=== arm: $arm" | tee -a "$LOG"
   if [ "$arm" = rust ]; then export LITELLM_RUST=1; else unset LITELLM_RUST; fi
-  H2H_CSV="$RES/phase-a-comparison-$arm-$STAMP.csv" \
-    LITELLM_VENV="$VENV" bench/run_headtohead.sh 2>&1 | tee -a "$LOG"
+  if ! H2H_CSV="$RES/phase-a-comparison-$arm-$STAMP.csv" \
+    LITELLM_VENV="$VENV" bash bench/run_headtohead.sh 2>&1 | tee -a "$LOG"; then
+    echo "LiteLLM $arm 对比失败；环境保留在 $VENV，查看 $LOG" >&2
+    exit 1
+  fi
 done
 
 cat <<EOF | tee -a "$LOG"
