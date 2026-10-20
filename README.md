@@ -1,5 +1,7 @@
 # llmbridge
 
+> AI-llm-transplot 分支的中文说明、配置方法与开发路线见 [README.zh-CN.md](README.zh-CN.md)。
+
 > A sub-millisecond, drop-in OpenAI-compatible **LLM gateway** in C++. Microsecond translation overhead, dependency-free default build (TLS uses OpenSSL), p99 < 1 ms at 1,000 RPS.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)

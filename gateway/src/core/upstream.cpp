@@ -79,7 +79,8 @@ namespace llmbridge::detail
         const ReqState& f = client->req.f;
         _policy->on_reply(ReplyFacts{.upstream_index = client->upstream_slot, .status = status,
                                      .attempt = f.failover_attempts, .tag = f.policy_tag,
-                                     .seq = f.req_seq, .streamed = streamed});
+                                     .seq = f.req_seq, .streamed = streamed,
+                                     .retry_after_s = f.retry_after_s});
     }
 
     bool Engine::pool_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept
@@ -202,6 +203,8 @@ namespace llmbridge::detail
         if (now_ns() - u->ts_pool_taken > kStaleRetryWindowNs) return false; // may have run
         ClientConn* client = u->client;
         if (!client || !client->req.can_redispatch()) return false; // a response byte arrived
+        if (_policy && !_policy->allows_unsafe_replay() &&
+            (u->sent_bytes > 0 || client->req.f.ts_up_sent > 0)) return false;
         // The same venue: a retry that lands elsewhere is a silent reroute, and the
         // request was translated for this dialect and carries its credential.
         UpstreamConn* uf = new_upstream(u->venue);
@@ -215,6 +218,8 @@ namespace llmbridge::detail
             NamedKey key;
             if ((!client->req.f.key_header.empty() &&
                  named_key(head, client->req.f.head, client->req.f.key_header.view(), upstream_of(u).dialect, key)) ||
+                (!client->req.f.server_credential.empty() &&
+                 server_key(client->req.f.server_credential, upstream_of(u).dialect, key)) ||
                 forward_parts(client, upstream_of(u), key, uf->out.stage()))
             {
                 delete uf;
@@ -348,6 +353,10 @@ namespace llmbridge::detail
         note_served_tier(client, r.body, /*tail=*/true);
         note_served_model(client, r.body, /*streamed=*/false);
         note_reply(client, h.status, /*streamed=*/false);
+        // 仅完整错误响应可替换；半截响应可能对应已执行的请求，不允许重放。
+        if ((h.status == 408 || h.status == 429 || (h.status >= 500 && h.status < 600)) &&
+            upstream_failed(client, h.status, "upstream retryable status", true))
+            return;
         on_response(u, h, r.body, r.total_len);
     }
 
@@ -404,9 +413,10 @@ namespace llmbridge::detail
         respond(client);
     }
 
-    bool Engine::upstream_failed(ClientConn* client, int status, const char* why) noexcept
+    bool Engine::upstream_failed(ClientConn* client, int status, const char* why,
+                                 bool response_received) noexcept
     {
-        const Retry r = failover_target(client, status, why);
+        const Retry r = failover_target(client, status, why, response_received);
         if (!r.retry) return false;
 
         LB_WARN(ReqId{client->req.f.req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),
@@ -442,7 +452,8 @@ namespace llmbridge::detail
         return true;
     }
 
-    Retry Engine::failover_target(ClientConn* client, int status, const char* why) noexcept
+    Retry Engine::failover_target(ClientConn* client, int status, const char* why,
+                                  bool response_received) noexcept
     {
         if (!_policy || !client || client->doomed) return {};
         ReqState& rf = client->req.f;
@@ -457,13 +468,21 @@ namespace llmbridge::detail
         // duplicate it; re-sending one we no longer hold is impossible; and an unbounded
         // chain turns one dead provider into a latency multiplier. A hedge is its own
         // redundancy: a leg that fails is counted, never sent again.
-        const bool retryable = _upstreams.size() >= 2 && !rf.hedged && client->req.can_redispatch() &&
+        const bool redispatchable = response_received ? rf.phase == Phase::Responding && !rf.body_streaming
+                                                      : client->req.can_redispatch();
+        const bool possibly_executed = response_received || rf.ts_up_sent > 0 ||
+                                       (client->up && client->up->sent_bytes > 0);
+        const bool retryable = _upstreams.size() >= 2 && !rf.hedged && redispatchable &&
+                               (!possibly_executed || _policy->allows_unsafe_replay()) &&
                                (!client->req.saved.empty() || rf.body_in_rbuf) &&
                                rf.failover_attempts < kMaxFailoverAttempts - 1;
         const FailureFacts f{.upstream_index = client->upstream_slot, .status = status, .reason = why,
                              .attempt = rf.failover_attempts, .tag = rf.policy_tag, .seq = rf.req_seq,
-                             .retryable = retryable};
-        const Retry r = _policy->on_failure(f);
+                             .retryable = retryable, .response_received = response_received,
+                             .model = rf.model.view()};
+        const Retry r = response_received
+                            ? (retryable ? _policy->on_status_retry(f) : Retry{})
+                            : _policy->on_failure(f);
         if (!retryable || !r.retry) return {};
         if (r.upstream_index < 0 || static_cast<size_t>(r.upstream_index) >= _upstreams.size())
         {
@@ -481,7 +500,11 @@ namespace llmbridge::detail
         }
         // The next venue's key comes from the header the retry names, never the failed
         // one's; none, once any attempt has named one, would send another venue's key.
-        if (r.credential_header.empty() ? !client->req.f.key_header.empty() : !key_header_ok(r.credential_header))
+        if ((!r.credential_header.empty() && !key_header_ok(r.credential_header)) ||
+            (!r.server_credential.empty() && !server_credential_ok(r.server_credential)) ||
+            (!r.credential_header.empty() && !r.server_credential.empty()) ||
+            (( !client->req.f.key_header.empty() || !client->req.f.server_credential.empty()) &&
+             r.credential_header.empty() && r.server_credential.empty()))
         {
             LB_WARN(ReqId{client->req.f.req_seq}, " failover named no usable credential header; giving up");
             return {};
@@ -498,7 +521,8 @@ namespace llmbridge::detail
             return {};
         }
         rf.beta_override.set(r.anthropic_beta);
-        if (!r.credential_header.empty()) rf.key_header.set(r.credential_header);
+        rf.key_header.set(r.credential_header);
+        rf.server_credential = r.server_credential;
         rf.subst_model.set(r.substitute_model);
         rf.subst_for.set(r.substitute_for);
         return r;

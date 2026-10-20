@@ -2,7 +2,7 @@
 # SIGINT must end a --duration run at once, with exit 0, not after the deadline.
 # usage: sigint_ends_duration.sh PATH/TO/llmbridge
 log=$(mktemp)
-"$1" --listen 0 --upstream 127.0.0.1:9 --duration 60 2>"$log" &
+"$1" --legacy-mode --listen 0 --upstream 127.0.0.1:9 --duration 60 2>"$log" &
 pid=$!
 i=0
 until grep -q "backend requested" "$log"; do

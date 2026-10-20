@@ -3,7 +3,7 @@
 
 # The option table (flags, config file, --help) as a library, so it is tested
 # without running main().
-add_library(llmbridge_options STATIC options.cpp)
+add_library(llmbridge_options STATIC options.cpp routing_policy.cpp observability.cpp management_server.cpp)
 target_link_libraries(llmbridge_options PUBLIC gateway provider)
 target_include_directories(llmbridge_options PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -52,8 +52,20 @@ if (LLMBRIDGE_BUILD_TESTS)
 
     # --duration took atoi, so 0.5 became 0 and ran until killed; the timeout fails it.
     add_test(NAME CliDurationTakesAFraction
-            COMMAND llmbridge --listen 0 --upstream 127.0.0.1:9 --duration 0.5)
+            COMMAND llmbridge --legacy-mode --listen 0 --upstream 127.0.0.1:9 --duration 0.5)
     set_tests_properties(CliDurationTakesAFraction PROPERTIES TIMEOUT 20)
+    llmbridge_cli_refuses(CliRefusesImplicitLegacyMode
+            "choose security.enabled=true"
+            --listen 0 --upstream 127.0.0.1:9)
+    llmbridge_cli_refuses(CliRefusesConflictingSecurityModes
+            "choose security.enabled=true"
+            --config ${CMAKE_CURRENT_SOURCE_DIR}/tests/conflicting_security.json)
+    llmbridge_cli_refuses(CliRefusesSecurePlaintextListener
+            "security mode requires a TLS listener"
+            --config ${CMAKE_CURRENT_SOURCE_DIR}/tests/secure_plaintext.json)
+    llmbridge_cli_refuses(CliRefusesSecurePlaintextUpstream
+            "security mode refuses a plaintext non-loopback upstream"
+            --config ${CMAKE_CURRENT_SOURCE_DIR}/tests/secure_plaintext_upstream.json)
     # The deadline used to be a sleep that SIGINT could not cut short.
     add_test(NAME CliSigintEndsADurationRun
             COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/sigint_ends_duration.sh
@@ -74,15 +86,52 @@ if (LLMBRIDGE_BUILD_TESTS)
                 --tls-cert /nonexistent --tls-key /nonexistent)
         llmbridge_cli_refuses(CliRefusesHttpsUpstreamWithoutTlsBuild
                 "https:// upstream requires a TLS build"
-                --listen 0 --upstream https://example.invalid)
+                --legacy-mode --listen 0 --upstream https://example.invalid)
     endif ()
 endif ()
 
 if (LLMBRIDGE_BUILD_TESTS)
     include(GoogleTest)
-    add_executable(app_options_test tests/config_test.cpp tests/cli_test.cpp)
+    add_executable(app_options_test tests/config_test.cpp tests/cli_test.cpp tests/routing_policy_test.cpp)
     target_link_libraries(app_options_test PRIVATE llmbridge_options GTest::gtest_main)
     target_compile_definitions(app_options_test PRIVATE
             LLMBRIDGE_EXAMPLE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/llmbridge.example.json")
     gtest_discover_tests(app_options_test)
+
+    # 手动运行的选路微基准，不作为有时序阈值的 CTest。
+    add_executable(routing_policy_bench tests/routing_policy_bench.cpp)
+    target_link_libraries(routing_policy_bench PRIVATE llmbridge_options)
+
+    # AI-llm-transplot 端到端测试：真实启动网关进程，验证主上游不可达时切换到备用上游。
+    find_package(Python3 COMPONENTS Interpreter)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME AppMultiUpstreamFailover
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/multi_upstream_e2e.py
+                $<TARGET_FILE:llmbridge>)
+        set_tests_properties(AppMultiUpstreamFailover PROPERTIES TIMEOUT 20)
+        add_test(NAME AppMultiUpstreamBoundaries
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/multi_upstream_boundaries.py
+                $<TARGET_FILE:llmbridge>)
+        set_tests_properties(AppMultiUpstreamBoundaries PROPERTIES TIMEOUT 40)
+        add_test(NAME AppStatusRetry
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/status_retry_e2e.py
+                $<TARGET_FILE:llmbridge>)
+        set_tests_properties(AppStatusRetry PROPERTIES TIMEOUT 30)
+        add_test(NAME AppHotReload
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/hot_reload_e2e.py
+                $<TARGET_FILE:llmbridge>)
+        set_tests_properties(AppHotReload PROPERTIES TIMEOUT 40)
+        add_test(NAME AppModelPools
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/model_pools_e2e.py
+                $<TARGET_FILE:llmbridge>)
+        set_tests_properties(AppModelPools PROPERTIES TIMEOUT 30)
+        add_test(NAME AppManagement
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/management_e2e.py
+                $<TARGET_FILE:llmbridge>)
+        set_tests_properties(AppManagement PROPERTIES TIMEOUT 30)
+        add_test(NAME AppSecureUsers
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/secure_users_e2e.py
+                $<TARGET_FILE:llmbridge>)
+        set_tests_properties(AppSecureUsers PROPERTIES TIMEOUT 30)
+    endif ()
 endif ()

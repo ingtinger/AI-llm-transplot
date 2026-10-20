@@ -11,10 +11,13 @@
 // after that many seconds (for scripted benchmark runs); otherwise it runs until
 // SIGINT/SIGTERM.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <condition_variable>
 #include <csignal>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -29,6 +32,9 @@
 #include <vector>
 
 #include "options.hpp"
+#include "routing_policy.hpp"
+#include "observability.hpp"
+#include "management_server.hpp"
 #include "gateway/gateway.hpp"
 #include "net/log.hpp"
 #include "net/upstream.hpp"
@@ -69,6 +75,7 @@ namespace
     // gateways it points at are destroyed.
     using Gateways = std::vector<std::unique_ptr<llmbridge::Gateway>>;
     std::atomic<Gateways*> g_gateways{nullptr};
+    std::atomic<bool> g_reload_requested{false};
     void on_signal(int) noexcept
     {
         if (Gateways* gs = g_gateways.load())
@@ -81,6 +88,25 @@ namespace
     {
         if (Gateways* gs = g_gateways.load())
             for (auto& g : *gs) g->request_stats_dump();
+    }
+    void on_reload_signal(int) noexcept { g_reload_requested.store(true); }
+
+    bool drained_mask(const llmbridge::app::Settings& cfg, size_t count,
+                      std::vector<bool>& mask, std::string& err)
+    {
+        mask.assign(count, false);
+        for (const std::string& value : cfg.routing_drained_upstreams)
+        {
+            size_t index = 0;
+            const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), index);
+            if (ec != std::errc{} || end != value.data() + value.size() || index >= count || mask[index])
+            {
+                err = "routing.drained_upstreams must contain distinct upstream indices in range";
+                return false;
+            }
+            mask[index] = true;
+        }
+        return true;
     }
 } // namespace
 
@@ -107,6 +133,9 @@ static int run(int argc, char** argv)
     case llmbridge::app::Cli::Run:
         break;
     }
+    bool has_config_file = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::string_view(argv[i]) == "--config") has_config_file = true;
     const uint16_t listen_port = static_cast<uint16_t>(cfg.listen_port);
     const bool listen_tls = cfg.listen_tls;
     const std::string& tls_cert = cfg.tls_cert;
@@ -147,6 +176,15 @@ static int run(int argc, char** argv)
     }
 #endif
 
+    if (cfg.security_enabled == cfg.legacy_mode)
+        return refuse("choose security.enabled=true for authenticated users or explicitly set "
+                      "security.legacy_mode=true (--legacy-mode) for local compatibility mode");
+    if (cfg.security_enabled && !listen_tls && !cfg.allow_insecure_http)
+        return refuse("security mode requires a TLS listener; security.allow_insecure_http=true "
+                      "is only for isolated local Mock tests");
+    if (cfg.allow_insecure_http && !cfg.security_enabled)
+        return refuse("security.allow_insecure_http requires security.enabled=true");
+
     // Parse + resolve --upstream, here on the setup path, and refuse a name that does not
     // resolve: with no policy there is no failover, so a venue with no address would fail
     // every request. A worker re-resolves the name off its loop after a failed connect.
@@ -181,17 +219,26 @@ static int run(int argc, char** argv)
     // wire in the clear. Loopback is exempt; that is the benchmark/mock setup and
     // the sidecar deployment, where there is no network to sniff.
     {
-        const bool loopback = upstream_ip.rfind("127.", 0) == 0 || upstream_ip == "::1";
+        const bool loopback = std::all_of(ips.begin(), ips.end(), [](const std::string& ip) {
+            return ip.rfind("127.", 0) == 0 || ip == "::1";
+        });
         if (!up.tls && !loopback)
+        {
+            if (cfg.security_enabled)
+                return refuse("security mode refuses a plaintext non-loopback upstream");
             LB_WARN("upstream is plaintext HTTP and not loopback; any client credential "
                     "forwarded to it travels UNENCRYPTED, use https:// for a real provider. "
                     "host=", up.host, " port=", upstream_port);
+        }
     }
 
     // The table the workers index. Entry 0 is what the flags describe; the rest are
     // parsed and resolved identically, because a venue reached only from a file must
     // fail as loudly at startup as one named on the command line.
     std::vector<llmbridge::Upstream> upstream_table;
+    std::vector<std::string> credential_headers;
+    std::vector<std::string> upstream_models;
+    std::vector<std::vector<std::string>> client_models;
     upstream_table.push_back(
         llmbridge::Upstream{.ip = upstream_ip,
                             .port = upstream_port,
@@ -202,6 +249,10 @@ static int run(int argc, char** argv)
                             .query = up.query,
                             .ips = ips,
                             .host = up.host});
+    credential_headers.push_back(cfg.upstream_credential_header);
+    upstream_models.push_back(cfg.upstream_model);
+    client_models.push_back(cfg.upstream_models);
+    std::vector<std::string> credential_envs{cfg.upstream_credential_env};
     for (const auto& e : cfg.more_upstreams)
     {
         const llmbridge::net::UpstreamSpec s2 = llmbridge::net::parse_upstream(e.url);
@@ -221,6 +272,11 @@ static int run(int argc, char** argv)
         {
             return refuse("cannot resolve upstream host '" + s2.host + "': " + e2);
         }
+        if (cfg.security_enabled && !s2.tls &&
+            !std::all_of(ips2.begin(), ips2.end(), [](const std::string& ip) {
+                return ip.rfind("127.", 0) == 0 || ip == "::1";
+            }))
+            return refuse("security mode refuses a plaintext non-loopback upstream");
         upstream_table.push_back(llmbridge::Upstream{.ip = ips2.front(),
                                                      .port = s2.port,
                                                      .tls = s2.tls,
@@ -230,7 +286,89 @@ static int run(int argc, char** argv)
                                                      .query = s2.query,
                                                      .ips = ips2,
                                                      .host = s2.host});
+        credential_headers.push_back(e.credential_header);
+        upstream_models.push_back(e.model);
+        client_models.push_back(e.models);
+        credential_envs.push_back(e.credential_env);
     }
+
+    const auto env_name_ok = [](std::string_view name) {
+        if (name.empty() || name.size() > 64) return false;
+        for (char c : name)
+            if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return false;
+        return true;
+    };
+    std::vector<std::string> server_credentials;
+    std::vector<llmbridge::app::UserRule> users;
+    if (cfg.security_enabled)
+    {
+        if (cfg.users.empty()) return refuse("security.enabled requires at least one user");
+        for (size_t i = 0; i < upstream_table.size(); ++i)
+        {
+            if (!credential_headers[i].empty() || !env_name_ok(credential_envs[i]))
+                return refuse("security mode requires upstream.credential_env and forbids credential_header");
+            if (upstream_table[i].dialect == llmbridge::UpstreamDialect::Bedrock)
+                return refuse("security mode does not support Bedrock SigV4 credentials");
+            const char* value = std::getenv(credential_envs[i].c_str());
+            if (!value || !llmbridge::server_credential_ok(value))
+                return refuse("missing or invalid provider credential environment variable " + credential_envs[i]);
+            server_credentials.emplace_back(value);
+        }
+        for (const auto& user : cfg.users)
+        {
+            if (!env_name_ok(user.key_env)) return refuse("invalid security.users.key_env");
+            const char* value = std::getenv(user.key_env.c_str());
+            if (!value || std::string_view(value).size() < 16 || !llmbridge::server_credential_ok(value))
+                return refuse("missing or invalid virtual key environment variable " + user.key_env);
+            users.push_back({user.id, user.tenant, value, user.models, user.upstreams,
+                             user.requests_per_minute, user.max_concurrent,
+                             user.daily_tokens, user.monthly_tokens, user.expires_unix_s,
+                             user.disabled});
+        }
+    }
+    else if (!cfg.users.empty() || std::any_of(credential_envs.begin(), credential_envs.end(),
+                                              [](const auto& name) { return !name.empty(); }))
+        return refuse("security.enabled must be true when users or credential_env are configured");
+
+    llmbridge::app::RoutingMode routing_mode{};
+    if (!llmbridge::app::routing_mode_from_name(cfg.routing_mode, routing_mode))
+        return refuse("unknown routing mode '" + cfg.routing_mode + "'");
+    const bool has_venue_overrides =
+        std::any_of(credential_headers.begin(), credential_headers.end(),
+                    [](const std::string& value) { return !value.empty(); }) ||
+        std::any_of(upstream_models.begin(), upstream_models.end(),
+                    [](const std::string& value) { return !value.empty(); });
+    const bool has_model_pools =
+        std::any_of(client_models.begin(), client_models.end(),
+                    [](const auto& models) { return !models.empty(); });
+    const bool needs_policy = upstream_table.size() > 1 ||
+                              routing_mode != llmbridge::app::RoutingMode::First ||
+                              has_venue_overrides || has_model_pools || has_config_file;
+    std::unique_ptr<llmbridge::app::RoutingPolicy> routing_policy;
+    if (needs_policy || cfg.management_port > 0 || cfg.request_log || cfg.security_enabled)
+        routing_policy = std::make_unique<llmbridge::app::RoutingPolicy>(
+            llmbridge::app::RoutingPolicyConfig{
+                .mode = routing_mode,
+                .upstream_count = upstream_table.size(),
+                .max_attempts = std::min<int>(cfg.routing_max_attempts,
+                                             static_cast<int>(upstream_table.size())),
+                .failure_threshold = static_cast<uint32_t>(cfg.routing_failure_threshold),
+                .cooldown_ns = static_cast<int64_t>(cfg.routing_cooldown_s * 1e9),
+                .sticky_header = cfg.routing_sticky_header,
+                .credential_headers = std::move(credential_headers),
+                .models = std::move(upstream_models),
+                .client_models = std::move(client_models),
+                .security_enabled = cfg.security_enabled,
+                .allow_unsafe_replay = cfg.routing_allow_unsafe_replay,
+                .server_credentials = std::move(server_credentials),
+                .users = std::move(users)});
+    std::vector<bool> initial_drained;
+    if (!drained_mask(cfg, upstream_table.size(), initial_drained, err)) return refuse(err);
+    if (routing_policy) routing_policy->set_drained(initial_drained);
+    std::unique_ptr<llmbridge::app::Observability> observability;
+    if (cfg.management_port > 0 || cfg.request_log || cfg.security_enabled)
+        observability = std::make_unique<llmbridge::app::Observability>(
+            upstream_table.size(), cfg.request_log || cfg.security_enabled, routing_policy.get());
 
     std::signal(SIGPIPE, SIG_IGN);
 
@@ -254,7 +392,7 @@ static int run(int argc, char** argv)
         tls.key_file = tls_key;
         auto gw = std::make_unique<llmbridge::Gateway>(
             listen_port, upstream_table, warmup_ns, io, up_timeout_ns, tls, cfg.timing_headers,
-            nullptr, cfg.strip_headers);
+            routing_policy.get(), cfg.strip_headers);
         // Before run(): the loop thread reads it, so setting it later is a data race.
         gw->set_client_idle_ns(static_cast<int64_t>(cfg.client_idle_s * 1e9));
         gw->set_pool_idle_ns(static_cast<int64_t>(cfg.pool_idle_s * 1e9));
@@ -267,13 +405,21 @@ static int run(int argc, char** argv)
         gw->set_stream_body(cfg.stream_body == "on");
         gw->set_stream_body_max(static_cast<size_t>(cfg.stream_body_max));
         gw->set_stream_openai_body(cfg.stream_openai_body == "on");
+        if (observability) gw->set_request_sink(observability.get(), {});
         gateways.push_back(std::move(gw));
     }
+    std::unique_ptr<llmbridge::app::ManagementServer> management;
+    if (cfg.management_port > 0)
+        management = std::make_unique<llmbridge::app::ManagementServer>(
+            static_cast<uint16_t>(cfg.management_port), *routing_policy, *observability);
     g_gateways.store(&gateways);
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
     std::signal(SIGUSR1, on_dump_signal);
+#ifdef SIGHUP
+    std::signal(SIGHUP, on_reload_signal);
+#endif
 
     // The stop condition: the first worker to return (a signal stops them all) or the
     // --duration deadline, whichever comes first. Waiting on it, not sleeping, is what
@@ -293,15 +439,55 @@ static int run(int argc, char** argv)
             finished = true;
             cv.notify_all();
         });
+    if (management) management->start();
+    const auto deadline = cfg.duration_s > 0
+        ? std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(cfg.duration_s))
+        : std::chrono::steady_clock::time_point::max();
+    for (;;)
     {
-        std::unique_lock<std::mutex> lk(m);
-        if (cfg.duration_s > 0)
-            cv.wait_for(lk, std::chrono::duration<double>(cfg.duration_s), [&] { return finished; });
-        else
-            cv.wait(lk, [&] { return finished; });
+        {
+            std::unique_lock<std::mutex> lk(m);
+            if (finished || std::chrono::steady_clock::now() >= deadline) break;
+            cv.wait_for(lk, std::chrono::milliseconds(200), [&] { return finished; });
+            if (finished) break;
+        }
+        if (!g_reload_requested.exchange(false)) continue;
+        if (!has_config_file || !routing_policy)
+        {
+            LB_WARN("SIGHUP ignored: no configuration file");
+            continue;
+        }
+        llmbridge::app::Settings reloaded;
+        std::string reload_error;
+        if (llmbridge::app::parse_cli(std::span<char* const>(argv + 1, argv + argc), reloaded,
+                                     reload_error) != llmbridge::app::Cli::Run)
+        {
+            LB_ERROR("SIGHUP rejected: ", reload_error);
+            continue;
+        }
+        std::vector<bool> new_drained;
+        if (!drained_mask(reloaded, upstream_table.size(), new_drained, reload_error))
+        {
+            LB_ERROR("SIGHUP rejected: ", reload_error);
+            continue;
+        }
+        // 地址、凭证、用户及工作线程配置均不可热改；旧请求持有原配置视图。
+        reloaded.routing_drained_upstreams = cfg.routing_drained_upstreams;
+        if (!(reloaded == cfg))
+        {
+            LB_ERROR("SIGHUP rejected: only routing.drained_upstreams is reloadable");
+            continue;
+        }
+        routing_policy->set_drained(new_drained);
+        cfg.routing_drained_upstreams.clear();
+        for (size_t i = 0; i < new_drained.size(); ++i)
+            if (new_drained[i]) cfg.routing_drained_upstreams.push_back(std::to_string(i));
+        LB_INFO("SIGHUP applied: drained upstreams=", static_cast<int64_t>(cfg.routing_drained_upstreams.size()));
     }
     for (auto& g : gateways) g->request_stop();
     for (auto& t : threads) t.join();
+    if (management) management->stop();
     // Only this thread is left, so a handler now runs here or not at all.
     g_gateways.store(nullptr);
 

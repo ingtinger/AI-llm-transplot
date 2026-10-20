@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <unordered_set>
 
 namespace llmbridge::app
 {
@@ -26,6 +27,7 @@ namespace llmbridge::app
         constexpr std::string_view kBackends[] = {"auto", "epoll", "uring"};
         constexpr std::string_view kOnOff[] = {"on", "off"};
         constexpr std::string_view kLevels[] = {"trace", "debug", "info", "warn", "error", "off"};
+        constexpr std::string_view kRoutingModes[] = {"first", "round_robin", "sticky"};
         constexpr double kYear = 31536000; // a bigger timeout is a unit typo, not a policy
 
         using K = Kind;
@@ -42,6 +44,33 @@ namespace llmbridge::app
              provider::venue_names(), &S::dialect},
             {"", "upstream.strip_headers", "", "header names dropped from every upstream request",
              K::List, 0, 0, {}, &S::strip_headers},
+            {"", "upstream.credential_header", "", "client header containing this venue's key",
+             K::Text, 0, 0, {}, &S::upstream_credential_header},
+            {"", "upstream.credential_env", "", "environment variable holding this venue's key",
+             K::Text, 0, 0, {}, &S::upstream_credential_env},
+            {"", "upstream.model", "", "model name sent to this venue; empty keeps the client model",
+             K::Text, 0, 0, {}, &S::upstream_model},
+            {"", "upstream.models", "", "client model names this venue can serve",
+             K::List, 0, 0, {}, &S::upstream_models},
+            {"--legacy-mode", "security.legacy_mode", "", "allow unauthenticated local compatibility mode",
+             K::Bool, 0, 0, {}, &S::legacy_mode},
+            {"--routing-mode", "routing.mode", "MODE", "built-in upstream selection policy",
+             K::Choice, 0, 0, kRoutingModes, &S::routing_mode},
+            {"--routing-max-attempts", "routing.max_attempts", "N",
+             "maximum venues tried for one request", K::Int, 1, 64, {}, &S::routing_max_attempts},
+            {"", "routing.failure_threshold", "", "failures before a venue enters cooldown",
+             K::Int, 1, 1000000, {}, &S::routing_failure_threshold},
+            {"", "routing.cooldown_s", "", "seconds a failed venue is skipped",
+             K::Number, 0, kYear, {}, &S::routing_cooldown_s},
+            {"", "routing.sticky_header", "", "header used by sticky routing",
+             K::Text, 0, 0, {}, &S::routing_sticky_header},
+            {"", "routing.drained_upstreams", "", "upstream indices excluded from new requests; SIGHUP reloadable",
+             K::List, 0, 0, {}, &S::routing_drained_upstreams},
+            {"", "routing.allow_unsafe_replay", "", "allow retry after a request may have run upstream",
+             K::Bool, 0, 0, {}, &S::routing_allow_unsafe_replay},
+            {"--management-port", "management.port", "PORT",
+             "loopback-only health, readiness and Prometheus metrics; 0 = off",
+             K::Int, 0, 65535, {}, &S::management_port},
             {"--upstream-timeout", "timeouts.upstream_s", "SECONDS",
              "upstream silence before a request is aborted, 0 = off", K::Number, 0, kYear, {},
              &S::upstream_s},
@@ -64,6 +93,9 @@ namespace llmbridge::app
             {"--io", "runtime.io", "NAME", "event loop", K::Choice, 0, 0, kBackends, &S::io},
             {"--log-level", "runtime.log_level", "LEVEL", "log level", K::Choice, 0, 0, kLevels,
              &S::log_level},
+            {"--request-log", "runtime.request_log", "",
+             "emit bounded structured request logs on a dedicated thread",
+             K::Bool, 0, 0, {}, &S::request_log},
             {"--workers", "runtime.workers", "N", "event loops sharing the port", K::Int, 1, 4096, {},
              &S::workers},
             {"--timing-headers", "runtime.timing_headers", "", "add x-llmbridge-* timing headers",
@@ -251,8 +283,11 @@ namespace llmbridge::app
                 return fail(err, "config: \"upstream\" must be an object or an array of them");
             if (g.is_array() && g.arr.empty())
                 return fail(err, "config: \"upstream\" must not be an empty array");
+            if (g.is_array() && g.arr.size() > 64)
+                return fail(err, "config: \"upstream\" supports at most 64 entries");
             const size_t n = g.is_array() ? g.arr.size() : 1;
             bool strip = false;
+            bool has_models = false, missing_models = false;
             for (size_t i = 0; i < n; ++i)
             {
                 const json::Value& e = g.is_array() ? g.arr[i] : g;
@@ -261,7 +296,22 @@ namespace llmbridge::app
                 Settings one;
                 one.upstream.clear();
                 one.dialect.clear();
+                one.upstream_credential_header.clear();
+                one.upstream_credential_env.clear();
+                one.upstream_model.clear();
+                one.upstream_models.clear();
                 if (!apply_group("upstream", e, one, err)) return false;
+                if (e.find("models") != nullptr)
+                {
+                    has_models = true;
+                    if (one.upstream_models.empty() || one.upstream_models.size() > 64)
+                        return fail(err, "config: upstream.models must contain 1..64 names");
+                    std::unordered_set<std::string_view> seen;
+                    for (const auto& model : one.upstream_models)
+                        if (!substitute_ok(model, 64) || !seen.insert(model).second)
+                            return fail(err, "config: upstream.models contains an invalid or duplicate model");
+                }
+                else missing_models = true;
                 if (g.is_array() && one.upstream.empty())
                     return fail(err, "config: every entry in an \"upstream\" array needs a url");
                 if (e.find("strip_headers") != nullptr)
@@ -274,9 +324,123 @@ namespace llmbridge::app
                 }
                 if (i > 0)
                     s.more_upstreams.push_back(
-                        {std::move(one.upstream), one.dialect.empty() ? "openai" : one.dialect});
+                        {std::move(one.upstream), one.dialect.empty() ? "openai" : one.dialect,
+                         std::move(one.upstream_credential_header), std::move(one.upstream_model),
+                         std::move(one.upstream_credential_env), std::move(one.upstream_models)});
                 if (i == 0 && !one.upstream.empty()) s.upstream = std::move(one.upstream);
                 if (i == 0 && !one.dialect.empty()) s.dialect = std::move(one.dialect);
+                if (i == 0) s.upstream_credential_header = std::move(one.upstream_credential_header);
+                if (i == 0) s.upstream_credential_env = std::move(one.upstream_credential_env);
+                if (i == 0) s.upstream_model = std::move(one.upstream_model);
+                if (i == 0) s.upstream_models = std::move(one.upstream_models);
+            }
+            if (has_models && missing_models)
+                return fail(err, "config: every upstream must set models when model pools are enabled");
+            return true;
+        }
+
+        bool apply_security(const json::Value& g, Settings& s, std::string& err)
+        {
+            if (!g.is_object()) return fail(err, "config: security must be an object");
+            for (const auto& [k, v] : g.obj)
+            {
+                if (is_comment(k)) continue;
+                if (k == "enabled")
+                {
+                    if (v.type != json::Value::Type::Bool)
+                        return fail(err, "config: security.enabled must be boolean");
+                    s.security_enabled = v.boolean;
+                }
+                else if (k == "legacy_mode")
+                {
+                    if (v.type != json::Value::Type::Bool)
+                        return fail(err, "config: security.legacy_mode must be boolean");
+                    s.legacy_mode = v.boolean;
+                }
+                else if (k == "allow_insecure_http")
+                {
+                    if (v.type != json::Value::Type::Bool)
+                        return fail(err, "config: security.allow_insecure_http must be boolean");
+                    s.allow_insecure_http = v.boolean;
+                }
+                else if (k == "users")
+                {
+                    if (!v.is_array() || v.arr.empty() || v.arr.size() > 256)
+                        return fail(err, "config: security.users must contain 1..256 users");
+                    s.users.clear();
+                    for (const auto& item : v.arr)
+                    {
+                        if (!item.is_object()) return fail(err, "config: security.users entries must be objects");
+                        UserSettings user;
+                        for (const auto& [field, value] : item.obj)
+                        {
+                            if (is_comment(field)) continue;
+                            if (field == "id" || field == "tenant" || field == "key_env")
+                            {
+                                if (value.type != json::Value::Type::String || value.sv.empty() ||
+                                    value.sv.size() > 64 || value.sv.find('\\') != std::string_view::npos)
+                                    return fail(err, "config: security.users identity fields must be plain strings (1..64)");
+                                (field == "id" ? user.id : field == "tenant" ? user.tenant : user.key_env) = value.sv;
+                            }
+                            else if (field == "models")
+                            {
+                                if (!value.is_array() || value.arr.empty() || value.arr.size() > 64)
+                                    return fail(err, "config: security.users.models must contain 1..64 names");
+                                for (const auto& e : value.arr)
+                                {
+                                    if (e.type != json::Value::Type::String || !substitute_ok(e.sv, 64))
+                                        return fail(err, "config: security.users.models contains an invalid model");
+                                    user.models.emplace_back(e.sv);
+                                }
+                            }
+                            else if (field == "upstreams")
+                            {
+                                if (!value.is_array() || value.arr.empty() || value.arr.size() > 64)
+                                    return fail(err, "config: security.users.upstreams must contain 1..64 indices");
+                                for (const auto& e : value.arr)
+                                {
+                                    if (e.type != json::Value::Type::Number || e.sv.empty())
+                                        return fail(err, "config: security.users.upstreams contains an invalid index");
+                                    int n = -1;
+                                    const auto parsed = std::from_chars(e.sv.data(), e.sv.data() + e.sv.size(), n);
+                                    if (parsed.ec != std::errc{} || parsed.ptr != e.sv.data() + e.sv.size() || n < 0)
+                                        return fail(err, "config: security.users.upstreams contains an invalid index");
+                                    user.upstreams.push_back(n);
+                                }
+                            }
+                            else if (field == "requests_per_minute" || field == "max_concurrent" ||
+                                     field == "daily_tokens" || field == "monthly_tokens" ||
+                                     field == "expires_unix_s")
+                            {
+                                if (value.type != json::Value::Type::Number || value.sv.empty())
+                                    return fail(err, "config: security.users numeric field must be a nonnegative integer");
+                                int64_t n = 0;
+                                const auto parsed = std::from_chars(value.sv.data(), value.sv.data() + value.sv.size(), n);
+                                if (parsed.ec != std::errc{} || parsed.ptr != value.sv.data() + value.sv.size() ||
+                                    n < (field == "requests_per_minute" || field == "max_concurrent" ? 1 : 0) ||
+                                    n > (field == "expires_unix_s" ? 4102444800LL : 1000000000LL))
+                                    return fail(err, "config: security.users numeric field out of range");
+                                if (field == "requests_per_minute") user.requests_per_minute = static_cast<int>(n);
+                                else if (field == "max_concurrent") user.max_concurrent = static_cast<int>(n);
+                                else if (field == "daily_tokens") user.daily_tokens = static_cast<int>(n);
+                                else if (field == "monthly_tokens") user.monthly_tokens = static_cast<int>(n);
+                                else user.expires_unix_s = n;
+                            }
+                            else if (field == "disabled")
+                            {
+                                if (value.type != json::Value::Type::Bool)
+                                    return fail(err, "config: security.users.disabled must be boolean");
+                                user.disabled = value.boolean;
+                            }
+                            else return fail(err, "config: unknown security.users field " + std::string(field));
+                        }
+                        if (user.id.empty() || user.tenant.empty() || user.key_env.empty() ||
+                            user.models.empty() || user.upstreams.empty())
+                            return fail(err, "config: security.users requires id, tenant, key_env, models, upstreams");
+                        s.users.push_back(std::move(user));
+                    }
+                }
+                else return fail(err, "config: unknown security field " + std::string(k));
             }
             return true;
         }
@@ -384,9 +548,10 @@ namespace llmbridge::app
         for (const auto& [k, v] : root.obj)
         {
             if (is_comment(k)) continue;
-            if (!is_group(k))
+            if (!is_group(k) && k != "security")
                 return fail(err, "config: unknown key \"" + std::string(k) + "\" in \"(top level)\"");
-            if (!(k == "upstream" ? apply_upstream(v, s, err) : apply_group(k, v, s, err)))
+            if (!(k == "upstream" ? apply_upstream(v, s, err) :
+                  k == "security" ? apply_security(v, s, err) : apply_group(k, v, s, err)))
                 return false;
         }
         return true;

@@ -3,8 +3,15 @@
   "_optional": "Every key is optional. An absent key leaves the default alone, so a real config is usually three or four lines.",
   "_precedence": "The file is read first and command-line flags overwrite it; --help names the key each flag sets. Precedence is NOT positional: a flag wins whether it appears before or after --config. Passing --config twice is an error.",
   "_strict": "Unknown keys are a startup ERROR, never ignored: a silently-skipped typo is how an operator ends up believing a setting took effect. Wrong types, bad enum values and out-of-range numbers are refused the same way. Keys beginning with _ are comments.",
-  "_secrets": "Paths only. Never put a token or a provider API key in this file. Provider credentials travel per request, from the client.",
+  "_secrets": "此文件展示上游原版的兼容默认值，不适合公网多用户部署。安全模式请参见 app/ai-gateway.example.json：所有真实密钥由环境变量提供。",
   "_pinned": "app/tests/config_test.cpp asserts these values equal the constants in the code, so this file cannot drift from the defaults it claims to document.",
+
+  "security": {
+    "_warning": "默认不启动服务：须配置 security.enabled=true 和 users，或仅本地兼容测试显式启用 security.legacy_mode=true。",
+    "enabled": false,
+    "legacy_mode": false,
+    "_allow_insecure_http": "安全模式默认需要 TLS；仅隔离本地 Mock 可显式设置 allow_insecure_http=true。"
+  },
 
   "listen": {
     "_port": "The one listening port. With workers > 1 every worker binds it with SO_REUSEPORT.",
@@ -17,7 +24,7 @@
     "_key": "Private key, PEM, and it must not be readable beyond its owner (chmod 600) or startup refuses it. Example: /etc/llmbridge/key.pem"
   },
 
-  "_upstream_table": "An OBJECT for one venue, as below, or an ARRAY of the same object for several. With an array, a policy installed by a consuming program selects the index per request; llmbridge itself always uses the first, because choosing needs measurements it does not collect. Order is the contract: the index a policy returns is a position in this list. strip_headers is gateway-wide: in an array it applies to every venue whichever entry sets it, and entries that set it must list the same headers.",
+  "_upstream_table": "upstream 可以是单个对象，也可以是多个上游组成的数组。数组顺序决定上游索引，内置 routing 策略会根据健康状态和路由模式选择上游。strip_headers 对整个网关生效。",
   "_upstream_example": "\"upstream\": [ {\"url\": \"https://api.anthropic.com\", \"dialect\": \"anthropic\"}, {\"url\": \"https://api.together.xyz\", \"dialect\": \"openai\"} ]",
 
   "upstream": {
@@ -28,7 +35,38 @@
     "dialect": "openai",
 
     "_strip_headers": "Header names removed from every request before it is forwarded, matched case-insensitively and exactly. Empty by default, which leaves passthrough a single memcpy. Use it when a client header must not reach a third-party provider: an internal routing header, or an identity token meant for THIS gateway and nobody else. Translating modes already rebuild from a whitelist; this also stops a stripped Authorization being promoted to the provider credential.",
-    "strip_headers": []
+    "strip_headers": [],
+
+    "_credential_header": "可选的 x-kottos-key-* 客户端请求头，用于携带该上游的密钥。只会转发被选中上游对应的密钥。",
+    "credential_header": "",
+
+    "_credential_env": "安全模式中保存 Provider Key 的环境变量名；默认兼容模式不使用。",
+
+    "_model": "可选的上游模型名称；空字符串表示保留客户端请求的模型。",
+    "model": "",
+    "_models": "可选的客户端模型池。多上游时一旦某项配置 models，每个上游都必须配置非空列表；model 是发给 Provider 的映射名，含义不同。"
+  },
+
+  "routing": {
+    "_mode": "first 优先第一个上游并在传输故障后切换；round_robin 轮询；sticky 根据会话头或请求前缀哈希选择。",
+    "mode": "first",
+    "_max_attempts": "响应尚未发送给客户端时，一次请求最多尝试的上游数量。",
+    "max_attempts": 3,
+    "_failure_threshold": "连续出现传输错误、408、429 或 5xx 后，后续请求暂时跳过该上游的阈值。",
+    "failure_threshold": 3,
+    "_cooldown_s": "异常上游的冷却秒数；全部上游都在冷却时仍允许一次探测。",
+    "cooldown_s": 10,
+    "_sticky_header": "客户端为每段对话提供的稳定会话标识请求头。",
+    "sticky_header": "x-conversation-id",
+    "_drained_upstreams": "SIGHUP 可热更新；填写上游数组索引的字符串，摘除后不再分配新请求，已在途请求继续完成。其他配置改动须重启。",
+    "drained_upstreams": [],
+    "_allow_unsafe_replay": "默认禁止重放可能已被上游执行的请求。设置 true 才允许完整错误响应/已发送请求的自动重试；可能重复执行和计费。",
+    "allow_unsafe_replay": false
+  },
+
+  "management": {
+    "_port": "AI-llm-transplot 管理端口。0 表示关闭；启用后只绑定 127.0.0.1，不能通过公网代理暴露。",
+    "port": 0
   },
 
   "timeouts": {
@@ -61,6 +99,9 @@
 
     "_log_level": "trace | debug | info | warn | error | off. Lines BELOW the level compiled in at build time do not exist at all, so raising this at runtime cannot resurrect them: build with -DLLMBRIDGE_LOG_LEVEL=debug for the per-connection lines. Release compiles in info and above so the published latency numbers are measured on what ships.",
     "log_level": "info",
+
+    "_request_log": "AI-llm-transplot 有界异步 JSON 请求日志；不输出密钥或正文，默认关闭以保持数据面开销。",
+    "request_log": false,
 
     "_workers": "1 to 4096 shared-nothing event loops, one thread each, all binding the same port with SO_REUSEPORT. The kernel picks a worker per CONNECTION by hashing the 4-tuple, so a single keep-alive client stays on one worker for that connection's life; a client wanting to spread across workers opens several connections.",
     "workers": 1,

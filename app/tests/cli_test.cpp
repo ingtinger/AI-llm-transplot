@@ -39,6 +39,10 @@ Flags override the file wherever they appear. In parentheses: the file key.
   --tls-key PATH              private key, PEM, owner-only (listen.key)
   --upstream URL              IP:PORT, HOST:PORT or http(s)://HOST[:PORT][/BASE] (upstream.url)
   --upstream-dialect NAME     what the venue speaks: openai|anthropic|gemini|cohere|bedrock|azure (upstream.dialect)
+  --legacy-mode               allow unauthenticated local compatibility mode (security.legacy_mode)
+  --routing-mode MODE         built-in upstream selection policy: first|round_robin|sticky (routing.mode)
+  --routing-max-attempts N    maximum venues tried for one request, 1..64 (routing.max_attempts)
+  --management-port PORT      loopback-only health, readiness and Prometheus metrics; 0 = off, 0..65535 (management.port)
   --upstream-timeout SECONDS  upstream silence before a request is aborted, 0 = off (timeouts.upstream_s)
   --client-idle SECONDS       idle client lifetime, 0 = off (timeouts.client_idle_s)
   --pool-idle SECONDS         idle pooled upstream lifetime, 0 = off (timeouts.pool_idle_s)
@@ -48,6 +52,7 @@ Flags override the file wherever they appear. In parentheses: the file key.
   --body-min-rate BYTES       a streamed body's least average upload in bytes a second, past its grace, 0 = off, 0..1073741824 (timeouts.body_min_rate)
   --io NAME                   event loop: auto|epoll|uring (runtime.io)
   --log-level LEVEL           log level: trace|debug|info|warn|error|off (runtime.log_level)
+  --request-log               emit bounded structured request logs on a dedicated thread (runtime.request_log)
   --workers N                 event loops sharing the port, 1..4096 (runtime.workers)
   --timing-headers            add x-llmbridge-* timing headers (runtime.timing_headers)
   --duration SECONDS          stop after this long and print the profile, 0 = until signalled (runtime.duration_s)
@@ -59,6 +64,15 @@ Flags override the file wherever they appear. In parentheses: the file key.
   --stream-openai-body MODE   forward an OpenAI client's body as it arrives, each chunk checked first: on|off (runtime.stream_openai_body)
 File only:
   upstream.strip_headers      header names dropped from every upstream request
+  upstream.credential_header  client header containing this venue's key
+  upstream.credential_env     environment variable holding this venue's key
+  upstream.model              model name sent to this venue; empty keeps the client model
+  upstream.models             client model names this venue can serve
+  routing.failure_threshold   failures before a venue enters cooldown
+  routing.cooldown_s          seconds a failed venue is skipped
+  routing.sticky_header       header used by sticky routing
+  routing.drained_upstreams   upstream indices excluded from new requests; SIGHUP reloadable
+  routing.allow_unsafe_replay allow retry after a request may have run upstream
   -h, --help                  print this and exit
 )";
 } // namespace
@@ -77,6 +91,17 @@ TEST_P(CliReject, IsRefusedAndNamesTheProblem)
 }
 
 using Args = std::vector<const char*>;
+
+TEST(Cli, ManagementFlagsLand)
+{
+    Settings s;
+    std::string err;
+    EXPECT_EQ(parse({"--management-port", "9091", "--request-log"}, s, err), Cli::Run) << err;
+    EXPECT_EQ(s.management_port, 9091);
+    EXPECT_TRUE(s.request_log);
+    EXPECT_EQ(parse({"--management-port", "65536"}, s, err), Cli::Refused);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     P16, CliReject,
     ::testing::Values(
@@ -149,7 +174,8 @@ TEST(Cli, ValuesAndSwitchesLand)
                      "--tls-cert", "/c", "--tls-key", "/k", "--prefault-mb", "16",
                      "--client-idle", "60", "--pool-idle", "45", "--connect-timeout", "2",
                      "--stream-body", "off", "--stream-body-max", "0", "--body-timeout", "600",
-                     "--body-grace", "2.5", "--body-min-rate", "0"},
+                     "--body-grace", "2.5", "--body-min-rate", "0", "--routing-mode",
+                     "sticky", "--routing-max-attempts", "2"},
                     s, err),
               Cli::Run)
         << err;
@@ -168,6 +194,8 @@ TEST(Cli, ValuesAndSwitchesLand)
     EXPECT_DOUBLE_EQ(s.body_s, 600);
     EXPECT_DOUBLE_EQ(s.body_grace_s, 2.5);
     EXPECT_EQ(s.body_min_rate, 0);
+    EXPECT_EQ(s.routing_mode, "sticky");
+    EXPECT_EQ(s.routing_max_attempts, 2);
 }
 
 // The file is applied first wherever --config sits, so a flag always wins.

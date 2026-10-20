@@ -86,6 +86,15 @@ namespace llmbridge
     inline constexpr std::string_view kKeyHeaderPrefix = "x-kottos-key-";
     inline constexpr size_t kMaxKeyHeaderName = 64;
 
+    /// 服务端凭证由策略持有，必须在请求结束前保持有效；不得包含换行或控制字符。
+    [[nodiscard]] constexpr bool server_credential_ok(std::string_view value) noexcept
+    {
+        if (value.empty() || value.size() > 255) return false;
+        for (unsigned char c : value)
+            if (c < 0x21 || c > 0x7e) return false;
+        return true;
+    }
+
     /// The rule for Decision::credential_header and Retry::credential_header, public so a
     /// policy can static_assert its own: the prefix in any case, then at least one of
     /// [A-Za-z0-9._-], kMaxKeyHeaderName bytes in all.
@@ -164,6 +173,8 @@ namespace llmbridge
         /// value goes as the venue's own key header and is the only credential sent: absent,
         /// empty, repeated or unsafe is a 400, never another header. Copied, like `model`.
         std::string_view credential_header{};
+        /// 与 credential_header 互斥；策略须保持生命周期覆盖整个请求。
+        std::string_view server_credential{};
 
         /// A decision on the head only: allowed, but nothing goes upstream before the
         /// body's last byte. Ignored on a whole body and from confirm().
@@ -200,9 +211,8 @@ namespace llmbridge
     };
 
     /// A venue did not answer (refused connect, failed write, EOF or silence before the
-    /// response was whole) and the client has seen nothing. `retryable`: the policy may fail
-    /// over; false (one venue, a response byte in, the third venue) ignores its answer and
-    /// leaves the failure for it to count. An unparseable answer never reaches here.
+    /// response was whole), or a complete retryable HTTP error was received, and the
+    /// client has seen nothing. Complete errors are offered only to on_status_retry().
     struct FailureFacts
     {
         int upstream_index = -1; ///< the venue that just failed
@@ -212,6 +222,8 @@ namespace llmbridge
         uint64_t tag = 0;        ///< Decision::tag of this request, verbatim; 0 if unset
         uint64_t seq = 0;        ///< RequestFacts::seq of this request, as RequestRecord::seq carries it
         bool retryable = true;   ///< false: the gateway gives up whatever on_failure returns
+        bool response_received = false; ///< 已收到完整、可按状态码重试的 HTTP 错误响应
+        std::string_view model{}; ///< 客户端请求的模型；重试不得越出其上游池
     };
 
     /// A venue answered: the status of a response head the gateway parsed, its 503 as much as
@@ -226,6 +238,7 @@ namespace llmbridge
         uint64_t tag = 0;        ///< Decision::tag of this request, verbatim; 0 if unset
         uint64_t seq = 0;        ///< RequestFacts::seq of this request, as RequestRecord::seq carries it
         bool streamed = false;   ///< a 200 event stream, reported at its head
+        uint16_t retry_after_s = 0; ///< 解析出的 Retry-After 秒数；缺失时为零
     };
 
     /// Value-initialised means give up and let the client see the error.
@@ -240,6 +253,8 @@ namespace llmbridge
         /// As Decision::credential_header, for the venue named here. Left empty after any
         /// attempt that named one, the decision or a retry, the request is not retried.
         std::string_view credential_header{};
+        /// 与 credential_header 互斥；同样由策略持有直到请求结束。
+        std::string_view server_credential{};
         /// As Decision's, for the venue named here; empty sends none of the failed one's.
         /// Still streaming, these and `service_tier` splice only if the head decision set
         /// each too (12e); else the body parks.
@@ -257,15 +272,21 @@ namespace llmbridge
     class Policy
     {
       public:
+        /// 是否允许重放可能已被上游执行的请求；自定义策略维持原行为，内置策略默认禁止。
+        [[nodiscard]] virtual bool allows_unsafe_replay() const noexcept { return true; }
         virtual ~Policy() = default;
 
         /// noexcept and allocation-free on the allow path: every request pays for it.
         virtual Decision decide(const RequestFacts& facts) noexcept = 0;
 
-        /// Once per venue that failed with nothing sent to the client. The default never
+        /// Once per venue that failed without a complete answer. The default never
         /// retries: llmbridge measures no health, so ordering, ejection and cooldown are the
         /// policy's. With FailureFacts::retryable false the answer is ignored: count, not route.
         virtual Retry on_failure(const FailureFacts&) noexcept { return {}; }
+
+        /// 完整的 408/429/5xx 在提交客户端响应前调用；已调用 on_reply() 记账。
+        /// 默认保留上游原始错误。启用重试的策略需考虑非幂等请求可能重复执行。
+        virtual Retry on_status_retry(const FailureFacts&) noexcept { return {}; }
 
         virtual bool wants_prefix_hash() const noexcept { return false; }
 
@@ -299,10 +320,19 @@ namespace llmbridge
         /// the reply. A whole response is reported once it is whole, a 200 stream at its
         /// head, translated or not, and a reply after a failover with its attempt. One cut
         /// short goes to on_failure instead, so each venue attempt reaches one hook at most.
+        /// A complete retryable error may then reach on_status_retry(), never on_failure().
         /// Not for a reply to a client already gone: the gateway closes that venue unread.
         /// The default does nothing; it runs on the loop thread on every response, so keep
         /// it as cheap as decide().
         virtual void on_reply(const ReplyFacts&) noexcept {}
+
+        /// 客户端在正常完成前断开；策略可释放已占用的在途名额。
+        /// upstream_sent 表示请求已向上游发送，实际用量可能不可知。
+        virtual void on_abandon(uint64_t tag, bool upstream_sent) noexcept
+        {
+            (void)tag;
+            (void)upstream_sent;
+        }
 
       protected:
         Policy() = default;

@@ -171,7 +171,7 @@ namespace llmbridge::detail
         c->upstream_slot = 0;
         if (d.upstream_index >= 0 && static_cast<size_t>(d.upstream_index) < _upstreams.size())
             c->upstream_slot = d.upstream_index;
-        else if (d.upstream_index >= 0 && !d.credential_header.empty())
+        else if (d.upstream_index >= 0 && (!d.credential_header.empty() || !d.server_credential.empty()))
             return error_respond(c, 500, "policy named a key for a venue past the table"), false;
         else if (d.upstream_index >= 0)
             LB_WARN(ReqId{c->req.f.req_seq}, " policy chose upstream ", static_cast<int64_t>(d.upstream_index),
@@ -179,6 +179,7 @@ namespace llmbridge::detail
         // Copied: the views die when decide() returns. Refused rather than cut, which
         // would route to whatever model the prefix names.
         ReqState& f = c->req.f;
+        f.policy_tag = d.tag;
         if (!f.model_override.set(d.model) || !f.tier_override.set(d.service_tier) ||
             !f.speed_override.set(d.speed) || !f.geo_override.set(d.inference_geo))
             return error_respond(c, 500, "policy override longer than the gateway holds"), false;
@@ -194,8 +195,11 @@ namespace llmbridge::detail
         // A name outside the family would be echoed by a byte-forward: refused, never guessed.
         if (!d.credential_header.empty() && !key_header_ok(d.credential_header))
             return error_respond(c, 400, kWhyKeyUnusable, refuse::kKeyHeaderUnusable), false;
+        if (!d.server_credential.empty() &&
+            (!d.credential_header.empty() || !server_credential_ok(d.server_credential)))
+            return error_respond(c, 500, "policy server credential unusable"), false;
         f.key_header.set(d.credential_header);
-        f.policy_tag = d.tag;
+        f.server_credential = d.server_credential;
         return apply_hedge(c, d);
     }
 
@@ -260,6 +264,7 @@ namespace llmbridge::detail
         d.reason = "";
         d.tag = c->req.f.policy_tag;
         d.credential_header = c->req.f.key_header.view();
+        d.server_credential = c->req.f.server_credential;
         d.hold = c->req.f.held;
         d.substitute_model = c->req.f.subst_model.view();
         d.substitute_for = c->req.f.subst_for.view();
@@ -289,7 +294,8 @@ namespace llmbridge::detail
         }
         // The venue apply_decision would pick: out of range is the first, unless a key is named.
         const bool in_table = d.upstream_index >= 0 && static_cast<size_t>(d.upstream_index) < _upstreams.size();
-        const int slot = in_table ? d.upstream_index : (d.upstream_index >= 0 && !d.credential_header.empty() ? -1 : 0);
+        const int slot = in_table ? d.upstream_index :
+                         (d.upstream_index >= 0 && (!d.credential_header.empty() || !d.server_credential.empty()) ? -1 : 0);
         // The model the venue gets, as an override or a substitution: either spelling of the
         // same one is a keep, so a splice already done stands (12d). In force, a parked body's
         // is still to be rewritten; a streamed one's went spliced or as it was.
@@ -312,7 +318,8 @@ namespace llmbridge::detail
             member(d.service_tier, BodyScan::kServiceTier) == member(f.tier_override.view(), BodyScan::kServiceTier) &&
             member(d.speed, BodyScan::kSpeed) == member(f.speed_override.view(), BodyScan::kSpeed) &&
             member(d.inference_geo, BodyScan::kInferenceGeo) == member(f.geo_override.view(), BodyScan::kInferenceGeo) &&
-            d.anthropic_beta == f.beta_override.view() && d.credential_header == f.key_header.view();
+            d.anthropic_beta == f.beta_override.view() && d.credential_header == f.key_header.view() &&
+            d.server_credential == f.server_credential;
         f.policy_tag = d.tag; // a tag alone changing is still a keep
         if (same)
         {
@@ -407,6 +414,9 @@ namespace llmbridge::detail
             if (const Refusal r = named_key(std::string_view(c->rbuf.data(), c->msg.header_len), c->req.f.head,
                                             c->req.f.key_header.view(), up.dialect, key))
                 return error_respond(c, 400, r.why, r.detail);
+        if (!c->req.f.server_credential.empty())
+            if (const Refusal r = server_key(c->req.f.server_credential, up.dialect, key))
+                return error_respond(c, 500, r.why, r.detail);
         // Built before an upstream is acquired, so a bad body cannot leak a pooled one.
         note_build(c->msg.total_len);
         const std::string_view body = body_so_far(c);
@@ -570,6 +580,8 @@ namespace llmbridge::detail
 
     ConnBase* Engine::forget(ClientConn* c) noexcept
     {
+        if (_policy && !c->req.f.sunk && c->req.f.phase != Phase::Idle)
+            _policy->on_abandon(c->req.f.policy_tag, c->req.f.ts_up_sent > 0);
         if (c->req.f.body_streaming && c->up) reset_venue(c->up);
         stop_body(c);
         c->req.f.body_parked = false;

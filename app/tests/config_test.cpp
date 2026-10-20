@@ -24,17 +24,46 @@
 using llmbridge::app::Settings;
 using llmbridge::app::parse_config;
 
+TEST(Config, SecurityUsersAndEnvironmentNamesAreStrict)
+{
+    Settings s;
+    std::string err;
+    ASSERT_TRUE(parse_config(R"({"upstream":{"credential_env":"PROVIDER_KEY"},"security":{"enabled":true,"users":[{"id":"alice","tenant":"team","key_env":"ALICE_KEY","models":["chat"],"upstreams":[0],"requests_per_minute":2,"max_concurrent":1}]}})", s, err)) << err;
+    EXPECT_TRUE(s.security_enabled);
+    EXPECT_EQ(s.upstream_credential_env, "PROVIDER_KEY");
+    ASSERT_EQ(s.users.size(), 1U);
+    EXPECT_EQ(s.users[0].id, "alice");
+    EXPECT_EQ(s.users[0].upstreams[0], 0);
+    Settings invalid;
+    EXPECT_FALSE(parse_config(R"({"security":{"users":[{"id":"alice","tenant":"team","key_env":"ALICE_KEY","models":["chat"],"upstreams":[1.5]}]}})", invalid, err));
+    EXPECT_FALSE(parse_config(R"({"security":{"unknown":true}})", invalid, err));
+    EXPECT_FALSE(parse_config(R"({"security":{"allow_insecure_http":"true"}})", invalid, err));
+}
+
+TEST(Config, DrainIndicesAreReadFromRoutingGroup)
+{
+    Settings s;
+    std::string err;
+    ASSERT_TRUE(parse_config(R"({"routing":{"drained_upstreams":["0","2"]}})", s, err)) << err;
+    EXPECT_EQ(s.routing_drained_upstreams, (std::vector<std::string>{"0", "2"}));
+    EXPECT_FALSE(parse_config(R"({"routing":{"drained_upstreams":[0]}})", s, err));
+}
+
 TEST(Config, FullFileAppliesEveryGroup)
 {
     const std::string text = R"({
       "_note": "comments are keys beginning with underscore",
       "listen":   { "port": 8443, "tls": true, "cert": "/c.pem", "key": "/k.pem" },
       "upstream": { "url": "https://api.anthropic.com", "dialect": "anthropic",
+                    "credential_header": "x-kottos-key-anthropic", "model": "claude-sonnet",
                     "strip_headers": ["authorization", "X-Internal"] },
+      "routing":  { "mode": "sticky", "max_attempts": 2, "failure_threshold": 4,
+                    "cooldown_s": 15, "sticky_header": "x-chat-id" },
+      "management": { "port": 9091 },
       "timeouts": { "upstream_s": 90, "client_idle_s": 259200, "pool_idle_s": 45,
                     "connect_s": 7 },
       "runtime":  { "io": "uring", "workers": 3, "timing_headers": true,
-                    "duration_s": 12, "warmup_s": 2, "log_level": "debug",
+                    "duration_s": 12, "warmup_s": 2, "log_level": "debug", "request_log": true,
                     "prefault_mb": 16 }
     })";
     Settings c;
@@ -48,6 +77,15 @@ TEST(Config, FullFileAppliesEveryGroup)
     EXPECT_TRUE(c.more_upstreams.empty()); // the object form is one entry
     EXPECT_EQ(c.upstream, "https://api.anthropic.com");
     EXPECT_EQ(c.dialect, "anthropic");
+    EXPECT_EQ(c.upstream_credential_header, "x-kottos-key-anthropic");
+    EXPECT_EQ(c.upstream_model, "claude-sonnet");
+    EXPECT_EQ(c.routing_mode, "sticky");
+    EXPECT_EQ(c.routing_max_attempts, 2);
+    EXPECT_EQ(c.routing_failure_threshold, 4);
+    EXPECT_DOUBLE_EQ(c.routing_cooldown_s, 15);
+    EXPECT_EQ(c.routing_sticky_header, "x-chat-id");
+    EXPECT_EQ(c.management_port, 9091);
+    EXPECT_TRUE(c.request_log);
     EXPECT_DOUBLE_EQ(c.upstream_s, 90);
     EXPECT_DOUBLE_EQ(c.client_idle_s, 259200);
     EXPECT_DOUBLE_EQ(c.pool_idle_s, 45);
@@ -95,6 +133,17 @@ TEST(Config, AbsentKeysAreNotApplied)
     EXPECT_TRUE(c.tls_cert.empty());
     EXPECT_EQ(c.upstream, "10.0.0.1:1");
     EXPECT_EQ(c.dialect, "openai");
+    EXPECT_TRUE(c.upstream_credential_header.empty());
+    EXPECT_TRUE(c.upstream_model.empty());
+    EXPECT_EQ(c.routing_mode, "first");
+    EXPECT_EQ(c.routing_max_attempts, 3);
+    EXPECT_EQ(c.routing_failure_threshold, 3);
+    EXPECT_DOUBLE_EQ(c.routing_cooldown_s, 10);
+    EXPECT_EQ(c.routing_sticky_header, "x-conversation-id");
+    EXPECT_TRUE(c.routing_drained_upstreams.empty());
+    EXPECT_FALSE(c.routing_allow_unsafe_replay);
+    EXPECT_EQ(c.management_port, 0);
+    EXPECT_FALSE(c.request_log);
 }
 
 // ── The upstream table ───────────────────────────────────────────────────────
@@ -106,8 +155,10 @@ TEST(Config, AbsentKeysAreNotApplied)
 TEST(Config, UpstreamArrayBecomesATableInOrder)
 {
     const char* text = R"({
-      "upstream": [ { "url": "127.0.0.1:9001", "dialect": "anthropic" },
-                    { "url": "127.0.0.1:9002", "dialect": "openai" },
+      "upstream": [ { "url": "127.0.0.1:9001", "dialect": "anthropic",
+                      "credential_header": "x-kottos-key-a", "model": "model-a" },
+                    { "url": "127.0.0.1:9002", "dialect": "openai",
+                      "credential_header": "x-kottos-key-b", "model": "model-b" },
                     { "url": "https://api.anthropic.com", "dialect": "anthropic" } ]
     })";
     Settings c;
@@ -122,6 +173,10 @@ TEST(Config, UpstreamArrayBecomesATableInOrder)
     EXPECT_EQ(c.dialect, "anthropic");
     EXPECT_EQ(c.more_upstreams[0].dialect, "openai");
     EXPECT_EQ(c.more_upstreams[1].dialect, "anthropic");
+    EXPECT_EQ(c.upstream_credential_header, "x-kottos-key-a");
+    EXPECT_EQ(c.upstream_model, "model-a");
+    EXPECT_EQ(c.more_upstreams[0].credential_header, "x-kottos-key-b");
+    EXPECT_EQ(c.more_upstreams[0].model, "model-b");
 }
 
 TEST(Config, EachEntryValidatesLikeTheObjectForm)
@@ -134,6 +189,23 @@ TEST(Config, EachEntryValidatesLikeTheObjectForm)
     err.clear();
     EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","dialect":"claude"}]})", c, err));
     EXPECT_NE(err.find("must be one of"), std::string::npos) << err;
+}
+
+TEST(Config, PerUpstreamClientModelPoolsAreStrict)
+{
+    Settings c;
+    std::string err;
+    ASSERT_TRUE(parse_config(R"({"upstream":[{"url":"a:1","models":["chat","code"],"model":"provider-a"},{"url":"b:2","models":["code"]}]})", c, err)) << err;
+    EXPECT_EQ(c.upstream_models, (std::vector<std::string>{"chat", "code"}));
+    ASSERT_EQ(c.more_upstreams.size(), 1u);
+    EXPECT_EQ(c.more_upstreams[0].models, (std::vector<std::string>{"code"}));
+    EXPECT_EQ(c.upstream_model, "provider-a");
+    EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"a:1","models":["chat"]},{"url":"b:2"}]})", c, err));
+    EXPECT_NE(err.find("every upstream"), std::string::npos);
+    EXPECT_FALSE(parse_config(R"({"upstream":{"models":["chat","chat"]}})", c, err));
+    EXPECT_NE(err.find("duplicate"), std::string::npos);
+    EXPECT_FALSE(parse_config(R"({"upstream":{"models":[]}})", c, err));
+    EXPECT_FALSE(parse_config(R"({"upstream":{"models":"chat"}})", c, err));
 }
 
 class ConfigReject : public ::testing::TestWithParam<std::pair<const char*, const char*>> {};
@@ -237,6 +309,8 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
                      static_cast<double>(llmbridge::Gateway::kDefaultConnectNs) / 1e9);
     EXPECT_EQ(c.io, "auto");
     EXPECT_EQ(c.log_level, "info");
+    EXPECT_EQ(c.management_port, 0);
+    EXPECT_FALSE(c.request_log);
     EXPECT_EQ(c.workers, 1);
     EXPECT_FALSE(c.timing_headers);
     EXPECT_DOUBLE_EQ(c.duration_s, 0);
@@ -376,6 +450,16 @@ TEST(Config, DurationKeepsItsFraction)
     std::string err;
     ASSERT_TRUE(parse_config(R"({"runtime":{"duration_s":0.5}})", c, err)) << err;
     EXPECT_DOUBLE_EQ(c.duration_s, 0.5);
+}
+
+TEST(Config, ManagementPortIsBounded)
+{
+    Settings c;
+    std::string err;
+    EXPECT_FALSE(parse_config(R"({"management":{"port":65536}})", c, err));
+    EXPECT_NE(err.find("out of range"), std::string::npos) << err;
+    ASSERT_TRUE(parse_config(R"({"management":{"port":0}})", c, err)) << err;
+    EXPECT_EQ(c.management_port, 0);
 }
 
 // Every row's kind must match the field it writes, or its first use throws.

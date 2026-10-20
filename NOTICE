@@ -14,3 +14,10 @@ and Google Benchmark (Apache-2.0). See the build documentation for
 details. These components are not linked into the distributed
 artifact and impose no obligations on downstream consumers.
 
+AI-llm-transplot modifications
+Copyright 2026 AI-llm-transplot contributors.
+
+The AI-llm-transplot branch adds built-in multi-upstream routing, failover,
+circuit cooldown, conversation affinity, per-upstream model mapping,
+Chinese documentation, and related tests.
+

@@ -22,7 +22,22 @@ namespace llmbridge::app
 {
     struct Venue
     {
-        std::string url, dialect;
+        std::string url, dialect, credential_header, model, credential_env;
+        std::vector<std::string> models; // 可服务的客户端模型；与 model 映射不同
+        bool operator==(const Venue&) const = default;
+    };
+
+    struct UserSettings
+    {
+        std::string id, tenant, key_env;
+        std::vector<std::string> models;
+        std::vector<int> upstreams;
+        int requests_per_minute = 60;
+        int max_concurrent = 4;
+        int daily_tokens = 0, monthly_tokens = 0; // 0 表示不限制
+        int64_t expires_unix_s = 0; // 0 表示不过期
+        bool disabled = false;
+        bool operator==(const UserSettings&) const = default;
     };
 
     /// Initialised to the built-in defaults; the file is applied first, then the flags.
@@ -32,8 +47,22 @@ namespace llmbridge::app
         bool listen_tls = false;
         std::string tls_cert, tls_key;
         std::string upstream = "127.0.0.1:9001", dialect = "openai"; // venue 0
+        std::string upstream_credential_header, upstream_model;
+        std::string upstream_credential_env;
+        std::vector<std::string> upstream_models; // 首个上游的客户端模型池
         std::vector<Venue> more_upstreams;                           // venues 1..N, file only
+        bool security_enabled = false;
+        bool legacy_mode = false; // 仅显式开启旧的无认证直通行为
+        bool allow_insecure_http = false; // 仅供本地 Mock 测试使用
+        std::vector<UserSettings> users;
         std::vector<std::string> strip_headers;                      // gateway-wide
+        std::string routing_mode = "first", routing_sticky_header = "x-conversation-id";
+        std::vector<std::string> routing_drained_upstreams; // SIGHUP 可热更新的索引列表
+        int routing_max_attempts = 3, routing_failure_threshold = 3;
+        bool routing_allow_unsafe_replay = false;
+        double routing_cooldown_s = 10;
+        int management_port = 0; // 0 关闭；启用后仅监听 127.0.0.1
+        bool request_log = false;
         double upstream_s = static_cast<double>(Gateway::kDefaultUpstreamIdleNs) / 1e9;
         double client_idle_s = static_cast<double>(Gateway::kDefaultClientIdleNs) / 1e9;
         double pool_idle_s = static_cast<double>(Gateway::kDefaultPoolIdleNs) / 1e9;
@@ -47,6 +76,7 @@ namespace llmbridge::app
         double duration_s = 0, warmup_s = 0, prefault_mb = 0, retain_mb = 4;
         std::string stream_body = "on", stream_openai_body = "on";
         int stream_body_max = static_cast<int>(Gateway::kDefaultStreamBodyMax);
+        bool operator==(const Settings&) const = default;
     };
 
     enum class Kind { Bool, Int, Number, Text, Choice, List };

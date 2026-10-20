@@ -178,6 +178,7 @@ namespace llmbridge
         FixedStr<32> geo_override;
         FixedStr<kMaxBetaToken> beta_override; ///< added to anthropic-beta at an x-api-key venue
         FixedStr<kMaxKeyHeaderName> key_header; ///< the family header holding this attempt's key
+        std::string_view server_credential; ///< 策略持有；网关不复制密钥内容
         FixedStr<64> model;          ///< the client's, for the policy and the sink
         FixedStr<16> asked_tier;     ///< the client's own service_tier
         FixedStr<8> asked_cache_ttl; ///< the client's prompt_cache_options.ttl

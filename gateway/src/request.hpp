@@ -100,6 +100,8 @@ namespace llmbridge::detail
     /// repeated in any case, absent or empty, or unsafe; nothing else stands in.
     [[nodiscard]] Refusal named_key(std::string_view head, const HeadFacts& f, std::string_view name,
                                     UpstreamDialect venue, NamedKey& out) noexcept;
+    [[nodiscard]] Refusal server_key(std::string_view value, UpstreamDialect venue,
+                                     NamedKey& out) noexcept;
 
     /// The policy's anthropic-beta token for `up`: only a venue taking an x-api-key gets one.
     [[nodiscard]] inline std::string_view beta_for(const Upstream& up, const ReqState& f) noexcept

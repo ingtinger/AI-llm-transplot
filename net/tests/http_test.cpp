@@ -1090,6 +1090,17 @@ TEST(ProviderHeads, RateLimitHeadsNameTheQuota)
     }
 }
 
+TEST(ProviderHeads, RetryAfterAcceptsOnlyValidImfFixdate)
+{
+    using llmbridge::net::http::retry_after_seconds;
+    EXPECT_EQ(retry_after_seconds("120"), 120);
+    EXPECT_EQ(retry_after_seconds("999999"), 65535);
+    EXPECT_EQ(retry_after_seconds("Sun, 06 Nov 1994 08:49:37 GMT"), 0);
+    EXPECT_EQ(retry_after_seconds("Sun, 06 Nov 2094 08:49:37 GMT"), 65535);
+    EXPECT_EQ(retry_after_seconds("Sun, 31 Feb 2094 08:49:37 GMT"), 0);
+    EXPECT_EQ(retry_after_seconds("tomorrow"), 0);
+}
+
 // The framer frames every provider reply exactly as parse_response does, byte by byte,
 // and parses the head once however many reads the body takes.
 TEST(ResponseFramer, FramesLikeParseResponseAndParsesTheHeadOnce)

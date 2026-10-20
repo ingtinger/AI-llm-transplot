@@ -1,0 +1,59 @@
+{
+  "_说明": "阶段三单机安全模式示例。真实密钥只从环境变量注入；对外部署必须启用 TLS。",
+  "listen": {
+    "port": 8088,
+    "tls": true,
+    "cert": "/path/to/cert.pem",
+    "key": "/path/to/key.pem"
+  },
+  "upstream": [
+    {
+      "url": "127.0.0.1:9001",
+      "dialect": "openai",
+      "credential_env": "PROVIDER_PRIMARY_KEY",
+      "models": ["chat-default"],
+      "model": "model-primary"
+    },
+    {
+      "url": "127.0.0.1:9002",
+      "dialect": "openai",
+      "credential_env": "PROVIDER_BACKUP_KEY",
+      "models": ["chat-default"],
+      "model": "model-backup"
+    }
+  ],
+  "security": {
+    "enabled": true,
+    "allow_insecure_http": false,
+    "users": [
+      {
+        "id": "alice", "tenant": "team-a", "key_env": "GATEWAY_ALICE_KEY",
+        "models": ["chat-default"], "upstreams": [0, 1],
+        "requests_per_minute": 60, "max_concurrent": 4,
+        "daily_tokens": 100000, "monthly_tokens": 1000000,
+        "expires_unix_s": 0
+      }
+    ]
+  },
+  "routing": {
+    "mode": "sticky",
+    "max_attempts": 2,
+    "failure_threshold": 3,
+    "cooldown_s": 10,
+    "sticky_header": "x-conversation-id"
+  },
+  "management": {
+    "port": 9091,
+    "_说明": "仅监听 127.0.0.1；0 表示关闭。请勿通过反向代理公开此端口。"
+  },
+  "timeouts": {
+    "connect_s": 5,
+    "upstream_s": 120
+  },
+  "runtime": {
+    "workers": 2,
+    "io": "auto",
+    "log_level": "info",
+    "request_log": false
+  }
+}

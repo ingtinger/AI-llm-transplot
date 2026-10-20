@@ -185,8 +185,10 @@ namespace llmbridge::detail
         void on_connect_error(UpstreamConn* u, int err) noexcept; // a connect's completion said no
         void release_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept;
         [[nodiscard]] bool pool_upstream(UpstreamConn* u, bool keep_alive, bool body_ended) noexcept;
-        bool upstream_failed(ClientConn* client, int status, const char* why) noexcept; // failover
-        [[nodiscard]] Retry failover_target(ClientConn* client, int status, const char* why) noexcept;
+        bool upstream_failed(ClientConn* client, int status, const char* why,
+                             bool response_received = false) noexcept; // failover
+        [[nodiscard]] Retry failover_target(ClientConn* client, int status, const char* why,
+                                            bool response_received) noexcept;
         enum class UpFail : uint8_t
         {
             Eof,

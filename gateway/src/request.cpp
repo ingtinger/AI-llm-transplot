@@ -315,6 +315,15 @@ namespace llmbridge::detail
         out = {line, value};
         return {};
     }
+    Refusal server_key(std::string_view value, UpstreamDialect venue, NamedKey& out) noexcept
+    {
+        out = {};
+        const std::string_view line = key_line_for(venue);
+        if (line.empty() || !server_credential_ok(value))
+            return {kWhyKeyUnusable, refuse::kKeyHeaderUnusable};
+        out = {line, value};
+        return {};
+    }
     // Spliced into a JSON string unescaped, as a policy's message is.
     static_assert(deny_message_ok(refuse::kKeyHeaderMissing) && deny_message_ok(refuse::kKeyHeaderRepeated) &&
                   deny_message_ok(refuse::kKeyHeaderUnusable) && deny_message_ok(refuse::kKeyHeaderTooMany));

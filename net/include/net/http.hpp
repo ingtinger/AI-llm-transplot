@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -389,9 +390,47 @@ namespace llmbridge::net::http
         enum class Quota : uint8_t { None = 0, Requests = 1, InputTokens = 2,
                                      OutputTokens = 3, Tokens = 4 };
         Quota quota_exhausted = Quota::None;
-        /// `Retry-After` in seconds, 0 when absent, saturated at 65535.
+        /// Retry-After 支持秒数和 IMF-fixdate；缺失为 0，最大 65535 秒。
         uint16_t retry_after_s = 0;
     };
+
+    inline uint16_t retry_after_seconds(std::string_view raw) noexcept
+    {
+        const std::string_view value = detail::trim_ows(raw);
+        size_t delta_seconds = 0;
+        if (detail::parse_strict_length(value, delta_seconds))
+            return static_cast<uint16_t>(std::min<size_t>(delta_seconds, 65535));
+        // 只接受 IMF-fixdate；旧式日期格式按缺失处理。
+        if (value.size() != 29 || value[3] != ',' || value[4] != ' ' || value[7] != ' ' ||
+            value[11] != ' ' || value[16] != ' ' || value[19] != ':' || value[22] != ':' ||
+            value.substr(25) != " GMT") return 0;
+        constexpr std::string_view months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        const auto number = [value](size_t pos, size_t len, unsigned& out) noexcept {
+            out = 0;
+            for (size_t i = pos; i < pos + len; ++i)
+            {
+                if (value[i] < '0' || value[i] > '9') return false;
+                out = out * 10 + static_cast<unsigned>(value[i] - '0');
+            }
+            return true;
+        };
+        unsigned day = 0, year = 0, hour = 0, minute = 0, second = 0;
+        if (!number(5, 2, day) || !number(12, 4, year) || !number(17, 2, hour) ||
+            !number(20, 2, minute) || !number(23, 2, second) || hour > 23 ||
+            minute > 59 || second > 59) return 0;
+        unsigned month = 0;
+        for (unsigned i = 0; i < 12; ++i)
+            if (value.substr(8, 3) == months[i]) month = i + 1;
+        if (month == 0) return 0;
+        using namespace std::chrono;
+        const year_month_day date{std::chrono::year{static_cast<int>(year)},
+                                  std::chrono::month{month}, std::chrono::day{day}};
+        if (!date.ok()) return 0;
+        const auto target = sys_days{date} + hours{hour} + minutes{minute} + seconds{second};
+        const auto remaining = ceil<std::chrono::seconds>(target - system_clock::now()).count();
+        return static_cast<uint16_t>(std::clamp<decltype(remaining)>(remaining, 0, 65535));
+    }
 
     // Unlike parse_request, accepts chunked (SSE and most non-streamed replies) and
     // reports the framing. NeedMore until the CRLFCRLF is buffered. `head_request`:
@@ -439,9 +478,7 @@ namespace llmbridge::net::http
                 }
                 case Field::RetryAfter:
                 {
-                    size_t n = 0; // seconds only; an HTTP-date reads as absent
-                    if (detail::parse_strict_length(h.value, n))
-                        out.retry_after_s = n > 65535 ? 65535 : static_cast<uint16_t>(n);
+                    out.retry_after_s = retry_after_seconds(h.value);
                     return true;
                 }
                 case Field::RequestsRemaining: return quota(h.value, Quota::Requests);

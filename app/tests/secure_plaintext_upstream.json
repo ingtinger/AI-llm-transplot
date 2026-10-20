@@ -1,0 +1,1 @@
+{"listen":{"port":0},"upstream":{"url":"http://192.0.2.1:9"},"security":{"enabled":true,"allow_insecure_http":true}}
