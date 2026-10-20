@@ -52,6 +52,9 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # ── Tests (GoogleTest, the only fetched dependency, and only for tests) ──────
 option(LLMBRIDGE_BUILD_TESTS "Build llmbridge module tests" ${PROJECT_IS_TOP_LEVEL})
 if (LLMBRIDGE_BUILD_TESTS)
+    if (POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif ()
     include(FetchContent)
     FetchContent_Declare(
             googletest

@@ -43,7 +43,7 @@ curl --cacert certs/cert.pem https://127.0.0.1:8088/v1/chat/completions \
 docker compose start mock-primary
 ```
 
-两次成功响应均应包含 Mock 的 `pong`。停止主 Mock 后，网关在连接失败时选择备用上游。查看管理状态可在容器内请求回环端口；不要额外映射 9091：
+正常响应包含 Mock 的 `pong`。停止主 Mock 后，如果下一次请求恰好复用了已关闭的连接，网关可能先返回错误，因为默认不重放已发送的请求；再发送一个新请求会在主上游冷却时选用备用上游。查看管理状态可在容器内请求回环端口；不要额外映射 9091：
 
 ```bash
 docker compose exec gateway bash -c 'exec 3<>/dev/tcp/127.0.0.1/9091; printf "GET /ready HTTP/1.0\r\n\r\n" >&3; IFS= read -r line <&3; printf "%s\n" "$line"'
@@ -51,14 +51,14 @@ docker compose logs --tail=30 gateway
 docker compose down
 ```
 
-镜像使用 OpenSSL 3 构建、非 root 用户运行，并以只读方式挂载配置和证书。`.env` 和 `certs/` 同时被 Git 与 Docker 构建上下文排除。Compose 的 JSON 日志限制为每文件 10 MB、最多 3 个文件。停止时先向进程发送 `SIGTERM`，30 秒后容器运行时可能强制结束；网关当前没有跨重启保留在途请求的机制。此 Compose 文件只用于本机演示，不应直接映射公网端口或把演示密钥用于真实 Provider。
+镜像使用 OpenSSL 3 构建、非 root 用户运行，并以只读方式挂载配置和证书。`.env`、`certs/` 和本地 `private/` 目录被 Docker 构建上下文排除；前两者也不会进入 Git。Compose 的 JSON 日志限制为每文件 10 MB、最多 3 个文件。停止时先向进程发送 `SIGTERM`，30 秒后容器运行时可能强制结束；网关当前没有跨重启保留在途请求的机制。此 Compose 文件只用于本机演示，不应直接映射公网端口或把演示密钥用于真实 Provider。
 
 ## systemd 单机示例
 
 使用 `LLMBRIDGE_TLS=ON` 构建后，安装网关二进制，创建只用于运行服务的账号，并将 [服务单元](../deploy/ai-llm-transplot.service) 安装为 `/etc/systemd/system/ai-llm-transplot.service`。将 [安全配置样例](../app/ai-gateway.example.json) 复制到 `/etc/ai-llm-transplot/config.json`，修改 Provider 地址、模型、证书路径及端口。配置文件只写环境变量名；真实凭据放在 `/etc/ai-llm-transplot/credentials.env`，格式为 `PROVIDER_PRIMARY_KEY=...` 等，权限设为 root 可读的 `0600`。TLS 私钥应仅由 `ai-gateway` 用户读取。
 
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin ai-gateway
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin ai-gateway
 sudo install -d -m 0750 -o root -g ai-gateway /etc/ai-llm-transplot
 sudo install -m 0644 deploy/ai-llm-transplot.service /etc/systemd/system/
 sudo systemctl daemon-reload

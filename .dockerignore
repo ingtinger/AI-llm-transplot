@@ -1,4 +1,11 @@
 .git
+private
+.venv
+.env
+.claude
+**/.env
+CLAUDE.md
+**/.claude
 build*
 deploy/.env
 deploy/certs
