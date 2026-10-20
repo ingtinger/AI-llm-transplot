@@ -406,6 +406,7 @@ namespace llmbridge::net::http
             value.substr(25) != " GMT") return 0;
         constexpr std::string_view kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        constexpr std::string_view kWeekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
         const auto number = [value](size_t pos, size_t len, unsigned& out) noexcept {
             out = 0;
             for (size_t i = pos; i < pos + len; ++i)
@@ -427,6 +428,7 @@ namespace llmbridge::net::http
         const year_month_day date{std::chrono::year{static_cast<int>(year)},
                                   std::chrono::month{month}, std::chrono::day{day}};
         if (!date.ok()) return 0;
+        if (value.substr(0, 3) != kWeekdays[weekday{sys_days{date}}.c_encoding()]) return 0;
         const auto target = sys_days{date} + hours{hour} + minutes{minute} + seconds{second};
         const auto remaining = ceil<std::chrono::seconds>(target - system_clock::now()).count();
         return static_cast<uint16_t>(std::clamp<decltype(remaining)>(remaining, 0, 65535));
