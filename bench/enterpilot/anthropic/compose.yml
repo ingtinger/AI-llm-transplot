@@ -11,8 +11,9 @@ services:
     image: ${LLMBRIDGE_ANTHROPIC_IMAGE:-llmbridge:bench}
     depends_on: [mock]
     ports:
-      - "${LLMBRIDGE_ANTHROPIC_HOST_PORT:-8093}:8080"
+      - "127.0.0.1:${LLMBRIDGE_ANTHROPIC_HOST_PORT:-8093}:8080"
     command:
+      - "--legacy-mode"
       - "--listen"
       - "8080"
       - "--upstream"

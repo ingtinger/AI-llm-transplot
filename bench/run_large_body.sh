@@ -27,7 +27,7 @@ VENUE=19001
 
 run() { # <label> <dialect> <reply> <shape> <mb> [gateway flags...]
   local label=$1 dialect=$2 reply=$3 shape=$4 mb=$5; shift 5
-  "$BIN/llmbridge" --listen $GW --upstream 127.0.0.1:$VENUE --upstream-dialect "$dialect" \
+  "$BIN/llmbridge" --legacy-mode --listen $GW --upstream 127.0.0.1:$VENUE --upstream-dialect "$dialect" \
       --workers 1 --duration 600 "$@" > /dev/null 2>&1 &
   local pid=$!
   sleep 0.5

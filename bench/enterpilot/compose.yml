@@ -8,12 +8,13 @@ services:
     image: ${LLMBRIDGE_IMAGE:-llmbridge:bench}
     depends_on: [mock]
     ports:
-      - "${LLMBRIDGE_HOST_PORT:-8092}:8080"
+      - "127.0.0.1:${LLMBRIDGE_HOST_PORT:-8092}:8080"
     # Space separated, one argv element per list item. The parser matches the flag
     # exactly and refuses anything it does not recognise, so "--listen=8080" stops the
     # container at startup. (Before v0.51.0 it was ignored, and the benchmark measured a
     # gateway pointed somewhere else.)
     command:
+      - "--legacy-mode"
       - "--listen"
       - "8080"
       - "--upstream"

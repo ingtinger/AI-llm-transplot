@@ -76,3 +76,14 @@ TSan 要单独构建，不能与 ASan 同时链接。**本机 WSL2** 下直接�
 修复管理端点的请求头长度判定和慢速请求头占用问题后，普通 Release / `LLMBRIDGE_WERROR=ON` 构建通过，完整 CTest **2216/2216 通过**。`AppManagement` 新增短请求头与大请求体同批到达、慢速请求头两种真实进程场景。独立的 `LLMBRIDGE_TLS=ON` / `LLMBRIDGE_BUILD_TESTS=OFF` / `LLMBRIDGE_WERROR=ON` 构建也通过，网关二进制可执行 `--help`。
 
 新增的 Docker Compose、镜像与 systemd 样例已完成 JSON/YAML 语法及配置解析检查；本机无 Docker，未执行容器启动或故障切换演示。systemd 静态检查只提示示例路径 `/usr/local/bin/llmbridge` 尚未在本机安装，部署时须先安装二进制、配置与证书。
+
+旧基准脚本在网关默认要求显式选择安全模式后无法启动进程；本轮为仅连接本地 Mock 的脚本加上 `--legacy-mode`，并让主延迟及饱和度脚本只停止自己启动的子进程。以下低负载命令用于冒烟验证，不作为性能结论：
+
+兼容模式会监听所有网卡，运行主机基准时应使用隔离网络或防火墙。ENTERPILOT Compose 中的兼容模式端口已限制在宿主机 `127.0.0.1`。
+
+```bash
+bash bench/run_bench.sh 10 2 1 10
+IO=epoll bash bench/saturate.sh 2 1 100
+```
+
+主延迟基准实际完成直连 **20/0**、代理 **20/0**（完成数/错误数）；饱和度基准在目标 100 RPS 时直连与代理均达到约 100 RPS。脚本现在将每轮完成数和错误数写入结果摘要。固定硬件下的长期吞吐、P50/P99、SSE 并发与 CPU/RSS 记录仍未验收。

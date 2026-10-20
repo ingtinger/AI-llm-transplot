@@ -61,22 +61,33 @@ fi
 [ -z "$BIN" ] && { echo "No built binaries; build first or set BIN=path" >&2; exit 1; }
 echo "Using binaries in $BIN"
 
+MOCK_PID=""
+LL_PID=""
+KP=""
 cleanup() {
-  pkill -f mock_provider.py 2>/dev/null
-  pkill -f "$BIN/llmbridge" 2>/dev/null
-  pkill -f 'litellm.*--port' 2>/dev/null
+  for pid in "$KP" "$LL_PID" "$MOCK_PID"; do
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
 }
 trap cleanup EXIT
-cleanup; sleep 0.3
 
 echo "Starting mock (anthropic, ${LAT_MS}ms) ..."
 python3 bench/mock_provider.py --port "$MOCK_PORT" --latency-ms "$LAT_MS" --format anthropic \
   >"$RESDIR/mock-h2h-$STAMP.log" 2>&1 &
+MOCK_PID=$!
 sleep 0.5
+if ! kill -0 "$MOCK_PID" 2>/dev/null; then
+  echo "Mock 启动失败或端口 $MOCK_PORT 已占用" >&2
+  exit 1
+fi
 
 echo "Starting LiteLLM (anthropic config); may take ~30-45s to import ..."
 "$VENV/bin/litellm" --config bench/litellm_config_anthropic.yaml --port "$LL_PORT" \
   >"$RESDIR/litellm-server-$STAMP.log" 2>&1 &
+LL_PID=$!
 ll_up=0
 for i in $(seq 1 90); do
   curl -s -o /dev/null "http://127.0.0.1:$LL_PORT/health/liveliness" 2>/dev/null && { echo "LiteLLM up (${i}s)"; ll_up=1; break; }
@@ -109,12 +120,13 @@ for RPS in "${RPS_LIST[@]}"; do
   : "${d50:=0}" "${d99:=0}" "${d999:=0}" "${dmax:=0}"
 
   # (2) through llmbridge (fresh per RPS; translate anthropic = equal work)
-  $BIN/llmbridge --listen $LLMBRIDGE_PORT --upstream 127.0.0.1:$MOCK_PORT --upstream-dialect anthropic --io uring --workers 1 \
+  $BIN/llmbridge --legacy-mode --listen $LLMBRIDGE_PORT --upstream 127.0.0.1:$MOCK_PORT --upstream-dialect anthropic --io uring --workers 1 \
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" 2>&1 &
   KP=$!
   sleep 1
   $BIN/loadgen --target 127.0.0.1:$LLMBRIDGE_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" >/dev/null 2>>"$RESDIR/h2h-llmbridge-loadgen-$RPS-$STAMP.log"
   kill -TERM "$KP" 2>/dev/null; wait "$KP" 2>/dev/null
+  KP=""
   k_self_p50=$(sed -n 's/.*added-total.*p50=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
   k_self_p99=$(sed -n 's/.*added-total.*p99=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
   k_self_p999=$(sed -n 's/.*added-total.*p99.9=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)

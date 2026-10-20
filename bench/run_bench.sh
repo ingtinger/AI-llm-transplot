@@ -53,15 +53,28 @@ if [ -z "$BIN" ]; then
 fi
 [ -z "$BIN" ] && { echo "No built binaries; build the CMake project first or set BIN=path" >&2; exit 1; }
 
-cleanup() { pkill -f mock_provider.py 2>/dev/null || true; pkill -f "$BIN/llmbridge" 2>/dev/null || true; }
+MOCK_PID=""
+PROXY_PID=""
+cleanup() {
+  for pid in "$PROXY_PID" "$MOCK_PID"; do
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+}
 trap cleanup EXIT
-cleanup; sleep 0.3
 
 echo "Using binaries in $BIN"
 
 echo "Starting mock provider (latency=${LAT_MS}ms) ..."
 python3 bench/mock_provider.py --port "$MOCK_PORT" --latency-ms "$LAT_MS" >"$RESDIR/mock-$STAMP.log" 2>&1 &
+MOCK_PID=$!
 sleep 1
+if ! kill -0 "$MOCK_PID" 2>/dev/null; then
+  echo "Mock 启动失败或端口 $MOCK_PORT 已占用" >&2
+  exit 1
+fi
 
 {
   echo "llmbridge Phase A benchmark, $STAMP"
@@ -74,6 +87,7 @@ sleep 1
 
 # parse "p50_us=NNN p99_us=NNN p999_us=NNN max_us=NNN" -> echo "p50 p99 p999 max" in ms (3 decimals)
 extract_us() { sed -n 's/.*p50_us=\([0-9]*\) p99_us=\([0-9]*\) p999_us=\([0-9]*\) max_us=\([0-9]*\).*/\1 \2 \3 \4/p'; }
+extract_counts() { sed -n 's/.*completed=\([0-9]*\) errors=\([0-9]*\) .*/\1 \2/p'; }
 ms() { awk -v u="$1" 'BEGIN{printf "%.3f", u/1000.0}'; }
 
 for RPS in "${RPS_LIST[@]}"; do
@@ -82,15 +96,26 @@ for RPS in "${RPS_LIST[@]}"; do
   # (2) direct-to-mock baseline
   DIRECT=$($BIN/loadgen --target 127.0.0.1:$MOCK_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" 2>>"$RESDIR/loadgen-direct-$RPS-$STAMP.log")
   read -r d50 d99 d999 dmax <<< "$(echo "$DIRECT" | extract_us)"
+  read -r d_completed d_errors <<< "$(echo "$DIRECT" | extract_counts)"
 
   # (1) through-proxy: fresh proxy per level so its self-stats are per-RPS
-  $BIN/llmbridge --listen $PROXY_PORT --upstream 127.0.0.1:$MOCK_PORT \
+  $BIN/llmbridge --legacy-mode --listen $PROXY_PORT --upstream 127.0.0.1:$MOCK_PORT \
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/proxy-$RPS-$STAMP.log" 2>&1 &
   PROXY_PID=$!
   sleep 1
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "网关启动失败或端口 $PROXY_PORT 已占用" >&2
+    exit 1
+  fi
   PROXIED=$($BIN/loadgen --target 127.0.0.1:$PROXY_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" 2>>"$RESDIR/loadgen-proxy-$RPS-$STAMP.log")
   read -r p50 p99 p999 pmax <<< "$(echo "$PROXIED" | extract_us)"
+  read -r p_completed p_errors <<< "$(echo "$PROXIED" | extract_counts)"
+  if [ -z "$d_completed" ] || [ -z "$d_errors" ] || [ -z "$p_completed" ] || [ -z "$p_errors" ]; then
+    echo "loadgen 输出缺少完成数或错误数，拒绝生成不完整基准结果" >&2
+    exit 1
+  fi
   kill -TERM "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true
+  PROXY_PID=""
 
   # proxy self-reported added-total p99 (µs) from its dumped histogram. The
   # histogram prints "us"/"µs" for microseconds and "ns" for nanoseconds; handle
@@ -108,6 +133,8 @@ for RPS in "${RPS_LIST[@]}"; do
     "$(ms "$p50") / $(ms "$p99") / $(ms "$p999") / $(ms "$pmax")" \
     "Δp50=$add50 Δp99=$add99 | self-p99=$(awk -v u="$self_p99" 'BEGIN{printf "%.3f", u/1000.0}')ms" \
     | tee -a "$SUMMARY"
+  printf "        completed/errors: direct=%s/%s proxy=%s/%s\n" \
+    "$d_completed" "$d_errors" "$p_completed" "$p_errors" | tee -a "$SUMMARY"
 done
 
 echo | tee -a "$SUMMARY"

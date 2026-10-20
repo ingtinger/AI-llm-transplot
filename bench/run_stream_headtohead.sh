@@ -109,7 +109,7 @@ MOCK_PID=$!
 wait_port "$MOCK_PORT" || { echo "mock failed to start" >&2; exit 1; }
 
 echo "Starting llmbridge (1 worker, io=$IO) ..."
-"$BIN/llmbridge" --listen "$GW_PORT" --upstream "127.0.0.1:$MOCK_PORT" \
+"$BIN/llmbridge" --legacy-mode --listen "$GW_PORT" --upstream "127.0.0.1:$MOCK_PORT" \
         --upstream-dialect anthropic --workers 1 --io "$IO" >"$RESDIR/stream-gw-$STAMP.log" 2>&1 &
 GW_PID=$!
 wait_port "$GW_PORT" || { echo "llmbridge failed to start" >&2; exit 1; }

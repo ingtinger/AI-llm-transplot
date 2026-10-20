@@ -46,15 +46,30 @@ if [ -z "$BIN" ]; then
 fi
 [ -z "$BIN" ] && { echo "No built binaries; build the CMake project first or set BIN=path" >&2; exit 1; }
 
-cleanup() { pkill -f "$BIN/fastbackend" 2>/dev/null; pkill -f "$BIN/llmbridge" 2>/dev/null; }
+BACK_PIDS=()
+PP=""
+cleanup() {
+  for pid in "$PP" "${BACK_PIDS[@]}"; do
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+}
 trap cleanup EXIT
-cleanup; sleep 0.3
 echo "Using binaries in $BIN"
 
 for b in $(seq 1 "$BACKENDS"); do
   $BIN/fastbackend --port "$BACK_PORT" --latency-us 0 >>"$RESDIR/fb-$STAMP.log" 2>&1 &
+  BACK_PIDS+=("$!")
 done
 sleep 0.5
+for pid in "${BACK_PIDS[@]}"; do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "Mock 启动失败或端口 $BACK_PORT 已占用" >&2
+    exit 1
+  fi
+done
 
 extract() { sed -n 's/.*achieved=\([0-9]*\) .*p50_us=\([0-9]*\) p99_us=\([0-9]*\) p999_us=\([0-9]*\) max_us=\([0-9]*\).*/\1 \2 \3 \4 \5/p'; }
 backlog_of() { sed -n 's/.*max_backlog=\([0-9]*\).*/\1/p' "$1" | tail -1; }
@@ -73,7 +88,7 @@ for RPS in "${RPS_LIST[@]}"; do
   read -r da d_p50 d_p99 d_p999 d_max <<< "$(echo "$D" | extract)"
 
   # fresh proxy per level
-  $BIN/llmbridge --listen $PROXY_PORT --upstream 127.0.0.1:$BACK_PORT --io "$IO" --workers "$WORKERS" \
+  $BIN/llmbridge --legacy-mode --listen $PROXY_PORT --upstream 127.0.0.1:$BACK_PORT --io "$IO" --workers "$WORKERS" \
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/sat-proxy-$RPS-$STAMP.log" 2>&1 &
   PP=$!
   sleep 0.7
@@ -82,6 +97,7 @@ for RPS in "${RPS_LIST[@]}"; do
   read -r pa p_p50 p_p99 p_p999 p_max <<< "$(echo "$P" | extract)"
   bl=$(backlog_of "$PLOG")
   kill -TERM "$PP" 2>/dev/null; wait "$PP" 2>/dev/null
+  PP=""
 
   : "${da:=0}" "${d_p99:=0}" "${pa:=0}" "${p_p50:=0}" "${p_p99:=0}" "${p_p999:=0}" "${p_max:=0}" "${bl:=0}"
   printf "%-9s | %-22s | %-38s | %s\n" "$RPS" \
