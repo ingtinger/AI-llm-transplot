@@ -91,6 +91,12 @@ def rejected_upstream_errors_hide_input(binary: Path) -> None:
     assert b"unknown key" in unknown.stderr
     assert marker.encode() not in unknown.stdout + unknown.stderr
 
+    unreadable = subprocess.run([str(binary), "--config", f"/nonexistent/{marker}.json"],
+                                capture_output=True, timeout=5, check=False)
+    assert unreadable.returncode != 0
+    assert b"cannot read" in unreadable.stderr
+    assert marker.encode() not in unreadable.stdout + unreadable.stderr
+
     for args, reason in [([f"--upstream={marker}"], b"flags take a separate value"),
                          (["--listen", marker], b"must be an integer"),
                          (["--upstream-dialect", marker], b"must be one of")]:

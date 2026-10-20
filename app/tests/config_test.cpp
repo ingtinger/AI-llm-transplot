@@ -52,6 +52,15 @@ TEST(Config, UnknownFieldNamesAreRejectedWithoutEchoingThem)
     }
 }
 
+TEST(Config, UnreadablePathIsNotEchoed)
+{
+    Settings s;
+    std::string err;
+    EXPECT_FALSE(llmbridge::app::load_config("/nonexistent/sk-secret-marker.json", s, err));
+    EXPECT_NE(err.find("cannot read"), std::string::npos);
+    EXPECT_EQ(err.find("sk-secret-marker"), std::string::npos);
+}
+
 TEST(Config, SecurityUsersAndEnvironmentNamesAreStrict)
 {
     Settings s;

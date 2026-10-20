@@ -559,7 +559,7 @@ namespace llmbridge::app
     bool load_config(const std::string& path, Settings& s, std::string& err)
     {
         std::ifstream in(path, std::ios::binary);
-        if (!in) return fail(err, "config: cannot read " + path);
+        if (!in) return fail(err, "config: cannot read file");
         std::string text;
         char chunk[4096];
         while (in)
@@ -567,12 +567,12 @@ namespace llmbridge::app
             in.read(chunk, sizeof(chunk));
             const size_t n = static_cast<size_t>(in.gcount());
             if (n > kMaxConfigBytes - text.size())
-                return fail(err, "config: exceeds 4 MiB size limit (" + path + ")");
+                return fail(err, "config: exceeds 4 MiB size limit");
             text.append(chunk, n);
         }
-        if (!in.eof()) return fail(err, "config: cannot read " + path);
-        if (text.empty()) return fail(err, "config: " + path + " is empty");
-        if (!parse_config(text, s, err)) return fail(err, err + " (" + path + ")");
+        if (!in.eof()) return fail(err, "config: cannot read file");
+        if (text.empty()) return fail(err, "config: file is empty");
+        if (!parse_config(text, s, err)) return false;
         return true;
     }
 } // namespace llmbridge::app
