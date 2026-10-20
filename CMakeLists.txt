@@ -140,6 +140,8 @@ endif ()
 #   find_package(llmbridge config required)
 #   target_link_libraries(myapp private llmbridge::provider)
 if (PROJECT_IS_TOP_LEVEL)
+    # AI-llm-transplot 分支安装包必须保留上游许可证和本分支修改说明。
+    install(FILES LICENSE NOTICE DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ai-llm-transplot)
     install(EXPORT llmbridgeTargets
             FILE llmbridgeTargets.cmake
             NAMESPACE llmbridge::

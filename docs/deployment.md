@@ -51,7 +51,7 @@ docker compose logs --tail=30 gateway
 docker compose down
 ```
 
-镜像使用 OpenSSL 3 构建、非 root 用户运行，并以只读方式挂载配置和证书。`.env`、`certs/` 和本地 `private/` 目录被 Docker 构建上下文排除；前两者也不会进入 Git。Compose 的 JSON 日志限制为每文件 10 MB、最多 3 个文件。停止时先向进程发送 `SIGTERM`，30 秒后容器运行时可能强制结束；网关当前没有跨重启保留在途请求的机制。此 Compose 文件只用于本机演示，不应直接映射公网端口或把演示密钥用于真实 Provider。
+镜像使用 OpenSSL 3 构建、非 root 用户运行，携带 `LICENSE` 和本分支的 `NOTICE`，并以只读方式挂载配置和证书。`.env`、`certs/` 和本地 `private/` 目录被 Docker 构建上下文排除；前两者也不会进入 Git。Compose 的 JSON 日志限制为每文件 10 MB、最多 3 个文件。停止时先向进程发送 `SIGTERM`，30 秒后容器运行时可能强制结束；网关当前没有跨重启保留在途请求的机制。此 Compose 文件只用于本机演示，不应直接映射公网端口或把演示密钥用于真实 Provider。
 
 ## systemd 单机示例
 

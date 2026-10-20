@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3t64 libstdc++6 libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/bin/llmbridge /usr/local/bin/llmbridge
+COPY LICENSE NOTICE /usr/share/doc/ai-llm-transplot/
 USER 10001:10001
 EXPOSE 8088
 ENTRYPOINT ["/usr/local/bin/llmbridge"]
