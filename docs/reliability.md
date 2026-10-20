@@ -111,3 +111,5 @@ SSE 对比脚本同样先检查 LiteLLM 环境和本机进程，再要求每条�
 同一保密约束扩展到未知 JSON 字段名：仍然拒绝启动，并报告配置组或 `security.users`，但不回显该字段的原文。配置单元测试和 `AppSecureUsers` 真实进程测试使用假凭据字段名检查这一点，定向 **2/2 通过**；相关的旧配置拒绝断言调整后 **28/28 通过**，`Release`/Werror 全量 CTest 及独立 TLS/Werror 定向测试 **2/2 通过**。
 
 配置文件路径在“不可读、为空、超限、解析失败”错误中也不再回显；操作者仍会看到具体拒绝原因。`Config.UnreadablePathIsNotEchoed` 与真实进程 `AppSecureUsers` 用假凭据文件名验证定向 **2/2 通过**；`Release`/Werror 全量 CTest 和独立 TLS/Werror 定向测试 **2/2 通过**。
+
+上游主机名校验补齐逐标签边界：标签不能以连字符开头或结尾，最长 63 字节；合法的 63 字节标签仍可解析。`UpstreamParse.RejectsMalformedHosts` 在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**，Release 全量 CTest 通过。该检查在启动解析路径执行，不触及请求热路径。

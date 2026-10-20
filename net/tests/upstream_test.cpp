@@ -148,6 +148,12 @@ TEST(UpstreamParse, RejectsMalformedHosts)
     EXPECT_FALSE(parse_upstream(".host:80").ok());
     EXPECT_FALSE(parse_upstream("host.:80").ok());
     EXPECT_FALSE(parse_upstream("-host:80").ok());
+    EXPECT_FALSE(parse_upstream("host-:80").ok());
+    EXPECT_FALSE(parse_upstream("host-.example:80").ok());
+    EXPECT_FALSE(parse_upstream("host.-example:80").ok());
+    EXPECT_FALSE(parse_upstream(std::string(64, 'a') + ".example:80").ok());
+    EXPECT_FALSE(parse_upstream("a." + std::string(64, 'b') + ":80").ok());
+    EXPECT_TRUE(parse_upstream(std::string(63, 'a') + ".example:80").ok());
     EXPECT_FALSE(parse_upstream("").ok());
     EXPECT_FALSE(parse_upstream(std::string(300, 'a') + ":80").ok());  // > 253
     EXPECT_FALSE(parse_upstream("https://?q=1").ok());

@@ -26,16 +26,27 @@ namespace llmbridge::net
         bool valid_host_chars(std::string_view h) noexcept
         {
             if (h.empty() || h.size() > 253) return false;
-            for (const char c : h)
+            size_t label_len = 0;
+            for (size_t i = 0; i < h.size(); ++i)
             {
+                const char c = h[i];
                 const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                                 (c >= '0' && c <= '9') || c == '.' || c == '-';
                 if (!ok) return false;
+                if (c == '.')
+                {
+                    if (label_len == 0 || h[i - 1] == '-') return false;
+                    label_len = 0;
+                }
+                else
+                {
+                    if (label_len == 0 && c == '-') return false;
+                    if (++label_len > 63) return false;
+                }
             }
             // No empty labels ("a..b") and no leading/trailing dot or hyphen weirdness
             // that some resolvers "helpfully" normalize.
-            if (h.front() == '.' || h.back() == '.' || h.front() == '-') return false;
-            return h.find("..") == std::string_view::npos;
+            return label_len != 0 && h.back() != '-';
         }
 
         /// Normalize a base path, or report why it cannot be one.
