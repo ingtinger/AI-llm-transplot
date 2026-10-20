@@ -404,8 +404,8 @@ namespace llmbridge::net::http
         if (value.size() != 29 || value[3] != ',' || value[4] != ' ' || value[7] != ' ' ||
             value[11] != ' ' || value[16] != ' ' || value[19] != ':' || value[22] != ':' ||
             value.substr(25) != " GMT") return 0;
-        constexpr std::string_view months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        constexpr std::string_view kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
         const auto number = [value](size_t pos, size_t len, unsigned& out) noexcept {
             out = 0;
             for (size_t i = pos; i < pos + len; ++i)
@@ -421,7 +421,7 @@ namespace llmbridge::net::http
             minute > 59 || second > 59) return 0;
         unsigned month = 0;
         for (unsigned i = 0; i < 12; ++i)
-            if (value.substr(8, 3) == months[i]) month = i + 1;
+            if (value.substr(8, 3) == kMonths[i]) month = i + 1;
         if (month == 0) return 0;
         using namespace std::chrono;
         const year_month_day date{std::chrono::year{static_cast<int>(year)},

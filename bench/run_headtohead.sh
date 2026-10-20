@@ -59,11 +59,13 @@ if [ -z "$BIN" ]; then
   done
 fi
 [ -z "$BIN" ] && { echo "No built binaries; build first or set BIN=path" >&2; exit 1; }
+[ -x "$VENV/bin/litellm" ] || { echo "LiteLLM 环境不存在：$VENV/bin/litellm" >&2; exit 1; }
 echo "Using binaries in $BIN"
 
 MOCK_PID=""
 LL_PID=""
 KP=""
+CSV_TMP=""
 cleanup() {
   for pid in "$KP" "$LL_PID" "$MOCK_PID"; do
     if [ -n "$pid" ]; then
@@ -71,6 +73,7 @@ cleanup() {
       wait "$pid" 2>/dev/null || true
     fi
   done
+  if [ -n "$CSV_TMP" ]; then rm -f -- "$CSV_TMP"; fi
 }
 trap cleanup EXIT
 
@@ -90,12 +93,14 @@ echo "Starting LiteLLM (anthropic config); may take ~30-45s to import ..."
 LL_PID=$!
 ll_up=0
 for i in $(seq 1 90); do
-  curl -s -o /dev/null "http://127.0.0.1:$LL_PORT/health/liveliness" 2>/dev/null && { echo "LiteLLM up (${i}s)"; ll_up=1; break; }
+  if ! kill -0 "$LL_PID" 2>/dev/null; then break; fi
+  curl -fsS -o /dev/null "http://127.0.0.1:$LL_PORT/health/liveliness" 2>/dev/null && { echo "LiteLLM up (${i}s)"; ll_up=1; break; }
   sleep 1
 done
-[ "$ll_up" = 0 ] && echo "WARNING: LiteLLM never reported healthy; its rows will be empty" >&2
+[ "$ll_up" = 1 ] || { echo "LiteLLM 未就绪，不能生成对比结果；查看 $RESDIR/litellm-server-$STAMP.log" >&2; exit 1; }
 
 extract() { sed -n 's/.*p50_us=\([0-9]*\) p99_us=\([0-9]*\) p999_us=\([0-9]*\) max_us=\([0-9]*\).*/\1 \2 \3 \4/p'; }
+extract_counts() { sed -n 's/.*completed=\([0-9]*\) errors=\([0-9]*\) .*/\1 \2/p'; }
 achieved_of() { sed -n 's/.*achieved=\([0-9]*\) .*/\1/p'; }
 ms() { awk -v u="$1" 'BEGIN{printf "%.3f", u/1000.0}'; }
 
@@ -108,8 +113,9 @@ ms() { awk -v u="$1" 'BEGIN{printf "%.3f", u/1000.0}'; }
   echo "-------+------------------------+--------------------------------+------------------"
 } | tee "$SUMMARY"
 
-echo "# llmbridge vs LiteLLM, equal-work OpenAI<->Anthropic, $STAMP, host=$(uname -mn), mock ${LAT_MS}ms" > "$CSV"
-echo "rps,llmbridge_p50_ms,llmbridge_p99_ms,llmbridge_p999_ms,llmbridge_max_ms,litellm_p50_ms,litellm_achieved,litellm_p99_ms,litellm_max_ms,litellm_sat" >> "$CSV"
+CSV_TMP=$(mktemp "${CSV}.tmp.XXXXXX") || exit 1
+echo "# llmbridge vs LiteLLM, equal-work OpenAI<->Anthropic, $STAMP, host=$(uname -mn), mock ${LAT_MS}ms" > "$CSV_TMP"
+echo "rps,llmbridge_p50_ms,llmbridge_p99_ms,llmbridge_p999_ms,llmbridge_max_ms,litellm_p50_ms,litellm_achieved,litellm_p99_ms,litellm_max_ms,litellm_sat" >> "$CSV_TMP"
 
 for RPS in "${RPS_LIST[@]}"; do
   echo ">>> RPS=$RPS" >&2
@@ -117,6 +123,7 @@ for RPS in "${RPS_LIST[@]}"; do
   # (1) direct-to-mock baseline (shared by both deltas)
   D=$($BIN/loadgen --target 127.0.0.1:$MOCK_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" 2>>"$RESDIR/h2h-direct-$RPS-$STAMP.log")
   read -r d50 d99 d999 dmax <<< "$(echo "$D" | extract)"
+  read -r d_completed d_errors <<< "$(echo "$D" | extract_counts)"
   : "${d50:=0}" "${d99:=0}" "${d999:=0}" "${dmax:=0}"
 
   # (2) through llmbridge (fresh per RPS; translate anthropic = equal work)
@@ -124,7 +131,8 @@ for RPS in "${RPS_LIST[@]}"; do
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" 2>&1 &
   KP=$!
   sleep 1
-  $BIN/loadgen --target 127.0.0.1:$LLMBRIDGE_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" >/dev/null 2>>"$RESDIR/h2h-llmbridge-loadgen-$RPS-$STAMP.log"
+  K=$($BIN/loadgen --target 127.0.0.1:$LLMBRIDGE_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" 2>>"$RESDIR/h2h-llmbridge-loadgen-$RPS-$STAMP.log")
+  read -r k_completed k_errors <<< "$(echo "$K" | extract_counts)"
   kill -TERM "$KP" 2>/dev/null; wait "$KP" 2>/dev/null
   KP=""
   k_self_p50=$(sed -n 's/.*added-total.*p50=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
@@ -136,8 +144,15 @@ for RPS in "${RPS_LIST[@]}"; do
   # (3) through LiteLLM
   L=$($BIN/loadgen --target 127.0.0.1:$LL_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" 2>>"$RESDIR/h2h-litellm-$RPS-$STAMP.log")
   read -r l50 l99 l999 lmax <<< "$(echo "$L" | extract)"
+  read -r l_completed l_errors <<< "$(echo "$L" | extract_counts)"
+  if [ -z "$d50" ] || [ -z "$l50" ] || [ -z "$d_completed" ] ||
+     [ -z "$k_completed" ] || [ -z "$l_completed" ] ||
+     [ "$d_completed" = 0 ] || [ "$k_completed" = 0 ] || [ "$l_completed" = 0 ]; then
+    echo "loadgen 缺少有效样本，拒绝生成延迟对比结果" >&2
+    exit 1
+  fi
   la=$(echo "$L" | achieved_of)
-  : "${l50:=0}" "${l99:=0}" "${l999:=0}" "${lmax:=0}" "${la:=0}"
+  : "${la:=0}"
 
   # LiteLLM added latency = client delta (ms)
   la50=$(awk -v a="$l50" -v b="$d50" 'BEGIN{printf "%.3f", (a-b)/1000.0}')
@@ -152,20 +167,18 @@ for RPS in "${RPS_LIST[@]}"; do
   k999=$(awk -v u="$k_self_p999" 'BEGIN{printf "%.3f", u/1000.0}')
   kmax=$(awk -v u="$k_self_max" 'BEGIN{printf "%.3f", u/1000.0}')
 
-  # Delivering nothing is not negative latency. l50 defaults to 0 when the sample is
-  # empty, so the subtraction above turns a dead proxy into a large negative delta.
-  if [ "$la" -eq 0 ] 2>/dev/null; then
-    la50=dead; la99=dead; la999=dead; lamax=dead
-  fi
-
   printf "%-6s | %-22s | %-30s | %s\n" "$RPS" \
     "$k50 / $k99" \
     "Δp50=$la50 Δp99=$la99" \
     "$la / $RPS ($lsat sat)" | tee -a "$SUMMARY"
+  printf "       completed/errors: direct=%s/%s llmbridge=%s/%s LiteLLM=%s/%s\n" \
+    "$d_completed" "$d_errors" "$k_completed" "$k_errors" "$l_completed" "$l_errors" | tee -a "$SUMMARY"
 
-  echo "$RPS,$k50,$k99,$k999,$kmax,$la50,$la,$la99,$lamax,$lsat" >> "$CSV"
+  echo "$RPS,$k50,$k99,$k999,$kmax,$la50,$la,$la99,$lamax,$lsat" >> "$CSV_TMP"
 done
 
+mv -- "$CSV_TMP" "$CSV" || exit 1
+CSV_TMP=""
 echo | tee -a "$SUMMARY"
 echo "CSV: $CSV   (feeds make_chart.py)" | tee -a "$SUMMARY"
 echo "Raw logs in $RESDIR/ (stamp $STAMP)" | tee -a "$SUMMARY"

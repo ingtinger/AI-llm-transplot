@@ -289,8 +289,8 @@ continuously fuzzed:
     and every reuse became a stale-connection retry.
   - **Quota and `Retry-After`.** A rate-limit family counts as exhausted only when its
     remaining value is a well-formed 0, since naming the wrong quota sends an
-    operator to raise a limit that was not the one refusing. `Retry-After` is read in
-    seconds only; the HTTP-date form reads as absent.
+    operator to raise a limit that was not the one refusing. `Retry-After` accepts
+    delta seconds and IMF-fixdate; other date forms read as absent.
   - **`find_header`** is the lenient lookup for code outside the framer. The name
     matches exactly, in any case, with or without its colon, so `x-tenant` never
     answers from an `x-tenant-spoof:` line (the bare-prefix version did, waiting for
