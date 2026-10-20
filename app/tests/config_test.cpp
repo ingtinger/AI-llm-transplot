@@ -35,6 +35,23 @@ TEST(Config, OversizedConfigurationIsRejectedBeforeParsing)
     EXPECT_NE(err.find("4 MiB"), std::string::npos);
 }
 
+TEST(Config, UnknownFieldNamesAreRejectedWithoutEchoingThem)
+{
+    // 未知字段可能误贴入凭据；保留组名即可定位，不能回显原字段名。
+    for (const std::string_view input : {
+             R"({"sk-secret-marker":true})",
+             R"({"listen":{"sk-secret-marker":true}})",
+             R"({"security":{"sk-secret-marker":true}})",
+             R"({"security":{"users":[{"sk-secret-marker":true}]}})"})
+    {
+        Settings s;
+        std::string err;
+        EXPECT_FALSE(parse_config(input, s, err));
+        EXPECT_NE(err.find("unknown"), std::string::npos) << err;
+        EXPECT_EQ(err.find("sk-secret-marker"), std::string::npos) << err;
+    }
+}
+
 TEST(Config, SecurityUsersAndEnvironmentNamesAreStrict)
 {
     Settings s;
@@ -196,7 +213,7 @@ TEST(Config, EachEntryValidatesLikeTheObjectForm)
     std::string err;
     // A misspelling inside an array entry must fail exactly as it does in an object.
     EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","dialec":"openai"}]})", c, err));
-    EXPECT_NE(err.find("dialec"), std::string::npos) << err;
+    EXPECT_NE(err.find("unknown key in \"upstream\""), std::string::npos) << err;
     err.clear();
     EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","dialect":"claude"}]})", c, err));
     EXPECT_NE(err.find("must be one of"), std::string::npos) << err;
@@ -234,9 +251,9 @@ INSTANTIATE_TEST_SUITE_P(
     Cases, ConfigReject,
     ::testing::Values(
         // The one that matters: a misspelling must not be silently ignored.
-        std::make_pair(R"({"listen":{"listen_tls":true}})", "listen_tls"),
-        std::make_pair(R"({"lisen":{"port":1}})", "lisen"),
-        std::make_pair(R"({"runtime":{"worker":2}})", "worker"),
+        std::make_pair(R"({"listen":{"listen_tls":true}})", "unknown key in \"listen\""),
+        std::make_pair(R"({"lisen":{"port":1}})", "unknown key in \"(top level)\""),
+        std::make_pair(R"({"runtime":{"worker":2}})", "unknown key in \"runtime\""),
         // wrong types
         std::make_pair(R"({"listen":{"tls":"yes"}})", "true or false"),
         std::make_pair(R"({"listen":{"port":"8443"}})", "must be a number"),

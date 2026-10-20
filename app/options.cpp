@@ -268,8 +268,7 @@ namespace llmbridge::app
                 if (!o && !retired(key).empty())
                     return fail(err, "config: \"" + std::string(k) + "\" " + std::string(retired(key)));
                 if (!o)
-                    return fail(err, "config: unknown key \"" + std::string(k) + "\" in \"" +
-                                         std::string(group) + "\"");
+                    return fail(err, "config: unknown key in \"" + std::string(group) + "\"");
                 if (!set_json(*o, v, s, err)) return false;
             }
             return true;
@@ -432,7 +431,7 @@ namespace llmbridge::app
                                     return fail(err, "config: security.users.disabled must be boolean");
                                 user.disabled = value.boolean;
                             }
-                            else return fail(err, "config: unknown security.users field " + std::string(field));
+                            else return fail(err, "config: unknown security.users field");
                         }
                         if (user.id.empty() || user.tenant.empty() || user.key_env.empty() ||
                             user.models.empty() || user.upstreams.empty())
@@ -440,7 +439,7 @@ namespace llmbridge::app
                         s.users.push_back(std::move(user));
                     }
                 }
-                else return fail(err, "config: unknown security field " + std::string(k));
+                else return fail(err, "config: unknown security field");
             }
             return true;
         }
@@ -549,7 +548,7 @@ namespace llmbridge::app
         {
             if (is_comment(k)) continue;
             if (!is_group(k) && k != "security")
-                return fail(err, "config: unknown key \"" + std::string(k) + "\" in \"(top level)\"");
+                return fail(err, "config: unknown key in \"(top level)\"");
             if (!(k == "upstream" ? apply_upstream(v, s, err) :
                   k == "security" ? apply_security(v, s, err) : apply_group(k, v, s, err)))
                 return false;

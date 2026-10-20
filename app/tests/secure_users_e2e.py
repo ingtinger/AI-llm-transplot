@@ -82,6 +82,15 @@ def rejected_upstream_errors_hide_input(binary: Path) -> None:
     assert b"bad upstream 1" in secondary.stderr
     assert marker.encode() not in secondary.stdout + secondary.stderr
 
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp) / "config.json"
+        path.write_text(json.dumps({marker: True}), encoding="utf-8")
+        unknown = subprocess.run([str(binary), "--config", str(path)],
+                                 capture_output=True, timeout=5, check=False)
+    assert unknown.returncode != 0
+    assert b"unknown key" in unknown.stderr
+    assert marker.encode() not in unknown.stdout + unknown.stderr
+
     for args, reason in [([f"--upstream={marker}"], b"flags take a separate value"),
                          (["--listen", marker], b"must be an integer"),
                          (["--upstream-dialect", marker], b"must be one of")]:
