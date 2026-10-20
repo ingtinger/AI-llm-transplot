@@ -34,7 +34,7 @@
     "_dialect": "What this venue speaks: openai | anthropic | gemini | cohere | bedrock | azure. A client already speaking the venue's dialect is byte-forwarded, whichever it is. The old key name \"translate\" and the old value \"none\" are refused by name.",
     "dialect": "openai",
 
-    "_strip_headers": "Header names removed from every request before it is forwarded, matched case-insensitively and exactly. Empty by default, which leaves passthrough a single memcpy. Use it when a client header must not reach a third-party provider: an internal routing header, or an identity token meant for THIS gateway and nobody else. Translating modes already rebuild from a whitelist; this also stops a stripped Authorization being promoted to the provider credential.",
+    "_strip_headers": "转发前删除的请求头名称，不区分大小写且精确匹配；默认空列表。可阻止内部路由头或网关身份凭据传给第三方，剥离的 Authorization 也不会被提升为 Provider 凭据。最多 64 个名称，每个最多 64 字节，须为合法 HTTP 字段名。",
     "strip_headers": [],
 
     "_credential_header": "可选的 x-kottos-key-* 客户端请求头，用于携带该上游的密钥。只会转发被选中上游对应的密钥。",

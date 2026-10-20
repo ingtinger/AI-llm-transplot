@@ -77,6 +77,33 @@ TEST(Config, SecurityUsersAndEnvironmentNamesAreStrict)
     EXPECT_FALSE(parse_config(R"({"security":{"allow_insecure_http":"true"}})", invalid, err));
 }
 
+TEST(Config, StripHeaderNamesAreBoundedAndValid)
+{
+    Settings s;
+    std::string err;
+    EXPECT_TRUE(parse_config(R"({"upstream":{"strip_headers":["Authorization","X.Custom_Header"]}})", s, err)) << err;
+    for (const std::string_view invalid : {
+             R"({"upstream":{"strip_headers":["authorization:"]}})",
+             R"({"upstream":{"strip_headers":["x bad"]}})",
+             R"({"upstream":{"strip_headers":["x/bad"]}})"})
+    {
+        Settings rejected;
+        EXPECT_FALSE(parse_config(invalid, rejected, err)) << invalid;
+    }
+    Settings long_name;
+    Settings boundary;
+    EXPECT_TRUE(parse_config("{\"upstream\":{\"strip_headers\":[\"" +
+                                 std::string(64, 'x') + "\"]}}", boundary, err)) << err;
+    EXPECT_FALSE(parse_config("{\"upstream\":{\"strip_headers\":[\"" +
+                                  std::string(65, 'x') + "\"]}}", long_name, err));
+    Settings many_names;
+    std::string many = "{\"upstream\":{\"strip_headers\":[";
+    for (int i = 0; i < 65; ++i)
+        many += (i ? "," : "") + std::string("\"x-" + std::to_string(i) + "\"");
+    many += "]}}";
+    EXPECT_FALSE(parse_config(many, many_names, err));
+}
+
 TEST(Config, DrainIndicesAreReadFromRoutingGroup)
 {
     Settings s;

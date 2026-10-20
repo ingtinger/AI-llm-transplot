@@ -117,3 +117,5 @@ SSE 对比脚本同样先检查 LiteLLM 环境和本机进程，再要求每条�
 单个上游 URL 现在限制为 2048 字节，避免超长配置路径进入每次请求的目标拼接。边界单元测试在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**；Release/Werror 全量构建、全量 CTest、约定及文档数据检查通过。
 
 显式空端口（如 `https://host:`）不再误用默认端口。新增两个回归输入先证明旧解析器会接受它们，再在三种构建下通过 `UpstreamParse.RejectsBadPorts`；Release/Werror 全量 CTest 通过。
+
+`upstream.strip_headers` 现在最多接受 64 个合法 HTTP 字段名，每个最多 64 字节；包含冒号、空格、斜杠或超限的名称在配置解析时被拒绝，不会复制到各工作线程。回归测试先证明旧解析器误接受这些输入，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**；Release/Werror 全量 CTest、约定及文档数据检查通过。

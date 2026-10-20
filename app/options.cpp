@@ -155,6 +155,19 @@ namespace llmbridge::app
 
         bool is_comment(std::string_view k) { return !k.empty() && k.front() == '_'; }
 
+        bool header_name_ok(std::string_view name) noexcept
+        {
+            if (name.empty() || name.size() > 64) return false;
+            for (const char c : name)
+            {
+                const bool alpha_num = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                       (c >= '0' && c <= '9');
+                if (!alpha_num && std::string_view("!#$%&'*+-.^_`|~").find(c) == std::string_view::npos)
+                    return false;
+            }
+            return true;
+        }
+
         std::string bounds(double v)
         {
             char b[32];
@@ -315,6 +328,11 @@ namespace llmbridge::app
                     return fail(err, "config: every entry in an \"upstream\" array needs a url");
                 if (e.find("strip_headers") != nullptr)
                 {
+                    if (one.strip_headers.size() > 64)
+                        return fail(err, "config: upstream.strip_headers supports at most 64 names");
+                    for (const auto& name : one.strip_headers)
+                        if (!header_name_ok(name))
+                            return fail(err, "config: upstream.strip_headers has an invalid header name");
                     if (strip && one.strip_headers != s.strip_headers)
                         return fail(err, "config: \"upstream.strip_headers\" is gateway-wide; every "
                                          "entry that sets it must list the same headers");
