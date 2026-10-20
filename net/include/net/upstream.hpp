@@ -29,11 +29,13 @@ namespace llmbridge::net
         [[nodiscard]] bool ok() const noexcept { return error.empty(); }
     };
 
-    /// Parse an --upstream argument. Never throws; failures come back in .error.
+    /// 解析上游地址。语法错误由返回值的 error 表示；内存分配失败仍可能抛异常。
+    /// 参数仅在调用期间借用，结果拥有自己的字符串；不同线程可并发调用。
     [[nodiscard]] UpstreamSpec parse_upstream(std::string_view arg);
 
-    /// IPv4 addresses for a host via getaddrinfo, deduplicated, in resolver order; an IPv4
-    /// literal passes through. Empty means failure, with the reason in *err if given.
+    /// 在初始化路径解析 IPv4 地址，去重并保留解析器顺序；IPv4 字面量直接返回。
+    /// 返回值拥有地址字符串；err 非空时仅在调用期间借用，失败时写入原因。
+    /// 不共享可变状态，可并发调用；DNS 查询可能阻塞或分配内存，不能在热路径使用。
     [[nodiscard]] std::vector<std::string> resolve_host_ipv4(const std::string& host,
                                                              std::string* err = nullptr);
 } // namespace llmbridge::net
