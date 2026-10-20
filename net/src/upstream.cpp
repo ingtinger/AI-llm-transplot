@@ -124,6 +124,11 @@ namespace llmbridge::net
     UpstreamSpec parse_upstream(std::string_view arg)
     {
         UpstreamSpec spec;
+        if (arg.size() > 2048)
+        {
+            spec.error = "upstream URL exceeds 2048 bytes";
+            return spec;
+        }
         std::string_view rest = arg;
         bool have_scheme = false;
 

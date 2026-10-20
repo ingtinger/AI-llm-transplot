@@ -159,6 +159,16 @@ TEST(UpstreamParse, RejectsMalformedHosts)
     EXPECT_FALSE(parse_upstream("https://?q=1").ok());
 }
 
+TEST(UpstreamParse, UrlLengthHasABoundary)
+{
+    // 配置中的超长路径会进入每次请求的上游目标，需在启动时限制。
+    const std::string prefix = "https://h/";
+    EXPECT_TRUE(parse_upstream(prefix + std::string(2048 - prefix.size(), 'x')).ok());
+    const auto too_long = parse_upstream(prefix + std::string(2049 - prefix.size(), 'x'));
+    EXPECT_FALSE(too_long.ok());
+    EXPECT_NE(too_long.error.find("2048"), std::string::npos);
+}
+
 // ── resolution: hermetic cases only ─────────────────────────────────────────
 // localhost and numeric literals resolve without a network round-trip; an
 // NXDOMAIN test would hit real DNS and is deliberately absent (tests must be
