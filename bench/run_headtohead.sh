@@ -124,7 +124,6 @@ for RPS in "${RPS_LIST[@]}"; do
   D=$($BIN/loadgen --target 127.0.0.1:$MOCK_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" 2>>"$RESDIR/h2h-direct-$RPS-$STAMP.log")
   read -r d50 d99 d999 dmax <<< "$(echo "$D" | extract)"
   read -r d_completed d_errors <<< "$(echo "$D" | extract_counts)"
-  : "${d50:=0}" "${d99:=0}" "${d999:=0}" "${dmax:=0}"
 
   # (2) through llmbridge (fresh per RPS; translate anthropic = equal work)
   $BIN/llmbridge --legacy-mode --listen $LLMBRIDGE_PORT --upstream 127.0.0.1:$MOCK_PORT --upstream-dialect anthropic --io uring --workers 1 \
@@ -139,20 +138,24 @@ for RPS in "${RPS_LIST[@]}"; do
   k_self_p99=$(sed -n 's/.*added-total.*p99=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
   k_self_p999=$(sed -n 's/.*added-total.*p99.9=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
   k_self_max=$(sed -n 's/.*added-total.*max=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
-  : "${k_self_p50:=0}" "${k_self_p99:=0}" "${k_self_p999:=0}" "${k_self_max:=0}"
 
   # (3) through LiteLLM
   L=$($BIN/loadgen --target 127.0.0.1:$LL_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" 2>>"$RESDIR/h2h-litellm-$RPS-$STAMP.log")
   read -r l50 l99 l999 lmax <<< "$(echo "$L" | extract)"
   read -r l_completed l_errors <<< "$(echo "$L" | extract_counts)"
-  if [ -z "$d50" ] || [ -z "$l50" ] || [ -z "$d_completed" ] ||
-     [ -z "$k_completed" ] || [ -z "$l_completed" ] ||
+  if [ -z "$d50" ] || [ -z "$d99" ] || [ -z "$d999" ] || [ -z "$dmax" ] ||
+     [ -z "$l50" ] || [ -z "$l99" ] || [ -z "$l999" ] || [ -z "$lmax" ] ||
+     [ -z "$k_self_p50" ] || [ -z "$k_self_p99" ] ||
+     [ -z "$k_self_p999" ] || [ -z "$k_self_max" ] ||
+     [ -z "$d_completed" ] || [ -z "$d_errors" ] ||
+     [ -z "$k_completed" ] || [ -z "$k_errors" ] ||
+     [ -z "$l_completed" ] || [ -z "$l_errors" ] ||
      [ "$d_completed" = 0 ] || [ "$k_completed" = 0 ] || [ "$l_completed" = 0 ]; then
-    echo "loadgen 缺少有效样本，拒绝生成延迟对比结果" >&2
+    echo "基准输出缺少有效样本或延迟字段，拒绝生成对比结果" >&2
     exit 1
   fi
   la=$(echo "$L" | achieved_of)
-  : "${la:=0}"
+  [ -n "$la" ] || { echo "LiteLLM 达成速率缺失，拒绝生成对比结果" >&2; exit 1; }
 
   # LiteLLM added latency = client delta (ms)
   la50=$(awk -v a="$l50" -v b="$d50" 'BEGIN{printf "%.3f", (a-b)/1000.0}')

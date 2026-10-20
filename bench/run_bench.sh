@@ -110,8 +110,12 @@ for RPS in "${RPS_LIST[@]}"; do
   PROXIED=$($BIN/loadgen --target 127.0.0.1:$PROXY_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" 2>>"$RESDIR/loadgen-proxy-$RPS-$STAMP.log")
   read -r p50 p99 p999 pmax <<< "$(echo "$PROXIED" | extract_us)"
   read -r p_completed p_errors <<< "$(echo "$PROXIED" | extract_counts)"
-  if [ -z "$d_completed" ] || [ -z "$d_errors" ] || [ -z "$p_completed" ] || [ -z "$p_errors" ]; then
-    echo "loadgen 输出缺少完成数或错误数，拒绝生成不完整基准结果" >&2
+  if [ -z "$d50" ] || [ -z "$d99" ] || [ -z "$d999" ] || [ -z "$dmax" ] ||
+     [ -z "$p50" ] || [ -z "$p99" ] || [ -z "$p999" ] || [ -z "$pmax" ] ||
+     [ -z "$d_completed" ] || [ -z "$d_errors" ] ||
+     [ -z "$p_completed" ] || [ -z "$p_errors" ] ||
+     [ "$d_completed" = 0 ] || [ "$p_completed" = 0 ]; then
+    echo "loadgen 缺少有效样本或延迟字段，拒绝生成不完整基准结果" >&2
     exit 1
   fi
   kill -TERM "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true
@@ -122,6 +126,7 @@ for RPS in "${RPS_LIST[@]}"; do
   # all three (us/µs values are already in µs; ns gets divided down).
   self_p99=$(sed -n 's/.*added-total.*p99=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/proxy-$RPS-$STAMP.log" | head -1)
   [ -z "$self_p99" ] && self_p99=$(sed -n 's/.*added-total.*p99=\([0-9.]*\) ns.*/\1/p' "$RESDIR/proxy-$RPS-$STAMP.log" | head -1 | awk '{printf "%.3f", $1/1000}')
+  [ -n "$self_p99" ] || { echo "网关自身延迟直方图缺失，拒绝生成不完整基准结果" >&2; exit 1; }
 
   # added latency delta (ms)
   add50=$(awk -v a="$p50" -v b="$d50" 'BEGIN{printf "%.3f", (a-b)/1000.0}')

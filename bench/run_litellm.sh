@@ -88,9 +88,12 @@ for RPS in "${RPS_LIST[@]}"; do
   L=$($BIN/loadgen --target 127.0.0.1:$LL_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" 2>>"$RESDIR/ll-proxy-$RPS-$STAMP.log")
   read -r l50 l99 l999 lmax <<< "$(echo "$L" | extract)"
   read -r l_completed l_errors <<< "$(echo "$L" | extract_counts)"
-  if [ -z "$d50" ] || [ -z "$l50" ] || [ -z "$d_completed" ] || [ -z "$l_completed" ] ||
+  if [ -z "$d50" ] || [ -z "$d99" ] || [ -z "$d999" ] || [ -z "$dmax" ] ||
+     [ -z "$l50" ] || [ -z "$l99" ] || [ -z "$l999" ] || [ -z "$lmax" ] ||
+     [ -z "$d_completed" ] || [ -z "$d_errors" ] ||
+     [ -z "$l_completed" ] || [ -z "$l_errors" ] ||
      [ "$d_completed" = 0 ] || [ "$l_completed" = 0 ]; then
-    echo "loadgen 缺少有效样本，拒绝生成延迟对比结果" >&2
+    echo "loadgen 缺少有效样本或延迟字段，拒绝生成对比结果" >&2
     exit 1
   fi
   a50=$(awk -v a="$l50" -v b="$d50" 'BEGIN{printf "%.2f", (a-b)/1000.0}')
