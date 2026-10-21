@@ -380,6 +380,34 @@ TEST(HttpDesync, ResponseWithBothChunkedAndContentLengthIsRejected)
     EXPECT_EQ(llmbridge::net::http::parse_response_head(raw, h), llmbridge::net::http::FrameStatus::Error);
 }
 
+TEST(HttpDesync, ResponseTransferEncodingMustBeSingleChunkedCoding)
+{
+    using llmbridge::net::http::FrameStatus;
+    using llmbridge::net::http::parse_response_head;
+    for (const std::string_view value : {"xchunkedx", "chunkedx", "gzip", "gzip, chunked",
+                                         "chunked, gzip", "chunked;foo=bar", ""})
+    {
+        llmbridge::net::http::ResponseHead h;
+        EXPECT_EQ(parse_response_head("HTTP/1.1 200 OK\r\nTransfer-Encoding: " +
+                                          std::string(value) + "\r\n\r\n", h),
+                  FrameStatus::Error) << value;
+    }
+    llmbridge::net::http::ResponseHead repeated;
+    EXPECT_EQ(parse_response_head("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                                  "Transfer-Encoding: chunked\r\n\r\n", repeated),
+              FrameStatus::Error);
+
+    for (const std::string_view value : {"chunked", " ChUnKeD\t"})
+    {
+        llmbridge::net::http::ResponseHead h;
+        ASSERT_EQ(parse_response_head("HTTP/1.1 200 OK\r\nTransfer-Encoding:" +
+                                          std::string(value) + "\r\n\r\n", h),
+                  FrameStatus::Complete) << value;
+        EXPECT_TRUE(h.chunked);
+        EXPECT_EQ(h.body, llmbridge::net::http::Body::Chunked);
+    }
+}
+
 TEST(HttpDesync, ResponseConflictingDuplicateContentLengthIsRejected)
 {
     const std::string raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 9\r\n\r\nhello";

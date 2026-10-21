@@ -137,3 +137,5 @@ SSE 对比脚本同样先检查 LiteLLM 环境和本机进程，再要求每条�
 HTTP 请求与响应共用的头解析器现在逐字验证字段名，只接受 RFC 9110 `token` 字符；空格、分隔符、DEL、高位字节和内嵌 NUL 不再被转发给语义可能不同的下游解析器。回归测试先证明旧实现接受六类非法名称，同时保留全部合法 `tchar` 的正例；修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**，Release/Werror 全量 CTest **2229/2229 通过**。约 1 KiB 响应头的本机 Release 性能冒烟为 p50 **925 ns**、p95 **1384 ns**；单次短测仅用于发现数量级回退，不作为稳定性能基线。
 
 同一解析器现在还拒绝字段值中的 NUL、DEL 和除 HTAB 外的 C0 控制字节，避免普通请求头原样转发给另一种解析器后被截断、丢弃或重解释；HTAB、SP、可见字符和 `obs-text` 高位字节仍可通过 HTTP framing，凭证层继续执行更严格的可打印 ASCII 约束。回归测试先证明旧实现接受七类非法值，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**；凭证请求单元测试 **29/29**、epoll/io_uring 真实网关拒绝与日志保密场景 **4/4**、Release/Werror 全量 CTest **2230/2230** 通过。约 1 KiB 响应头的本机 Release 性能冒烟为 p50 **928 ns**、p95 **1368 ns**，仅作数量级检查。
+
+响应 `Transfer-Encoding` 不再以子串搜索识别 `chunked`。网关只实现 chunked 解码，因此现在仅接受一个大小写不敏感、可带两侧 OWS 的 `chunked` coding；伪装子串、参数、重复字段和 gzip 等其他 coding 都在进入解码器前拒绝。回归测试先证明旧实现接受八类不支持形式，修复后 Release `net_http_test` **353/353** 通过，ASan/UBSan 与独立 TLS/Werror 定向测试各 **1/1** 通过，Release/Werror 全量 CTest **2231/2231** 通过。约 1 KiB 响应头的本机 Release 性能冒烟为 p50 **934 ns**、p95 **1488 ns**，仅作数量级检查。

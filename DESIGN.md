@@ -335,6 +335,8 @@ continuously fuzzed:
   completions chunked over HTTP/1.1 (invisible over h2, so a curl probe will not
   show it). So the response framer accepts both, and refuses:
   - both framings at once (RFC 9112 §6.3), whichever is right;
+  - a `Transfer-Encoding` value other than one `chunked` coding, including parameters,
+    duplicates or another transfer coding the gateway does not implement;
   - a 1xx: framing `100 Continue` as the reply orphans the real response on a pooled
     connection, where it becomes the next client's bytes (a byte-forward also
     drops the client's `Expect`);

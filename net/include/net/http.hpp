@@ -473,7 +473,7 @@ namespace llmbridge::net::http
         out.status = (head[9] - '0') * 100 + (head[10] - '0') * 10 + (head[11] - '0');
 
         out.keep_alive = head[7] == '1'; // 1.0 closes unless it says keep-alive
-        bool close = false, keep = false;
+        bool close = false, keep = false, have_transfer_encoding = false;
         using Quota = ResponseHead::Quota;
         const auto quota = [&out](std::string_view v, Quota q) noexcept {
             if (detail::is_zero_count(v)) out.quota_exhausted = q;
@@ -501,7 +501,11 @@ namespace llmbridge::net::http
                 case Field::OutputTokensRemaining: return quota(h.value, Quota::OutputTokens);
                 case Field::TokensRemaining: return quota(h.value, Quota::Tokens);
                 case Field::TransferEncoding:
-                    if (detail::contains_ci(h.value, "chunked")) out.chunked = true;
+                    if (have_transfer_encoding ||
+                        !detail::same_ci(detail::trim_ows(h.value), "chunked"))
+                        return false;
+                    have_transfer_encoding = true;
+                    out.chunked = true;
                     return true;
                 case Field::ContentEncoding:
                 {
