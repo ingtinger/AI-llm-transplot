@@ -335,7 +335,7 @@ TEST(KeySwap, AFamilyLineNoPolicyCouldNameIsStrippedToo)
 {
     const std::vector<std::string> strip;
     const std::string m = forward_request("Authorization: Bearer sk-CLIENT\r\nx-kottos-key-: sk-F1\r\n"
-                                          "x-kottos-key-a@b: sk-F2\r\nX-Kottos-Key-" + std::string(52, 'a') +
+                                          "x-kottos-key-a+b: sk-F2\r\nX-Kottos-Key-" + std::string(52, 'a') +
                                           ": sk-F3\r\n");
     std::string into;
     ASSERT_TRUE(request_without(m, head_len(m), strip, "venue", "", {}, into));

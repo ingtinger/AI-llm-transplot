@@ -326,6 +326,21 @@ TEST(HttpDesync, HeaderLineWithoutColonIsRejected)
     expect_rejected(build("POST", {": novalue"}, "hello"), "empty field name");
 }
 
+TEST(HttpDesync, HeaderNamesMustBeTokens)
+{
+    // 非法字段名在不同 HTTP 实现中可能被丢弃、截断或重新解释，代理必须拒绝。
+    for (const std::string& line : {
+             std::string("Bad Name: x"), std::string("Bad(Name): x"),
+             std::string("Bad/Name: x"), std::string("Bad") + '\x7f' + "Name: x",
+             std::string("Bad") + static_cast<char>(0x80) + "Name: x",
+             std::string("Bad\0Name: x", 11)})
+        expect_rejected(build("POST", {line}, ""), "non-token field name");
+
+    Message m;
+    EXPECT_EQ(parse_request(build("POST", {"X!#$%&'*+-.^_`|~: ok"}, ""), m),
+              FrameStatus::Complete);
+}
+
 TEST(HttpDesync, LegalContentLengthFormsStillAccepted)
 {
     // The fix must not over-reject: trailing OWS is legal (RFC 9110 trims it), and

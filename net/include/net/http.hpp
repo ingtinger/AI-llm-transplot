@@ -68,6 +68,15 @@ namespace llmbridge::net::http
             return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
         }
 
+        constexpr bool token_char(char ch) noexcept
+        {
+            const auto c = static_cast<unsigned char>(ch);
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') ||
+                   std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(c)) !=
+                       std::string_view::npos;
+        }
+
         // Case-insensitive substring search; `needle` must be lower-case.
         inline bool contains_ci(std::string_view hay, std::string_view needle) noexcept
         {
@@ -154,15 +163,17 @@ namespace llmbridge::net::http
             return true;
         }
 
-        // A header line needs a colon after a non-empty name, no obs-fold and no
-        // whitespace before the colon (RFC 9112 §5.1, §5.2).
+        // A header line needs a colon after a non-empty token name and no obs-fold
+        // (RFC 9110 §5.1, RFC 9112 §5.2).
         inline bool line_ok(std::string_view line, size_t& colon) noexcept
         {
             if (line.empty()) return false;
             if (line[0] == ' ' || line[0] == '\t') return false; // obs-fold
             colon = line.find(':');
             if (colon == std::string_view::npos || colon == 0) return false;
-            return !(line[colon - 1] == ' ' || line[colon - 1] == '\t');
+            for (const char c : line.substr(0, colon))
+                if (!token_char(c)) return false;
+            return true;
         }
 
         // The length, then the first letter, pick the one name a header can be; one
@@ -227,7 +238,7 @@ namespace llmbridge::net::http
     /// Calls `on_line(const HeaderLine&) -> bool` for each header line of `head`, the
     /// bytes before the terminating CRLFCRLF; the start line is checked, then skipped.
     /// False when another parser could split the head differently (a bare CR or LF
-    /// anywhere, obs-fold, no colon, whitespace before the colon) or `on_line` refuses.
+    /// anywhere, obs-fold, no colon, a non-token field name) or `on_line` refuses.
     template <class OnLine>
     bool walk_headers(std::string_view head, OnLine&& on_line) noexcept
     {
@@ -284,9 +295,7 @@ namespace llmbridge::net::http
         const std::string_view ver = rl.substr(sp2 + 1);
         if (ver != "HTTP/1.1" && ver != "HTTP/1.0") return false;
         for (const char c : rl.substr(0, sp1))
-            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                  std::string_view("!#$%&'*+-.^_`|~").find(c) != std::string_view::npos))
-                return false;
+            if (!detail::token_char(c)) return false;
         for (const char c : rl.substr(sp1 + 1, sp2 - sp1 - 1))
             if (static_cast<unsigned char>(c) <= ' ' || c == 0x7f) return false;
         return true;
