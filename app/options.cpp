@@ -401,6 +401,8 @@ namespace llmbridge::app
                     if (!v.is_array() || v.arr.empty() || v.arr.size() > 256)
                         return fail(err, "config: security.users must contain 1..256 users");
                     s.users.clear();
+                    std::unordered_set<std::string> user_ids;
+                    std::unordered_set<std::string> key_envs;
                     for (const auto& item : v.arr)
                     {
                         if (!item.is_object()) return fail(err, "config: security.users entries must be objects");
@@ -419,10 +421,13 @@ namespace llmbridge::app
                             {
                                 if (!value.is_array() || value.arr.empty() || value.arr.size() > 64)
                                     return fail(err, "config: security.users.models must contain 1..64 names");
+                                std::unordered_set<std::string_view> seen;
                                 for (const auto& e : value.arr)
                                 {
                                     if (e.type != json::Value::Type::String || !substitute_ok(e.sv, 64))
                                         return fail(err, "config: security.users.models contains an invalid model");
+                                    if (!seen.insert(e.sv).second)
+                                        return fail(err, "config: security.users.models contains a duplicate model");
                                     user.models.emplace_back(e.sv);
                                 }
                             }
@@ -430,6 +435,7 @@ namespace llmbridge::app
                             {
                                 if (!value.is_array() || value.arr.empty() || value.arr.size() > 64)
                                     return fail(err, "config: security.users.upstreams must contain 1..64 indices");
+                                std::unordered_set<int> seen;
                                 for (const auto& e : value.arr)
                                 {
                                     if (e.type != json::Value::Type::Number || e.sv.empty())
@@ -438,6 +444,8 @@ namespace llmbridge::app
                                     const auto parsed = std::from_chars(e.sv.data(), e.sv.data() + e.sv.size(), n);
                                     if (parsed.ec != std::errc{} || parsed.ptr != e.sv.data() + e.sv.size() || n < 0)
                                         return fail(err, "config: security.users.upstreams contains an invalid index");
+                                    if (!seen.insert(n).second)
+                                        return fail(err, "config: security.users.upstreams contains a duplicate index");
                                     user.upstreams.push_back(n);
                                 }
                             }
@@ -470,6 +478,8 @@ namespace llmbridge::app
                         if (user.id.empty() || user.tenant.empty() || user.key_env.empty() ||
                             user.models.empty() || user.upstreams.empty())
                             return fail(err, "config: security.users requires id, tenant, key_env, models, upstreams");
+                        if (!user_ids.insert(user.id).second || !key_envs.insert(user.key_env).second)
+                            return fail(err, "config: security.users contains a duplicate id or key_env");
                         s.users.push_back(std::move(user));
                     }
                 }

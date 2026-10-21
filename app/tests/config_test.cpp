@@ -77,6 +77,21 @@ TEST(Config, SecurityUsersAndEnvironmentNamesAreStrict)
     EXPECT_FALSE(parse_config(R"({"security":{"allow_insecure_http":"true"}})", invalid, err));
 }
 
+TEST(Config, SecurityUserPermissionListsAndIdentitiesAreUnique)
+{
+    std::string err;
+    for (const std::string_view input : {
+             R"({"security":{"users":[{"id":"alice","tenant":"team","key_env":"ALICE_KEY","models":["chat","chat"],"upstreams":[0]}]}})",
+             R"({"security":{"users":[{"id":"alice","tenant":"team","key_env":"ALICE_KEY","models":["chat"],"upstreams":[0,0]}]}})",
+             R"({"security":{"users":[{"id":"alice","tenant":"a","key_env":"ALICE_KEY","models":["chat"],"upstreams":[0]},{"id":"alice","tenant":"b","key_env":"BOB_KEY","models":["chat"],"upstreams":[0]}]}})",
+             R"({"security":{"users":[{"id":"alice","tenant":"a","key_env":"SHARED_KEY","models":["chat"],"upstreams":[0]},{"id":"bob","tenant":"b","key_env":"SHARED_KEY","models":["chat"],"upstreams":[0]}]}})"})
+    {
+        Settings rejected;
+        EXPECT_FALSE(parse_config(input, rejected, err)) << input;
+        EXPECT_NE(err.find("duplicate"), std::string::npos) << err;
+    }
+}
+
 TEST(Config, StripHeaderNamesAreBoundedAndValid)
 {
     Settings s;

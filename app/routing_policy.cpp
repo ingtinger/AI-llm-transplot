@@ -117,9 +117,18 @@ namespace llmbridge::app
                 if (user.daily_tokens < 0 || user.daily_tokens > 1'000'000'000 ||
                     user.monthly_tokens < 0 || user.monthly_tokens > 1'000'000'000)
                     throw std::invalid_argument("security: invalid token quota");
+                std::unordered_set<std::string_view> user_models;
+                for (const auto& model : user.models)
+                    if (!user_models.insert(model).second)
+                        throw std::invalid_argument("security: duplicate user model");
+                std::unordered_set<int> user_upstreams;
                 for (int index : user.upstreams)
+                {
+                    if (!user_upstreams.insert(index).second)
+                        throw std::invalid_argument("security: duplicate user upstream index");
                     if (index < 0 || static_cast<size_t>(index) >= config_.upstream_count)
                         throw std::invalid_argument("security: user upstream index out of range");
+                }
                 if (model_pools_enabled_)
                     for (const auto& model : user.models)
                     {

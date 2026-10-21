@@ -118,7 +118,7 @@ curl --cacert /path/to/ca.pem https://127.0.0.1:8088/v1/chat/completions \
   }'
 ```
 
-网关验证虚拟 Key 后仅向该用户许可的上游发送对应的服务端 Provider Key。客户端的 `Authorization` 和 `X-Kottos-Key-*` 不会作为 Provider 凭证转发。缺失/错误/禁用/过期 Key 返回 401，模型越权返回 403，限额返回 429。用户必须继续携带完整 `messages`；相同会话 ID 不构成跨用户授权。
+网关验证虚拟 Key 后仅向该用户许可的上游发送对应的服务端 Provider Key。客户端的 `Authorization` 和 `X-Kottos-Key-*` 不会作为 Provider 凭证转发。每个用户的 `id` 和 `key_env` 必须全局唯一，其 `models` 与 `upstreams` 列表内部也不得重复。缺失/错误/禁用/过期 Key 返回 401，模型越权返回 403，限额返回 429。用户必须继续携带完整 `messages`；相同会话 ID 不构成跨用户授权。
 
 默认不启动无认证服务：必须配置 `security.enabled=true`，或仅做本地兼容测试时显式启用 `security.legacy_mode=true` / `--legacy-mode`；两者不能同时开启。安全模式还默认要求数据端口启用 TLS，并拒绝非回环地址的明文上游。仅隔离的本地 Mock 测试可显式设置 `security.allow_insecure_http=true`；此开关仍会监听所有网卡，**不能用于公网部署**。虚拟 Key 至少 16 个可打印 ASCII 字符。创建时生成随机 Key 并通过环境变量注入；撤销可把用户设为 `disabled: true`，轮换可更换对应环境变量值，均需重启进程。`expires_unix_s` 可设置 UTC Unix 秒时间戳。不要把真实 Key 写入 JSON、仓库或日志。
 

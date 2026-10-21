@@ -25,6 +25,7 @@
   "security": {
     "enabled": true,
     "allow_insecure_http": false,
+    "_users_constraint": "每个用户的 id 和 key_env 必须全局唯一；models 与 upstreams 列表内部不得重复。",
     "users": [
       {
         "id": "alice", "tenant": "team-a", "key_env": "GATEWAY_ALICE_KEY",

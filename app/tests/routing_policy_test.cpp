@@ -46,6 +46,23 @@ TEST(RoutingPolicy, StickyHeaderLengthIsBounded)
     EXPECT_THROW(llmbridge::app::RoutingPolicy(std::move(c)), std::invalid_argument);
 }
 
+TEST(RoutingPolicy, SecureUserPermissionsMustBeUnique)
+{
+    auto duplicate_models = config(1);
+    duplicate_models.security_enabled = true;
+    duplicate_models.server_credentials = {"provider-secret"};
+    duplicate_models.users = {{"alice", "tenant", "gateway-key-alice-123456",
+                               {"chat", "chat"}, {0}, 10, 1, 0, 0, 0, false}};
+    EXPECT_THROW(llmbridge::app::RoutingPolicy(std::move(duplicate_models)), std::invalid_argument);
+
+    auto duplicate_upstreams = config(1);
+    duplicate_upstreams.security_enabled = true;
+    duplicate_upstreams.server_credentials = {"provider-secret"};
+    duplicate_upstreams.users = {{"alice", "tenant", "gateway-key-alice-123456",
+                                  {"chat"}, {0, 0}, 10, 1, 0, 0, 0, false}};
+    EXPECT_THROW(llmbridge::app::RoutingPolicy(std::move(duplicate_upstreams)), std::invalid_argument);
+}
+
 TEST(RoutingPolicy, UnsafeStatusRetryRequiresExplicitOptIn)
 {
     auto c = config(2);
