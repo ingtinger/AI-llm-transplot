@@ -121,3 +121,5 @@ SSE 对比脚本同样先检查 LiteLLM 环境和本机进程，再要求每条�
 `upstream.strip_headers` 现在最多接受 64 个合法 HTTP 字段名，每个最多 64 字节；包含冒号、空格、斜杠或超限的名称在配置解析时被拒绝，不会复制到各工作线程。回归测试先证明旧解析器误接受这些输入，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**；Release/Werror 全量 CTest、约定及文档数据检查通过。
 
 `routing.drained_upstreams` 在复制配置前限制为最多 64 项，单个索引文本最多 20 字节，与 64 位摘除掩码一致。回归测试先证明旧解析器接受超长列表和索引文本，修复后与 `strip_headers` 边界测试一起在 ASan/UBSan 和独立 TLS/Werror 构建下各 **2/2 通过**；Release/Werror 全量构建及 CTest、约定和文档数据检查通过。
+
+`routing.sticky_header` 现在在配置解析和策略构造两层统一限制为 1..64 字节，并只接受字母、数字、连字符和下划线，防止接近配置文件上限的名称进入每次请求的头匹配。两个回归测试先证明旧实现会接受非法字符和 65 字节名称，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **2/2 通过**；Release/Werror 全量 CTest、约定及文档数据检查通过。

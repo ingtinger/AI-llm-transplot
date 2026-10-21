@@ -168,6 +168,18 @@ namespace llmbridge::app
             return true;
         }
 
+        bool sticky_header_name_ok(std::string_view name) noexcept
+        {
+            if (name.empty() || name.size() > 64) return false;
+            for (const char c : name)
+            {
+                const bool alpha_num = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                       (c >= '0' && c <= '9');
+                if (!alpha_num && c != '-' && c != '_') return false;
+            }
+            return true;
+        }
+
         std::string bounds(double v)
         {
             char b[32];
@@ -221,6 +233,8 @@ namespace llmbridge::app
                     return fail(err, m);
                 }
             }
+            if (o.key == "routing.sticky_header" && !sticky_header_name_ok(v))
+                return fail(err, where + " must be a 1..64 byte HTTP header name");
             s.*std::get<std::string Settings::*>(o.field) = std::string(v);
             return true;
         }

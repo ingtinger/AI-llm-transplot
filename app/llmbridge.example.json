@@ -56,7 +56,7 @@
     "failure_threshold": 3,
     "_cooldown_s": "异常上游的冷却秒数；全部上游都在冷却时仍允许一次探测。",
     "cooldown_s": 10,
-    "_sticky_header": "客户端为每段对话提供的稳定会话标识请求头。",
+    "_sticky_header": "客户端为每段对话提供的稳定会话标识请求头；名称为 1..64 字节，仅允许字母、数字、连字符和下划线。",
     "sticky_header": "x-conversation-id",
     "_drained_upstreams": "SIGHUP 可热更新；填写上游数组索引的十进制字符串，最多 64 项且单项最多 20 字节。摘除后不再分配新请求，已在途请求继续完成。其他配置改动须重启。",
     "drained_upstreams": [],

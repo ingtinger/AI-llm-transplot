@@ -127,6 +127,25 @@ TEST(Config, DrainListIsBoundedBeforeCopying)
     EXPECT_FALSE(parse_config(many, s, err));
 }
 
+TEST(Config, StickyHeaderIsBoundedAndValid)
+{
+    Settings s;
+    std::string err;
+    EXPECT_TRUE(parse_config(R"({"routing":{"sticky_header":"x_chat-id"}})", s, err)) << err;
+    for (const std::string_view invalid : {
+             R"({"routing":{"sticky_header":"x bad"}})",
+             R"({"routing":{"sticky_header":"x.bad"}})",
+             R"({"routing":{"sticky_header":"x:bad"}})"})
+    {
+        Settings rejected;
+        EXPECT_FALSE(parse_config(invalid, rejected, err)) << invalid;
+    }
+    EXPECT_TRUE(parse_config("{\"routing\":{\"sticky_header\":\"" +
+                                 std::string(64, 'x') + "\"}}", s, err)) << err;
+    EXPECT_FALSE(parse_config("{\"routing\":{\"sticky_header\":\"" +
+                                  std::string(65, 'x') + "\"}}", s, err));
+}
+
 TEST(Config, FullFileAppliesEveryGroup)
 {
     const std::string text = R"({

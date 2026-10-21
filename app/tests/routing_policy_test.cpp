@@ -39,6 +39,13 @@ TEST(RoutingPolicy, RoundRobinVisitsEveryUpstream)
     EXPECT_EQ(policy.decide(facts).upstream_index, 0);
 }
 
+TEST(RoutingPolicy, StickyHeaderLengthIsBounded)
+{
+    auto c = config(1);
+    c.sticky_header.assign(65, 'x');
+    EXPECT_THROW(llmbridge::app::RoutingPolicy(std::move(c)), std::invalid_argument);
+}
+
 TEST(RoutingPolicy, UnsafeStatusRetryRequiresExplicitOptIn)
 {
     auto c = config(2);

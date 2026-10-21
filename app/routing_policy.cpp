@@ -47,7 +47,7 @@ namespace llmbridge::app
 
         bool header_name_ok(std::string_view name) noexcept
         {
-            if (name.empty()) return false;
+            if (name.empty() || name.size() > 64) return false;
             for (const unsigned char c : name)
             {
                 const bool alpha_num = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
