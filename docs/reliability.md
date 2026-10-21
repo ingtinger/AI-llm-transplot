@@ -119,3 +119,5 @@ SSE 对比脚本同样先检查 LiteLLM 环境和本机进程，再要求每条�
 显式空端口（如 `https://host:`）不再误用默认端口。新增两个回归输入先证明旧解析器会接受它们，再在三种构建下通过 `UpstreamParse.RejectsBadPorts`；Release/Werror 全量 CTest 通过。
 
 `upstream.strip_headers` 现在最多接受 64 个合法 HTTP 字段名，每个最多 64 字节；包含冒号、空格、斜杠或超限的名称在配置解析时被拒绝，不会复制到各工作线程。回归测试先证明旧解析器误接受这些输入，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**；Release/Werror 全量 CTest、约定及文档数据检查通过。
+
+`routing.drained_upstreams` 在复制配置前限制为最多 64 项，单个索引文本最多 20 字节，与 64 位摘除掩码一致。回归测试先证明旧解析器接受超长列表和索引文本，修复后与 `strip_headers` 边界测试一起在 ASan/UBSan 和独立 TLS/Werror 构建下各 **2/2 通过**；Release/Werror 全量构建及 CTest、约定和文档数据检查通过。

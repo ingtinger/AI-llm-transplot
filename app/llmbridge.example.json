@@ -58,7 +58,7 @@
     "cooldown_s": 10,
     "_sticky_header": "客户端为每段对话提供的稳定会话标识请求头。",
     "sticky_header": "x-conversation-id",
-    "_drained_upstreams": "SIGHUP 可热更新；填写上游数组索引的字符串，摘除后不再分配新请求，已在途请求继续完成。其他配置改动须重启。",
+    "_drained_upstreams": "SIGHUP 可热更新；填写上游数组索引的十进制字符串，最多 64 项且单项最多 20 字节。摘除后不再分配新请求，已在途请求继续完成。其他配置改动须重启。",
     "drained_upstreams": [],
     "_allow_unsafe_replay": "默认禁止重放可能已被上游执行的请求。设置 true 才允许完整错误响应/已发送请求的自动重试；可能重复执行和计费。",
     "allow_unsafe_replay": false

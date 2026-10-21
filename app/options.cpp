@@ -254,6 +254,9 @@ namespace llmbridge::app
             }
             // A bare string where a list was meant must not become a silent no-op.
             if (!v.is_array()) return fail(err, where + " must be an array of strings");
+            if ((o.key == "upstream.strip_headers" || o.key == "routing.drained_upstreams") &&
+                v.arr.size() > 64)
+                return fail(err, where + " supports at most 64 entries");
             std::vector<std::string> out;
             for (const json::Value& e : v.arr)
             {
@@ -261,6 +264,10 @@ namespace llmbridge::app
                     return fail(err, where + " must contain only strings");
                 if (e.sv.empty()) return fail(err, where + " must not contain an empty string");
                 if (!plain(e.sv)) return false;
+                if (o.key == "upstream.strip_headers" && !header_name_ok(e.sv))
+                    return fail(err, where + " has an invalid header name");
+                if (o.key == "routing.drained_upstreams" && e.sv.size() > 20)
+                    return fail(err, where + " has an index longer than 20 bytes");
                 out.emplace_back(e.sv);
             }
             s.*std::get<std::vector<std::string> Settings::*>(o.field) = std::move(out);
@@ -328,11 +335,6 @@ namespace llmbridge::app
                     return fail(err, "config: every entry in an \"upstream\" array needs a url");
                 if (e.find("strip_headers") != nullptr)
                 {
-                    if (one.strip_headers.size() > 64)
-                        return fail(err, "config: upstream.strip_headers supports at most 64 names");
-                    for (const auto& name : one.strip_headers)
-                        if (!header_name_ok(name))
-                            return fail(err, "config: upstream.strip_headers has an invalid header name");
                     if (strip && one.strip_headers != s.strip_headers)
                         return fail(err, "config: \"upstream.strip_headers\" is gateway-wide; every "
                                          "entry that sets it must list the same headers");

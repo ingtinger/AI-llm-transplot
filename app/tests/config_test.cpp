@@ -113,6 +113,20 @@ TEST(Config, DrainIndicesAreReadFromRoutingGroup)
     EXPECT_FALSE(parse_config(R"({"routing":{"drained_upstreams":[0]}})", s, err));
 }
 
+TEST(Config, DrainListIsBoundedBeforeCopying)
+{
+    // 摘除位图至多有 64 位，配置解析不应复制任意长的索引列表或索引文本。
+    Settings s;
+    std::string err;
+    EXPECT_FALSE(parse_config("{\"routing\":{\"drained_upstreams\":[\"" +
+                                  std::string(21, '0') + "\"]}}", s, err));
+    std::string many = "{\"routing\":{\"drained_upstreams\":[";
+    for (int i = 0; i < 65; ++i)
+        many += (i ? "," : "") + std::string("\"") + std::to_string(i) + "\"";
+    many += "]}}";
+    EXPECT_FALSE(parse_config(many, s, err));
+}
+
 TEST(Config, FullFileAppliesEveryGroup)
 {
     const std::string text = R"({
