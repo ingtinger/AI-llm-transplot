@@ -107,8 +107,33 @@ def rejected_upstream_errors_hide_input(binary: Path) -> None:
         assert marker.encode() not in result.stdout + result.stderr
 
 
+def duplicate_user_permissions_are_rejected(binary: Path) -> None:
+    """重复权限在读取配置时拒绝，且错误输出不回显配置值。"""
+    marker = "secret-duplicate-marker"
+    base = {"id": "alice", "tenant": "team", "key_env": "ALICE_KEY",
+            "models": ["chat"], "upstreams": [0]}
+    cases = [
+        [{**base, "models": [marker, marker]}],
+        [{**base, "upstreams": [0, 0]}],
+        [{**base, "id": marker},
+         {**base, "id": marker, "key_env": "BOB_KEY"}],
+        [{**base, "id": "alice", "key_env": marker},
+         {**base, "id": "bob", "key_env": marker}],
+    ]
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp) / "config.json"
+        for users in cases:
+            path.write_text(json.dumps({"security": {"users": users}}), encoding="utf-8")
+            result = subprocess.run([str(binary), "--config", str(path)], capture_output=True,
+                                    timeout=5, check=False)
+            assert result.returncode != 0
+            assert b"duplicate" in result.stderr
+            assert marker.encode() not in result.stdout + result.stderr
+
+
 def main(binary: Path) -> None:
     rejected_upstream_errors_hide_input(binary)
+    duplicate_user_permissions_are_rejected(binary)
     port, dead, live = free_port(), free_port(), free_port()
     mock = http.server.ThreadingHTTPServer(("127.0.0.1", live), Mock)
     thread = threading.Thread(target=mock.serve_forever, daemon=True)

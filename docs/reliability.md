@@ -124,4 +124,4 @@ SSE 对比脚本同样先检查 LiteLLM 环境和本机进程，再要求每条�
 
 `routing.sticky_header` 现在在配置解析和策略构造两层统一限制为 1..64 字节，并只接受字母、数字、连字符和下划线，防止接近配置文件上限的名称进入每次请求的头匹配。两个回归测试先证明旧实现会接受非法字符和 65 字节名称，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **2/2 通过**；Release/Werror 全量 CTest、约定及文档数据检查通过。
 
-安全用户配置现在拒绝重复的用户 `id`、`key_env`、用户模型和许可上游索引；配置解析阶段给出具体错误，策略构造层继续防止程序化调用绕过校验。两个回归测试先证明旧实现会接受四类重复项，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **2/2 通过**；Release/Werror 全量 CTest、约定及文档数据检查通过。
+安全用户配置现在拒绝重复的用户 `id`、`key_env`、用户模型和许可上游索引；配置解析阶段给出具体错误，策略构造层继续防止程序化调用绕过校验。两个回归测试先证明旧实现会接受四类重复项，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **2/2 通过**；`AppSecureUsers` 又用四份临时配置验证真实进程会拒绝启动且不回显配置值，定向 **1/1 通过**。Release/Werror 全量 CTest、约定及文档数据检查通过。
