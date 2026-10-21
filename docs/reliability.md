@@ -48,21 +48,23 @@ ASan 检查越界、释放后访问等内存错误，UBSan 检查未定义行为
 ## TSan
 
 ```bash
-cmake -S . -B build-wsl-tsan -DCMAKE_BUILD_TYPE=Debug \
+cmake -S . -B build-tsan-current -DCMAKE_BUILD_TYPE=Debug \
   -DLLMBRIDGE_WERROR=ON -DLLMBRIDGE_TLS=OFF -DLLMBRIDGE_BUILD_TESTS=ON \
   -DCMAKE_CXX_FLAGS='-fsanitize=thread' \
   -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=thread' \
   -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
-cmake --build build-wsl-tsan -j3 --target app_options_test llmbridge
+cmake --build build-tsan-current -j3 --target app_options_test llmbridge
 TSAN_OPTIONS=halt_on_error=1 setarch x86_64 -R \
-  build-wsl-tsan/bin/app_options_test --gtest_filter='RoutingPolicy.*'
+  build-tsan-current/bin/app_options_test --gtest_filter='RoutingPolicy.*'
 TSAN_OPTIONS=halt_on_error=1 setarch x86_64 -R \
-  python3 app/tests/hot_reload_e2e.py build-wsl-tsan/bin/llmbridge
+  python3 app/tests/hot_reload_e2e.py build-tsan-current/bin/llmbridge
+TSAN_OPTIONS=halt_on_error=1 setarch x86_64 -R \
+  python3 app/tests/secure_users_e2e.py build-tsan-current/bin/llmbridge
 ```
 
 TSan 要单独构建，不能与 ASan 同时链接。**本机 WSL2** 下直接启动 GCC TSan 程序会在进入测试前报 `FATAL: ThreadSanitizer: unexpected memory mapping`；`setarch x86_64 -R` 才能启动，因此这里将 GoogleTest 发现改为 `PRE_TEST`，并直接在该包装下运行测试。在原生 Linux/CI 上应再用通常的 CTest 方式验证，不依赖 WSL 特例。
 
-**2026-10-20 实测：**`RoutingPolicy.*` **21/21 通过**，真实进程 `hot_reload_e2e.py` **1/1 通过**，未报告数据竞争。这是选定的并发路径，不是全项目 TSan 验证。
+**2026-10-21 实测：**新建且指向当前工作树的 `build-tsan-current` 后，`RoutingPolicy.*` **23/23 通过**，真实进程 `hot_reload_e2e.py` 与 `secure_users_e2e.py` 各 **1/1 通过**，未报告数据竞争。这覆盖热加载、共享路由状态、用户并发与额度路径，不是全项目 TSan 验证。
 
 ## 验收边界
 
