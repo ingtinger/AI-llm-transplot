@@ -66,6 +66,12 @@ TSan 要单独构建，不能与 ASan 同时链接。**本机 WSL2** 下直接�
 
 **2026-10-21 实测：**新建且指向当前工作树的 `build-tsan-current` 后，`RoutingPolicy.*` **23/23 通过**，真实进程 `hot_reload_e2e.py` 与 `secure_users_e2e.py` 各 **1/1 通过**，未报告数据竞争。这覆盖热加载、共享路由状态、用户并发与额度路径，不是全项目 TSan 验证。
 
+## Fuzz
+
+CI 使用 Clang/libFuzzer 配合 ASan/UBSan，分别覆盖 JSON、HTTP、HTTP 差分、TLS 握手、用量扫描、配置、流式请求体和 SSE。上游 URL 解析器另有 `fuzz_upstream`：对任意字节验证拒绝必有原因，接受结果满足主机、端口和路径不变量，并能规范化后往返解析；种子包含路径与查询、旧式地址、空端口、userinfo 混淆和点段。
+
+**2026-10-21 本机检查：**当前环境没有 Clang/libFuzzer，不能声称已在本机执行随机 Fuzz；新目标及解析实现通过 GCC 13 的 C++20/Werror 编译，五个提交种子的确定性冒烟通过。CI 会以 60 秒、4096 字节输入上限运行该目标，最终以 CI Fuzz 作业结果为准。
+
 ## 验收边界
 
 - `LLMBRIDGE_WERROR=ON` 构建通过只说明当前编译器没有警告，不说明逻辑正确。

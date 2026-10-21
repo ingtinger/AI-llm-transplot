@@ -49,6 +49,12 @@ target_link_libraries(fuzz_http_diff PRIVATE net) # http.hpp against fuzz/http_l
 target_link_libraries(fuzz_sse PRIVATE provider)  # provider/sse.hpp + compiled sse.cpp
 target_link_libraries(fuzz_scan PRIVATE provider) # provider/openai.hpp scans
 
+# 上游 URL 配置解析器。直接编译实现文件，使覆盖率和消毒器进入解析逻辑本身。
+add_executable(fuzz_upstream fuzz_upstream.cpp ${PROJECT_SOURCE_DIR}/net/src/upstream.cpp)
+target_compile_options(fuzz_upstream PRIVATE -g -O1 -UNDEBUG -fsanitize=fuzzer,address,undefined)
+target_link_options(fuzz_upstream PRIVATE -fsanitize=fuzzer,address,undefined)
+target_include_directories(fuzz_upstream PRIVATE ${PROJECT_SOURCE_DIR}/net/include)
+
 # The `--config` file parser. options.cpp is compiled in, not linked from the app's
 # library, so libFuzzer sees its coverage.
 add_executable(fuzz_config fuzz_config.cpp ${PROJECT_SOURCE_DIR}/app/options.cpp)
