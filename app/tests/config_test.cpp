@@ -100,7 +100,8 @@ TEST(Config, StripHeaderNamesAreBoundedAndValid)
     for (const std::string_view invalid : {
              R"({"upstream":{"strip_headers":["authorization:"]}})",
              R"({"upstream":{"strip_headers":["x bad"]}})",
-             R"({"upstream":{"strip_headers":["x/bad"]}})"})
+             R"({"upstream":{"strip_headers":["x/bad"]}})",
+             R"({"upstream":{"strip_headers":["Authorization","authorization"]}})"})
     {
         Settings rejected;
         EXPECT_FALSE(parse_config(invalid, rejected, err)) << invalid;

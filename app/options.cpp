@@ -272,14 +272,23 @@ namespace llmbridge::app
                 v.arr.size() > 64)
                 return fail(err, where + " supports at most 64 entries");
             std::vector<std::string> out;
+            std::unordered_set<std::string> strip_names;
             for (const json::Value& e : v.arr)
             {
                 if (e.type != json::Value::Type::String)
                     return fail(err, where + " must contain only strings");
                 if (e.sv.empty()) return fail(err, where + " must not contain an empty string");
                 if (!plain(e.sv)) return false;
-                if (o.key == "upstream.strip_headers" && !header_name_ok(e.sv))
-                    return fail(err, where + " has an invalid header name");
+                if (o.key == "upstream.strip_headers")
+                {
+                    if (!header_name_ok(e.sv))
+                        return fail(err, where + " has an invalid header name");
+                    std::string normalized(e.sv);
+                    for (char& c : normalized)
+                        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                    if (!strip_names.insert(std::move(normalized)).second)
+                        return fail(err, where + " contains a duplicate header name");
+                }
                 if (o.key == "routing.drained_upstreams" && e.sv.size() > 20)
                     return fail(err, where + " has an index longer than 20 bytes");
                 out.emplace_back(e.sv);
