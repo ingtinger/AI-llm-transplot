@@ -980,6 +980,52 @@ TEST(HttpRequestEncoding, CaseInsensitive)
     EXPECT_TRUE(m.encoded);
 }
 
+TEST(HttpOutputState, ReusedRequestResultDoesNotKeepPriorFlags)
+{
+    Message m;
+    ASSERT_EQ(parse_request("POST / HTTP/1.1\r\nContent-Encoding: gzip\r\n"
+                            "Connection: close\r\nContent-Length: 0\r\n\r\n", m),
+              FrameStatus::Complete);
+    ASSERT_TRUE(m.encoded);
+    ASSERT_FALSE(m.keep_alive);
+
+    ASSERT_EQ(parse_request("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n", m),
+              FrameStatus::Complete);
+    EXPECT_FALSE(m.encoded);
+    EXPECT_TRUE(m.keep_alive);
+}
+
+TEST(HttpOutputState, ReusedResponseResultDoesNotKeepPriorMetadata)
+{
+    llmbridge::net::http::ResponseHead h;
+    ASSERT_EQ(llmbridge::net::http::parse_response_head(
+                  "HTTP/1.1 429 Busy\r\nTransfer-Encoding: chunked\r\n"
+                  "Content-Type: text/event-stream\r\nContent-Encoding: gzip\r\n"
+                  "Retry-After: 7\r\nx-ratelimit-remaining-requests: 0\r\n"
+                  "x-amzn-bedrock-service-tier: priority\r\n\r\n", h),
+              FrameStatus::Complete);
+    ASSERT_TRUE(h.chunked);
+    ASSERT_TRUE(h.event_stream);
+    ASSERT_TRUE(h.encoded);
+    ASSERT_EQ(h.retry_after_s, 7);
+    ASSERT_NE(h.quota_exhausted, llmbridge::net::http::ResponseHead::Quota::None);
+    ASSERT_NE(h.bedrock_tier_len, 0);
+
+    ASSERT_EQ(llmbridge::net::http::parse_response_head(
+                  "HTTP/1.0 204 No Content\r\n\r\n", h),
+              FrameStatus::Complete);
+    EXPECT_FALSE(h.keep_alive);
+    EXPECT_FALSE(h.chunked);
+    EXPECT_FALSE(h.event_stream);
+    EXPECT_FALSE(h.encoded);
+    EXPECT_FALSE(h.has_content_length);
+    EXPECT_EQ(h.content_length, 0);
+    EXPECT_EQ(h.retry_after_s, 0);
+    EXPECT_EQ(h.quota_exhausted, llmbridge::net::http::ResponseHead::Quota::None);
+    EXPECT_EQ(h.bedrock_tier_len, 0);
+    EXPECT_EQ(h.bedrock_latency_len, 0);
+}
+
 // ── walk_headers ─────────────────────────────────────────────────────────────
 
 TEST(WalkHeaders, ClassifiesEachLineAndSkipsTheStartLine)

@@ -264,6 +264,8 @@ continuously fuzzed:
   - **One header walk.** `walk_headers` splits the head once, checks each line's
     ending as it goes, and hands every line to the caller already classified as a
     `Field`, so `parse_request` and `parse_response_head` share one strict reader.
+    Both entry points replace their output object on every call, so reusing it for a
+    later message cannot retain encoding, framing, quota or retry metadata.
     It refuses a head that another parser could split differently, because on a
     pooled upstream a framing disagreement hands one client another client's bytes:
     - a bare CR or bare LF anywhere, start line included (`X-A: 1\rContent-Length: 27`

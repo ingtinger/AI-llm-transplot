@@ -139,3 +139,5 @@ HTTP 请求与响应共用的头解析器现在逐字验证字段名，只接受
 同一解析器现在还拒绝字段值中的 NUL、DEL 和除 HTAB 外的 C0 控制字节，避免普通请求头原样转发给另一种解析器后被截断、丢弃或重解释；HTAB、SP、可见字符和 `obs-text` 高位字节仍可通过 HTTP framing，凭证层继续执行更严格的可打印 ASCII 约束。回归测试先证明旧实现接受七类非法值，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**；凭证请求单元测试 **29/29**、epoll/io_uring 真实网关拒绝与日志保密场景 **4/4**、Release/Werror 全量 CTest **2230/2230** 通过。约 1 KiB 响应头的本机 Release 性能冒烟为 p50 **928 ns**、p95 **1368 ns**，仅作数量级检查。
 
 响应 `Transfer-Encoding` 不再以子串搜索识别 `chunked`。网关只实现 chunked 解码，因此现在仅接受一个大小写不敏感、可带两侧 OWS 的 `chunked` coding；伪装子串、参数、重复字段和 gzip 等其他 coding 都在进入解码器前拒绝。回归测试先证明旧实现接受八类不支持形式，修复后 Release `net_http_test` **353/353** 通过，ASan/UBSan 与独立 TLS/Werror 定向测试各 **1/1** 通过，Release/Werror 全量 CTest **2231/2231** 通过。约 1 KiB 响应头的本机 Release 性能冒烟为 p50 **934 ns**、p95 **1488 ns**，仅作数量级检查。
+
+`parse_request` 与 `parse_response_head` 现在每次调用都先替换输出对象，并在公共 API 注释中明确只有 `Complete` 状态包含解析事实。两个回归测试先证明复用对象会让新请求继承 `encoded`，让新响应继承 chunked、SSE、压缩、Retry-After、配额和 Bedrock 元数据；修复后 Release `net_http_test` **355/355**、ASan/UBSan 与独立 TLS/Werror 定向测试各 **2/2**、Release/Werror 全量 CTest **2233/2233** 通过。约 1 KiB 响应头的本机 Release 性能冒烟为 p50 **856 ns**、p95 **1211 ns**，未见初始化造成的数量级回退。

@@ -311,11 +311,13 @@ namespace llmbridge::net::http
     inline constexpr size_t kMaxBodyLen = 16 * 1024 * 1024;
 
     // Idempotent: re-run as bytes arrive; NeedMore until the full message is buffered.
+    // `out` is replaced on every call and carries parsed facts only on Complete.
     // `also(const HeaderLine&) -> bool` sees every header line of the one walk, once the
     // head is buffered; false refuses the request.
     template <class Also>
     inline FrameStatus parse_request(std::string_view buf, Message& out, Also&& also) noexcept
     {
+        out = Message{};
         const size_t hdr_end = buf.find("\r\n\r\n");
         if (hdr_end == std::string_view::npos)
             return buf.size() > kMaxHeaderLen ? FrameStatus::Error : FrameStatus::NeedMore;
@@ -448,11 +450,13 @@ namespace llmbridge::net::http
     }
 
     // Unlike parse_request, accepts chunked (SSE and most non-streamed replies) and
-    // reports the framing. NeedMore until the CRLFCRLF is buffered. `head_request`:
-    // the request was HEAD, so the response has no body.
+    // reports the framing. NeedMore until the CRLFCRLF is buffered. `out` is replaced
+    // on every call and carries parsed facts only on Complete. `head_request`: the
+    // request was HEAD, so the response has no body.
     inline FrameStatus parse_response_head(std::string_view buf, ResponseHead& out,
                                            bool head_request = false) noexcept
     {
+        out = ResponseHead{};
         const size_t hdr_end = buf.find("\r\n\r\n");
         if (hdr_end == std::string_view::npos)
             return buf.size() > kMaxHeaderLen ? FrameStatus::Error : FrameStatus::NeedMore;
