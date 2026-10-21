@@ -431,8 +431,7 @@ TEST(KeyHeader, ARepeatedHeaderIsRefusedWhicheverCopyIsFirst)
 TEST(KeyHeader, UnsafeBytesAreRefused)
 {
     const std::vector<std::string> strip;
-    for (const std::string& value : {std::string("sk\x01x"), std::string("sk\x7fx"), std::string("sk\xC3x"),
-                                     std::string(9000, 'k')})
+    for (const std::string& value : {std::string("sk\xC3x"), std::string(9000, 'k')})
     {
         std::string out;
         Refusal r;
@@ -441,13 +440,18 @@ TEST(KeyHeader, UnsafeBytesAreRefused)
         EXPECT_STREQ(r.detail, refuse::kCredential);
         EXPECT_TRUE(out.empty()) << out;
     }
-    // A bare CR splits the head differently for another parser: the framing walk refuses it.
-    std::string out;
-    Refusal r;
-    EXPECT_FALSE(auth_headers_for(UpstreamDialect::Anthropic, "x-kottos-key-anthropic: sk\rX-Injected: 1\r\n",
-                                  strip, out, kNamed, &r));
-    EXPECT_STREQ(r.why, "request framing");
-    EXPECT_TRUE(out.empty()) << out;
+    // 控制字节和裸 CR 会让另一解析器以不同方式读取头部，由 framing 层先拒绝。
+    for (const std::string& value : {std::string("sk\x01x"), std::string("sk\x7fx"),
+                                     std::string("sk\rX-Injected: 1")})
+    {
+        std::string out;
+        Refusal r;
+        EXPECT_FALSE(auth_headers_for(UpstreamDialect::Anthropic,
+                                      "x-kottos-key-anthropic: " + value + "\r\n",
+                                      strip, out, kNamed, &r));
+        EXPECT_STREQ(r.why, "request framing");
+        EXPECT_TRUE(out.empty()) << out;
+    }
 }
 
 TEST(KeyHeader, ASignedVenueCannotTakeOne)
@@ -634,7 +638,6 @@ TEST(KeySwap, EveryRefusalLeavesTheBufferEmpty)
         {"Authorization: Bearer sk-WRONG\r\n", refuse::kKeyHeaderMissing},
         {"x-kottos-key-anthropic:  \r\n", refuse::kKeyHeaderMissing},
         {"x-kottos-key-anthropic: a\r\nx-Kottos-Key-Anthropic: b\r\n", refuse::kKeyHeaderRepeated},
-        {"x-kottos-key-anthropic: sk\x01x\r\n", refuse::kCredential},
         {"x-kottos-key-anthropic: sk\xC3x\r\n", refuse::kCredential},
         {family_lines(8) + "x-kottos-key-anthropic: sk\r\n", refuse::kKeyHeaderTooMany},
     };
@@ -646,6 +649,15 @@ TEST(KeySwap, EveryRefusalLeavesTheBufferEmpty)
         EXPECT_FALSE(request_without(m, head_len(m), strip, "venue", "", {}, into, kNamed,
                                      UpstreamDialect::OpenAI, &r));
         EXPECT_STREQ(r.detail, want) << hdrs;
+        EXPECT_TRUE(into.empty()) << into;
+    }
+    {
+        const std::string m = forward_request("x-kottos-key-anthropic: sk\x01x\r\n");
+        std::string into = "stale";
+        Refusal r;
+        EXPECT_FALSE(request_without(m, head_len(m), strip, "venue", "", {}, into, kNamed,
+                                     UpstreamDialect::OpenAI, &r));
+        EXPECT_STREQ(r.why, "request framing");
         EXPECT_TRUE(into.empty()) << into;
     }
     const std::string m = forward_request(kManyKeys);

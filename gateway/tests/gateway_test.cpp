@@ -12157,7 +12157,7 @@ TEST_P(ProxyKeyHeader, EveryMalformedKeyHeaderIsRefusedAndNothingIsSent)
         {"Authorization: Bearer sk-AUTH-VALUE\r\nx-kottos-key-anthropic:   \r\n", refuse::kKeyHeaderMissing},
         {"x-kottos-key-anthropic: sk-ONE-VALUE\r\nX-Kottos-Key-Anthropic: sk-TWO-VALUE\r\n",
          refuse::kKeyHeaderRepeated},
-        {"x-kottos-key-anthropic: sk-CTL\x01VALUE\r\n", refuse::kCredential},
+        {"x-kottos-key-anthropic: sk-CTL\x01VALUE\r\n", "malformed request"},
         {"x-kottos-key-anthropic: sk-HIGH\xC3VALUE\r\n", refuse::kCredential},
         {"x-kottos-key-anthropic: sk-ONE-VALUE\r\n" + family_lines(8), refuse::kKeyHeaderTooMany},
     };
@@ -12378,7 +12378,7 @@ TEST_P(ProxyKeyHeader, NoKeyReachesTheLog)
     shutdown();
     llmbridge::net::log::set_sink(nullptr);
     for (const char* reason : {"reply 400 credential header missing", "reply 400 credential header repeated",
-                               "reply 400 malformed credential", "reply 400 credential header unusable"})
+                               "reply 400 request framing", "reply 400 credential header unusable"})
         EXPECT_NE(log.text.find(reason), std::string::npos) << reason << " in:\n" << log.text;
     EXPECT_NE(log.text.find("retrying on 1"), std::string::npos) << log.text;
     for (const char* secret : {"KEY-", "sk-AUTH-LOGGED"})

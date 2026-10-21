@@ -135,3 +135,5 @@ SSE 对比脚本同样先检查 LiteLLM 环境和本机进程，再要求每条�
 安全用户配置现在拒绝重复的用户 `id`、`key_env`、用户模型和许可上游索引；配置解析阶段给出具体错误，策略构造层继续防止程序化调用绕过校验。两个回归测试先证明旧实现会接受四类重复项，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **2/2 通过**；`AppSecureUsers` 又用四份临时配置验证真实进程会拒绝启动且不回显配置值，定向 **1/1 通过**。Release/Werror 全量 CTest、约定及文档数据检查通过。
 
 HTTP 请求与响应共用的头解析器现在逐字验证字段名，只接受 RFC 9110 `token` 字符；空格、分隔符、DEL、高位字节和内嵌 NUL 不再被转发给语义可能不同的下游解析器。回归测试先证明旧实现接受六类非法名称，同时保留全部合法 `tchar` 的正例；修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**，Release/Werror 全量 CTest **2229/2229 通过**。约 1 KiB 响应头的本机 Release 性能冒烟为 p50 **925 ns**、p95 **1384 ns**；单次短测仅用于发现数量级回退，不作为稳定性能基线。
+
+同一解析器现在还拒绝字段值中的 NUL、DEL 和除 HTAB 外的 C0 控制字节，避免普通请求头原样转发给另一种解析器后被截断、丢弃或重解释；HTAB、SP、可见字符和 `obs-text` 高位字节仍可通过 HTTP framing，凭证层继续执行更严格的可打印 ASCII 约束。回归测试先证明旧实现接受七类非法值，修复后在 Release/Werror、ASan/UBSan 和独立 TLS/Werror 构建下各 **1/1 通过**；凭证请求单元测试 **29/29**、epoll/io_uring 真实网关拒绝与日志保密场景 **4/4**、Release/Werror 全量 CTest **2230/2230** 通过。约 1 KiB 响应头的本机 Release 性能冒烟为 p50 **928 ns**、p95 **1368 ns**，仅作数量级检查。

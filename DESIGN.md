@@ -271,7 +271,9 @@ continuously fuzzed:
     - obs-fold, a line starting with SP or HTAB (RFC 9112 §5.2);
     - whitespace before the colon (`Content-Length : 27`, RFC 9112 §5.1);
     - a line with no colon, an empty name, or a field name containing anything outside
-      the RFC 9110 `token` character set.
+      the RFC 9110 `token` character set;
+    - NUL, DEL or another C0 control byte in a field value; HTAB, SP, visible bytes and
+      `obs-text` remain accepted as required by the HTTP field grammar.
   - **Content-Length is `1*DIGIT`** after trimming OWS. `std::from_chars` alone reads
     `0x1b` as 0 and `27abc` as 27; the first framed a 27-byte body as empty.
   - **The request line is `method SP target SP HTTP/1.x`** (RFC 9112 §3): single

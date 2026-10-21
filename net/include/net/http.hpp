@@ -173,6 +173,8 @@ namespace llmbridge::net::http
             if (colon == std::string_view::npos || colon == 0) return false;
             for (const char c : line.substr(0, colon))
                 if (!token_char(c)) return false;
+            for (const unsigned char c : line.substr(colon + 1))
+                if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
             return true;
         }
 
@@ -238,7 +240,8 @@ namespace llmbridge::net::http
     /// Calls `on_line(const HeaderLine&) -> bool` for each header line of `head`, the
     /// bytes before the terminating CRLFCRLF; the start line is checked, then skipped.
     /// False when another parser could split the head differently (a bare CR or LF
-    /// anywhere, obs-fold, no colon, a non-token field name) or `on_line` refuses.
+    /// anywhere, obs-fold, no colon, a non-token field name, or an illegal control
+    /// byte in a field value) or `on_line` refuses.
     template <class OnLine>
     bool walk_headers(std::string_view head, OnLine&& on_line) noexcept
     {

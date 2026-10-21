@@ -341,6 +341,23 @@ TEST(HttpDesync, HeaderNamesMustBeTokens)
               FrameStatus::Complete);
 }
 
+TEST(HttpDesync, HeaderValuesRejectControlBytes)
+{
+    // 除 HTAB 外的控制字节可能被 C 风格或宽松解析器截断、丢弃或重解释。
+    for (const unsigned char c : {0x00, 0x01, 0x08, 0x0b, 0x0c, 0x1f, 0x7f})
+    {
+        std::string line = "X-A: before";
+        line.push_back(static_cast<char>(c));
+        line += "after";
+        expect_rejected(build("POST", {line}, ""), "control byte in field value");
+    }
+
+    Message m;
+    std::string obs_text = "X-A:\t visible ";
+    obs_text.push_back(static_cast<char>(0x80));
+    EXPECT_EQ(parse_request(build("POST", {obs_text}, ""), m), FrameStatus::Complete);
+}
+
 TEST(HttpDesync, LegalContentLengthFormsStillAccepted)
 {
     // The fix must not over-reject: trailing OWS is legal (RFC 9110 trims it), and
