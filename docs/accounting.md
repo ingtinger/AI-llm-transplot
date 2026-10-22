@@ -25,6 +25,22 @@
 
 ## 实施进度
 
-`app/accounting.*` 已建立不可变、线程安全的版本化价目表与费用计算契约：按 Provider、实际服务模型和生效时间选择带来源的价格版本；输入、输出、缓存写入 TTL、推理、音频、图像、预测 Token、服务端工具、压缩及模型回退分别核算。缺价格、缺用量、非法分项和金额溢出都会得到不可结算状态，不会退化为零费用；模型回退使用旧模型自己的价格版本。该模块目前尚未从配置加载，也尚未写入持久化审计账本，因此不能据此宣称第 6 项完成。
+`app/accounting.*` 已建立不可变、线程安全的版本化价目表与费用计算契约：按 Provider、实际服务模型和生效时间选择带来源的价格版本；输入、输出、缓存写入 TTL、推理、音频、图像、预测 Token、服务端工具、压缩及模型回退分别核算。缺价格、缺用量、非法分项和金额溢出都会得到不可结算状态，不会退化为零费用；模型回退使用旧模型自己的价格版本。
+
+配置文件可在 `accounting.prices` 加载规则。启用非空价目表后，每个 `upstream` 必须设置唯一且稳定的 `id`，每条规则的 `provider` 必须引用其中一个 ID。规则必须包含 `provider`、`model`、`version`、`source`、生效时间区间和 `rates`；`rates.input`、`rates.output` 必填，其余计费项目按 Provider 实际规则显式填写。Token 类单价单位为皮美元/Token，工具类为皮美元/次。例如每百万 Token 3 美元应写为 `3000000` 皮美元/Token。该模块尚未写入持久化审计账本，因此不能据此宣称第 6 项完成。
+
+```json
+{
+  "upstream": {"id": "primary", "url": "https://api.example.com"},
+  "accounting": {
+    "prices": [{
+      "provider": "primary", "model": "model-a",
+      "version": "2026-10-22", "source": "provider price page",
+      "valid_from_unix_s": 1792627200, "valid_until_unix_s": 0,
+      "rates": {"input": 3000000, "output": 15000000, "cached_input": 300000}
+    }]
+  }
+}
+```
 
 **验收前不应勾选 `docs/tasks.md` 阶段三第 6 项：**覆盖正常、缺失用量、SSE 中断、客户端断连、重试、日志写入失败、进程崩溃恢复和多 Provider 价格差异；证明每个请求和每次尝试能被重放、核对且不泄露内容。当前测试只覆盖其中的单机限额规则。

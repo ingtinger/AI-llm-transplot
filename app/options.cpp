@@ -40,6 +40,8 @@ namespace llmbridge::app
             {"--tls-key", "listen.key", "PATH", "private key, PEM, owner-only", K::Text, 0, 0, {}, &S::tls_key},
             {"--upstream", "upstream.url", "URL", "IP:PORT, HOST:PORT or http(s)://HOST[:PORT][/BASE]",
              K::Text, 0, 0, {}, &S::upstream},
+            {"", "upstream.id", "", "stable Provider identity used by accounting",
+             K::Text, 0, 0, {}, &S::upstream_id},
             {"--upstream-dialect", "upstream.dialect", "NAME", "what the venue speaks", K::Choice, 0, 0,
              provider::venue_names(), &S::dialect},
             {"", "upstream.strip_headers", "", "header names dropped from every upstream request",
@@ -176,6 +178,18 @@ namespace llmbridge::app
                 const bool alpha_num = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                                        (c >= '0' && c <= '9');
                 if (!alpha_num && c != '-' && c != '_') return false;
+            }
+            return true;
+        }
+
+        bool stable_id_ok(std::string_view value) noexcept
+        {
+            if (value.empty() || value.size() > 64) return false;
+            for (const char c : value)
+            {
+                const bool alpha_num = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                       (c >= '0' && c <= '9');
+                if (!alpha_num && c != '-' && c != '_' && c != '.') return false;
             }
             return true;
         }
@@ -336,6 +350,7 @@ namespace llmbridge::app
                 if (!e.is_object())
                     return fail(err, "config: each entry in \"upstream\" must be an object");
                 Settings one;
+                one.upstream_id.clear();
                 one.upstream.clear();
                 one.dialect.clear();
                 one.upstream_credential_header.clear();
@@ -343,6 +358,8 @@ namespace llmbridge::app
                 one.upstream_model.clear();
                 one.upstream_models.clear();
                 if (!apply_group("upstream", e, one, err)) return false;
+                if (!one.upstream_id.empty() && !stable_id_ok(one.upstream_id))
+                    return fail(err, "config: upstream.id must be a 1..64 byte stable identifier");
                 if (e.find("models") != nullptr)
                 {
                     has_models = true;
@@ -366,9 +383,11 @@ namespace llmbridge::app
                 }
                 if (i > 0)
                     s.more_upstreams.push_back(
-                        {std::move(one.upstream), one.dialect.empty() ? "openai" : one.dialect,
+                        {std::move(one.upstream_id), std::move(one.upstream),
+                         one.dialect.empty() ? "openai" : one.dialect,
                          std::move(one.upstream_credential_header), std::move(one.upstream_model),
                          std::move(one.upstream_credential_env), std::move(one.upstream_models)});
+                if (i == 0) s.upstream_id = std::move(one.upstream_id);
                 if (i == 0 && !one.upstream.empty()) s.upstream = std::move(one.upstream);
                 if (i == 0 && !one.dialect.empty()) s.dialect = std::move(one.dialect);
                 if (i == 0) s.upstream_credential_header = std::move(one.upstream_credential_header);
@@ -378,6 +397,131 @@ namespace llmbridge::app
             }
             if (has_models && missing_models)
                 return fail(err, "config: every upstream must set models when model pools are enabled");
+            return true;
+        }
+
+        bool parse_nonnegative_i64(const json::Value& value, int64_t& out) noexcept
+        {
+            if (value.type != json::Value::Type::Number || value.sv.empty()) return false;
+            const auto parsed =
+                std::from_chars(value.sv.data(), value.sv.data() + value.sv.size(), out);
+            return parsed.ec == std::errc{} && parsed.ptr == value.sv.data() + value.sv.size() &&
+                   out >= 0;
+        }
+
+        bool apply_price_rates(const json::Value& value, PriceRates& rates, std::string& err)
+        {
+            if (!value.is_object())
+                return fail(err, "config: accounting.prices.rates must be an object");
+            struct RateField
+            {
+                std::string_view name;
+                int64_t PriceRates::*member;
+            };
+            constexpr RateField fields[] = {
+                {"input", &PriceRates::input},
+                {"output", &PriceRates::output},
+                {"cached_input", &PriceRates::cached_input},
+                {"cache_write", &PriceRates::cache_write},
+                {"cache_write_5m", &PriceRates::cache_write_5m},
+                {"cache_write_1h", &PriceRates::cache_write_1h},
+                {"reasoning", &PriceRates::reasoning},
+                {"audio_input", &PriceRates::audio_input},
+                {"audio_output", &PriceRates::audio_output},
+                {"accepted_prediction", &PriceRates::accepted_prediction},
+                {"rejected_prediction", &PriceRates::rejected_prediction},
+                {"tool_prompt", &PriceRates::tool_prompt},
+                {"image_input", &PriceRates::image_input},
+                {"web_search", &PriceRates::web_search},
+                {"web_fetch", &PriceRates::web_fetch},
+                {"code_exec", &PriceRates::code_exec},
+                {"file_search", &PriceRates::file_search},
+            };
+            for (const auto& [name, item] : value.obj)
+            {
+                if (is_comment(name)) continue;
+                const RateField* found = nullptr;
+                for (const RateField& field : fields)
+                    if (field.name == name) found = &field;
+                if (!found)
+                    return fail(err, "config: unknown accounting.prices.rates field");
+                int64_t amount = 0;
+                if (!parse_nonnegative_i64(item, amount))
+                    return fail(err, "config: accounting price rates must be nonnegative integers");
+                rates.*found->member = amount;
+            }
+            if (rates.input < 0 || rates.output < 0)
+                return fail(err, "config: accounting price rates require input and output");
+            return true;
+        }
+
+        bool apply_accounting(const json::Value& g, Settings& s, std::string& err)
+        {
+            if (!g.is_object()) return fail(err, "config: accounting must be an object");
+            for (const auto& [key, value] : g.obj)
+            {
+                if (is_comment(key)) continue;
+                if (key != "prices") return fail(err, "config: unknown accounting field");
+                if (!value.is_array() || value.arr.size() > 1024)
+                    return fail(err,
+                                "config: accounting.prices must be an array of at most 1024 rules");
+                std::vector<PriceRule> rules;
+                rules.reserve(value.arr.size());
+                for (const json::Value& item : value.arr)
+                {
+                    if (!item.is_object())
+                        return fail(err, "config: accounting.prices entries must be objects");
+                    PriceRule rule;
+                    bool saw_rates = false, saw_from = false, saw_until = false;
+                    for (const auto& [field, member] : item.obj)
+                    {
+                        if (is_comment(field)) continue;
+                        if (field == "provider" || field == "model" || field == "version" ||
+                            field == "source")
+                        {
+                            const size_t limit =
+                                field == "source" ? 512 : field == "model" ? 128 : 64;
+                            if (member.type != json::Value::Type::String || member.sv.empty() ||
+                                member.sv.size() > limit ||
+                                member.sv.find('\\') != std::string_view::npos)
+                                return fail(err, "config: accounting price identity fields are invalid");
+                            (field == "provider"   ? rule.provider
+                             : field == "model"   ? rule.model
+                             : field == "version" ? rule.version
+                                                  : rule.source) = member.sv;
+                        }
+                        else if (field == "valid_from_unix_s" || field == "valid_until_unix_s")
+                        {
+                            int64_t timestamp = 0;
+                            if (!parse_nonnegative_i64(member, timestamp) || timestamp > 4102444800LL)
+                                return fail(err, "config: accounting price timestamp is out of range");
+                            (field == "valid_from_unix_s" ? rule.valid_from_s : rule.valid_until_s) =
+                                timestamp;
+                            if (field == "valid_from_unix_s") saw_from = true;
+                            else saw_until = true;
+                        }
+                        else if (field == "rates")
+                        {
+                            if (!apply_price_rates(member, rule.rates, err)) return false;
+                            saw_rates = true;
+                        }
+                        else return fail(err, "config: unknown accounting.prices field");
+                    }
+                    if (!stable_id_ok(rule.provider) || rule.model.empty() || rule.version.empty() ||
+                        rule.source.empty() || !saw_from || !saw_until || !saw_rates)
+                        return fail(err, "config: accounting price rule is incomplete");
+                    rules.push_back(std::move(rule));
+                }
+                try
+                {
+                    (void)PriceTable(rules);
+                }
+                catch (const std::invalid_argument&)
+                {
+                    return fail(err, "config: accounting.prices contains invalid or overlapping rules");
+                }
+                s.price_rules = std::move(rules);
+            }
             return true;
         }
 
@@ -600,11 +744,26 @@ namespace llmbridge::app
         for (const auto& [k, v] : root.obj)
         {
             if (is_comment(k)) continue;
-            if (!is_group(k) && k != "security")
+            if (!is_group(k) && k != "security" && k != "accounting")
                 return fail(err, "config: unknown key in \"(top level)\"");
             if (!(k == "upstream" ? apply_upstream(v, s, err) :
-                  k == "security" ? apply_security(v, s, err) : apply_group(k, v, s, err)))
+                  k == "security" ? apply_security(v, s, err) :
+                  k == "accounting" ? apply_accounting(v, s, err) : apply_group(k, v, s, err)))
                 return false;
+        }
+        if (!s.price_rules.empty())
+        {
+            std::unordered_set<std::string_view> providers;
+            if (!stable_id_ok(s.upstream_id) || !providers.insert(s.upstream_id).second)
+                return fail(
+                    err, "config: every upstream needs a unique id when accounting is configured");
+            for (const Venue& venue : s.more_upstreams)
+                if (!stable_id_ok(venue.id) || !providers.insert(venue.id).second)
+                    return fail(
+                        err, "config: every upstream needs a unique id when accounting is configured");
+            for (const PriceRule& rule : s.price_rules)
+                if (!providers.contains(rule.provider))
+                    return fail(err, "config: accounting price refers to an unknown provider");
         }
         return true;
     }

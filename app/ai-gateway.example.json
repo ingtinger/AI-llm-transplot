@@ -8,6 +8,7 @@
   },
   "upstream": [
     {
+      "id": "primary",
       "url": "127.0.0.1:9001",
       "dialect": "openai",
       "credential_env": "PROVIDER_PRIMARY_KEY",
@@ -15,6 +16,7 @@
       "model": "model-primary"
     },
     {
+      "id": "backup",
       "url": "127.0.0.1:9002",
       "dialect": "openai",
       "credential_env": "PROVIDER_BACKUP_KEY",

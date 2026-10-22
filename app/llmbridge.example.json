@@ -28,6 +28,7 @@
   "_upstream_example": "\"upstream\": [ {\"url\": \"https://api.anthropic.com\", \"dialect\": \"anthropic\"}, {\"url\": \"https://api.together.xyz\", \"dialect\": \"openai\"} ]",
 
   "upstream": {
+    "_id": "启用 accounting.prices 时必填的稳定 Provider 标识；多上游不可重复。示例：primary-openai。",
     "_url": "IP:PORT, HOST:PORT, or http(s)://HOST[:PORT]. https:// needs a TLS build and verifies both the chain and the hostname, with no way to disable it. A non-loopback plaintext upstream warns at startup, because a forwarded credential would cross the network in the clear.",
     "url": "127.0.0.1:9001",
 
@@ -45,6 +46,11 @@
     "_model": "可选的上游模型名称；空字符串表示保留客户端请求的模型。",
     "model": "",
     "_models": "可选的客户端模型池。多上游时一旦某项配置 models，每个上游都必须配置非空列表；model 是发给 Provider 的映射名，含义不同。"
+  },
+
+  "accounting": {
+    "_prices": "版本化价目规则，默认空表示尚未配置费用计算。每条规则按 upstream.id、实际服务模型和 [valid_from_unix_s, valid_until_unix_s) 匹配；version 与 source 必填。Token 类 rates 单位为皮美元/Token，工具类为皮美元/次，0 表示明确免费；所有数值必须是非负整数。示例规则见 docs/accounting.md。",
+    "prices": []
   },
 
   "routing": {

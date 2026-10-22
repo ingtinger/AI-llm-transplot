@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "accounting.hpp"
 #include "gateway/gateway.hpp"
 
 #include <span>
@@ -22,7 +23,7 @@ namespace llmbridge::app
 {
     struct Venue
     {
-        std::string url, dialect, credential_header, model, credential_env;
+        std::string id, url, dialect, credential_header, model, credential_env;
         std::vector<std::string> models; // 可服务的客户端模型；与 model 映射不同
         bool operator==(const Venue&) const = default;
     };
@@ -47,6 +48,7 @@ namespace llmbridge::app
         bool listen_tls = false;
         std::string tls_cert, tls_key;
         std::string upstream = "127.0.0.1:9001", dialect = "openai"; // venue 0
+        std::string upstream_id;
         std::string upstream_credential_header, upstream_model;
         std::string upstream_credential_env;
         std::vector<std::string> upstream_models; // 首个上游的客户端模型池
@@ -55,6 +57,7 @@ namespace llmbridge::app
         bool legacy_mode = false; // 仅显式开启旧的无认证直通行为
         bool allow_insecure_http = false; // 仅供本地 Mock 测试使用
         std::vector<UserSettings> users;
+        std::vector<PriceRule> price_rules; // 文件中的版本化 Provider 价目表
         std::vector<std::string> strip_headers;                      // gateway-wide
         std::string routing_mode = "first", routing_sticky_header = "x-conversation-id";
         std::vector<std::string> routing_drained_upstreams; // SIGHUP 可热更新的索引列表

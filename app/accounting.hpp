@@ -32,6 +32,7 @@ namespace llmbridge::app
         int64_t web_fetch = -1;
         int64_t code_exec = -1;
         int64_t file_search = -1;
+        bool operator==(const PriceRates&) const = default;
     };
 
     struct PriceRule
@@ -43,6 +44,7 @@ namespace llmbridge::app
         int64_t valid_from_s = 0; ///< 含此 Unix 秒；0 表示不设下界。
         int64_t valid_until_s = 0; ///< 不含此 Unix 秒；0 表示不设上界。
         PriceRates rates;
+        bool operator==(const PriceRule&) const = default;
     };
 
     enum class CostStatus : uint8_t

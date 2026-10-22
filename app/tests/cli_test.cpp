@@ -63,6 +63,7 @@ Flags override the file wherever they appear. In parentheses: the file key.
   --stream-body-max N         bodies a worker forwards as they arrive at once; past it one is held, 0 = no cap, 0..1048576 (runtime.stream_body_max)
   --stream-openai-body MODE   forward an OpenAI client's body as it arrives, each chunk checked first: on|off (runtime.stream_openai_body)
 File only:
+  upstream.id                 stable Provider identity used by accounting
   upstream.strip_headers      header names dropped from every upstream request
   upstream.credential_header  client header containing this venue's key
   upstream.credential_env     environment variable holding this venue's key

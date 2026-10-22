@@ -42,7 +42,9 @@ TEST(Config, UnknownFieldNamesAreRejectedWithoutEchoingThem)
              R"({"sk-secret-marker":true})",
              R"({"listen":{"sk-secret-marker":true}})",
              R"({"security":{"sk-secret-marker":true}})",
-             R"({"security":{"users":[{"sk-secret-marker":true}]}})"})
+             R"({"security":{"users":[{"sk-secret-marker":true}]}})",
+             R"({"accounting":{"sk-secret-marker":true}})",
+             R"({"accounting":{"prices":[{"sk-secret-marker":true}]}})"})
     {
         Settings s;
         std::string err;
@@ -50,6 +52,76 @@ TEST(Config, UnknownFieldNamesAreRejectedWithoutEchoingThem)
         EXPECT_NE(err.find("unknown"), std::string::npos) << err;
         EXPECT_EQ(err.find("sk-secret-marker"), std::string::npos) << err;
     }
+}
+
+TEST(Config, VersionedAccountingPricesAreStrictAndOwned)
+{
+    Settings s;
+    std::string err;
+    std::string input = R"({
+      "accounting":{"prices":[
+        {"provider":"primary","model":"model-a","version":"2026-10-a",
+         "source":"provider price page","valid_from_unix_s":100,"valid_until_unix_s":200,
+         "rates":{"input":2000000,"output":5000000,"cached_input":1000000,
+                  "web_search":10000000000}},
+        {"provider":"primary","model":"model-a","version":"2026-10-b",
+         "source":"provider price page","valid_from_unix_s":200,"valid_until_unix_s":0,
+         "rates":{"input":3000000,"output":6000000}}
+      ]},
+      "upstream":{"id":"primary","url":"127.0.0.1:9001"}
+    })";
+    ASSERT_TRUE(parse_config(input, s, err)) << err;
+    input.assign(4096, 'x');
+    ASSERT_EQ(s.price_rules.size(), 2U);
+    EXPECT_EQ(s.upstream_id, "primary");
+    EXPECT_EQ(s.price_rules[0].provider, "primary");
+    EXPECT_EQ(s.price_rules[0].model, "model-a");
+    EXPECT_EQ(s.price_rules[0].version, "2026-10-a");
+    EXPECT_EQ(s.price_rules[0].source, "provider price page");
+    EXPECT_EQ(s.price_rules[0].valid_from_s, 100);
+    EXPECT_EQ(s.price_rules[0].valid_until_s, 200);
+    EXPECT_EQ(s.price_rules[0].rates.input, 2000000);
+    EXPECT_EQ(s.price_rules[0].rates.web_search, 10000000000LL);
+}
+
+TEST(Config, AccountingPricesRejectAmbiguityUnknownFieldsAndBadNumbers)
+{
+    std::string err;
+    for (const std::string_view input : {
+             R"({"upstream":{"id":"p"},"accounting":{"prices":[{"provider":"p","model":"m","version":"v1","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1,"output":2}},{"provider":"p","model":"m","version":"v2","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1,"output":2}}]}})",
+             R"({"upstream":{"id":"p"},"accounting":{"prices":[{"provider":"p","model":"m","version":"v","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1,"output":2,"typo":3}}]}})",
+             R"({"upstream":{"id":"p"},"accounting":{"prices":[{"provider":"p","model":"m","version":"v","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":-1,"output":2}}]}})",
+             R"({"upstream":{"id":"p"},"accounting":{"prices":[{"provider":"p","model":"m","version":"v","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1.5,"output":2}}]}})",
+             R"({"upstream":{"id":"p"},"accounting":{"prices":[{"provider":"p","model":"m","version":"v","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1}}]}})",
+             R"({"upstream":{"id":"p"},"accounting":{"prices":[{"provider":"p","model":"m","version":"v","source":"s","rates":{"input":1,"output":2}}]}})",
+             R"({"upstream":{"id":"p"},"accounting":{"prices":[{"provider":"p","model":"m","version":"v","source":"s","valid_from_unix_s":201,"valid_until_unix_s":200,"rates":{"input":1,"output":2}}]}})"})
+    {
+        Settings rejected;
+        EXPECT_FALSE(parse_config(input, rejected, err)) << input;
+    }
+}
+
+TEST(Config, AccountingRequiresStableUniqueKnownProviderIds)
+{
+    const std::string prices =
+        R"("accounting":{"prices":[{"provider":"primary","model":"m","version":"v","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1,"output":2}}]})";
+    std::string err;
+    Settings missing;
+    EXPECT_FALSE(parse_config("{" + prices + R"(,"upstream":{"url":"a:1"}})", missing, err));
+    Settings unknown;
+    EXPECT_FALSE(parse_config("{" + prices +
+                                  R"(,"upstream":{"id":"other","url":"a:1"}})",
+                              unknown, err));
+    Settings duplicate;
+    EXPECT_FALSE(parse_config("{" + prices +
+                                  R"(,"upstream":[{"id":"primary","url":"a:1"},{"id":"primary","url":"b:2"}]})",
+                              duplicate, err));
+    Settings ordered_late;
+    EXPECT_TRUE(parse_config("{" + prices +
+                                 R"(,"upstream":[{"id":"primary","url":"a:1"},{"id":"backup","url":"b:2"}]})",
+                             ordered_late, err)) << err;
+    ASSERT_EQ(ordered_late.more_upstreams.size(), 1U);
+    EXPECT_EQ(ordered_late.more_upstreams[0].id, "backup");
 }
 
 TEST(Config, UnreadablePathIsNotEchoed)
