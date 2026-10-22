@@ -12,6 +12,7 @@ command -v curl >/dev/null || { echo "需要 curl" >&2; exit 1; }
 command -v openssl >/dev/null || { echo "需要 openssl" >&2; exit 1; }
 
 compose=(docker compose --env-file .env)
+demo_gateway_key=demo-gateway-key-change-me
 cleanup() {
   "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
   rm -rf certs .env
@@ -26,7 +27,7 @@ GATEWAY_UID=$(id -u)
 GATEWAY_GID=$(id -g)
 PROVIDER_PRIMARY_KEY=demo-primary-key-only
 PROVIDER_BACKUP_KEY=demo-backup-key-only
-GATEWAY_ALICE_KEY=demo-gateway-key-change-me
+GATEWAY_ALICE_KEY=$demo_gateway_key
 EOF
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj '/CN=localhost' \
@@ -39,7 +40,7 @@ request() {
   curl --silent --show-error --fail --max-time 5 \
     --cacert certs/cert.pem https://127.0.0.1:8088/v1/chat/completions \
     -H 'Content-Type: application/json' \
-    -H 'Authorization: Bearer demo-gateway-key-change-me' \
+    -H "Authorization: Bearer $demo_gateway_key" \
     -d '{"model":"chat-default","messages":[{"role":"user","content":"ping"}]}'
 }
 
