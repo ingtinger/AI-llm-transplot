@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,6 +22,14 @@ namespace llmbridge::app
     {
         std::string tenant_id;
         std::string user_id;
+    };
+
+    struct ReplayedUsage
+    {
+        uint32_t daily_tokens = 0;
+        uint32_t monthly_tokens = 0;
+        bool daily_unknown = false;
+        bool monthly_unknown = false;
     };
 
     /// 多个网关线程共享的持久化账本。on_attempt() 不分配内存、不等待锁且不做 I/O；
@@ -40,6 +49,11 @@ namespace llmbridge::app
         [[nodiscard]] const std::atomic<bool>* health_flag() const noexcept { return &healthy_; }
         [[nodiscard]] uint64_t written() const noexcept;
         [[nodiscard]] std::string_view instance_id() const noexcept { return instance_id_; }
+        /// 启动期间校验账本后得到的当前 UTC 日/月用量，顺序与构造时 users 一致。
+        [[nodiscard]] std::span<const ReplayedUsage> replayed_usage() const noexcept
+        {
+            return replayed_usage_;
+        }
 
       private:
         template <size_t N>
@@ -51,6 +65,7 @@ namespace llmbridge::app
         struct Entry
         {
             AttemptRecord record;
+            int64_t recorded_at_ns = 0;
             Text<65> tenant, user, provider, price_version, prior_price_version;
             Text<513> price_source, prior_price_source;
             Text<65> requested_model;
@@ -74,6 +89,7 @@ namespace llmbridge::app
         const PriceTable& prices_;
         std::vector<std::string> provider_ids_;
         std::vector<AuditUser> users_;
+        std::vector<ReplayedUsage> replayed_usage_;
         int fd_ = -1;
         std::string instance_id_;
         static constexpr size_t kCapacity = 1024;

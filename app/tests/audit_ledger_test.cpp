@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <fcntl.h>
 #include <fstream>
 #include <iterator>
@@ -161,5 +162,63 @@ TEST(AuditLedger, DrainsConcurrentProducersWithoutLosingRecords)
     }
     const std::string text = read_all(path);
     EXPECT_EQ(static_cast<size_t>(std::count(text.begin(), text.end(), '\n')), 400u);
+    ::unlink(path.c_str());
+}
+
+TEST(AuditLedger, ReplaysCurrentUtcUsageAndUnknownStateByStableUserIdentity)
+{
+    const std::string path = temporary_path();
+    const auto table = prices();
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count();
+    {
+        llmbridge::app::AuditLedger ledger(path, table, {"provider-a"},
+                                           {{"tenant-a", "alice"}, {"tenant-b", "bob"}});
+        auto known = attempt(501);
+        known.wall_t0_ns = now_ns;
+        ledger.on_attempt(known);
+        auto unknown = attempt(502);
+        unknown.wall_t0_ns = now_ns;
+        unknown.tag = (uint64_t{2} << 32) | 1;
+        unknown.tokens_in = -1;
+        unknown.tokens_out = -1;
+        ledger.on_attempt(unknown);
+    }
+    {
+        llmbridge::app::AuditLedger ledger(path, table, {"provider-a"},
+                                           {{"tenant-a", "alice"}, {"tenant-b", "bob"}});
+        const auto replayed = ledger.replayed_usage();
+        ASSERT_EQ(replayed.size(), 2u);
+        EXPECT_EQ(replayed[0].daily_tokens, 14u);
+        EXPECT_EQ(replayed[0].monthly_tokens, 14u);
+        EXPECT_FALSE(replayed[0].daily_unknown);
+        EXPECT_FALSE(replayed[0].monthly_unknown);
+        EXPECT_TRUE(replayed[1].daily_unknown);
+        EXPECT_TRUE(replayed[1].monthly_unknown);
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(AuditLedger, RefusesDuplicateAttemptIdentityInTheCurrentMonth)
+{
+    const std::string path = temporary_path();
+    const auto table = prices();
+    {
+        llmbridge::app::AuditLedger ledger(path, table, {"provider-a"},
+                                           {{"tenant-a", "alice"}});
+        auto current = attempt(601);
+        current.wall_t0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch()).count();
+        ledger.on_attempt(current);
+    }
+    const std::string original = read_all(path);
+    const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::write(fd, original.data(), original.size()),
+              static_cast<ssize_t>(original.size()));
+    ::close(fd);
+    EXPECT_THROW((llmbridge::app::AuditLedger(path, table, {"provider-a"},
+                                               {{"tenant-a", "alice"}})),
+                 std::runtime_error);
     ::unlink(path.c_str());
 }

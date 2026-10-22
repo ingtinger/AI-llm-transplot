@@ -160,6 +160,7 @@ def main(binary: Path) -> None:
         "runtime": {"io": "epoll", "workers": 2, "request_log": True, "log_level": "error"},
     }
     process: subprocess.Popen[bytes] | None = None
+    stderr_parts: list[bytes] = []
     try:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.json"
@@ -209,10 +210,33 @@ def main(binary: Path) -> None:
                 time.sleep(0.01)
             else:
                 raise AssertionError(f"audit records were not persisted: {ledger_bytes!r}")
+            process.terminate()
+            _, first_stderr = process.communicate(timeout=5)
+            stderr_parts.append(first_stderr)
+            process = subprocess.Popen([str(binary), "--config", str(path)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise AssertionError(process.stderr.read().decode(errors="replace"))
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                        break
+                except OSError:
+                    time.sleep(0.02)
+            else:
+                raise AssertionError("restarted gateway did not listen")
+            # Bob 已在前一个进程恰好用完 5 Token；重启后必须从账本恢复，而不是清零。
+            assert request(port, bob, "chat-b")[0] == 429
+            assert Mock.received == [(f"Bearer {provider_b}", "", "model-b"),
+                                     (f"Bearer {provider_b}", "", "model-b")], Mock.received
     finally:
         if process is not None:
             process.terminate()
-            _, stderr = process.communicate(timeout=5)
+            _, final_stderr = process.communicate(timeout=5)
+            stderr_parts.append(final_stderr)
+        if stderr_parts:
+            stderr = b"".join(stderr_parts)
             for secret in (alice, bob, provider_a, provider_b, "private-prompt"):
                 assert secret.encode() not in stderr
             assert b'"tokens_in":3' in stderr and b'"tokens_out":2' in stderr, stderr

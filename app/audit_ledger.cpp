@@ -1,6 +1,7 @@
 // AI-llm-transplot 扩展：审计线程写带 CRC 的 JSONL，数据面不执行文件 I/O。
 
 #include "audit_ledger.hpp"
+#include "provider/json.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -13,6 +14,7 @@
 #include <string_view>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <unordered_set>
 #include <unistd.h>
 
 namespace llmbridge::app
@@ -44,6 +46,116 @@ namespace llmbridge::app
             std::string original(line.substr(0, at));
             original.push_back('}');
             return expected == crc32(original);
+        }
+
+        template <class T>
+        bool integer_member(const provider::json::Value& object, std::string_view name,
+                            T& out) noexcept
+        {
+            const provider::json::Value* value = object.find(name);
+            if (!value || value->type != provider::json::Value::Type::Number || value->sv.empty())
+                return false;
+            const auto [end, ec] = std::from_chars(value->sv.data(),
+                                                   value->sv.data() + value->sv.size(), out);
+            return ec == std::errc{} && end == value->sv.data() + value->sv.size();
+        }
+
+        bool bool_member(const provider::json::Value& object, std::string_view name,
+                         bool& out) noexcept
+        {
+            const provider::json::Value* value = object.find(name);
+            if (!value || value->type != provider::json::Value::Type::Bool) return false;
+            out = value->boolean;
+            return true;
+        }
+
+        struct ReplayKey
+        {
+            uint64_t instance_hi = 0, instance_lo = 0, request_seq = 0;
+            uint32_t attempt = 0;
+            bool operator==(const ReplayKey&) const = default;
+        };
+
+        struct ReplayKeyHash
+        {
+            size_t operator()(const ReplayKey& key) const noexcept
+            {
+                size_t h = static_cast<size_t>(key.instance_hi ^ key.instance_lo);
+                h ^= static_cast<size_t>(key.request_seq + 0x9e3779b97f4a7c15ULL +
+                                         (static_cast<uint64_t>(h) << 6) + (h >> 2));
+                return h ^ (static_cast<size_t>(key.attempt) * 0x9e3779b9U);
+            }
+        };
+
+        struct ReplayRecord
+        {
+            ReplayKey key;
+            std::string_view tenant, user;
+            int64_t accounted_at_ns = 0;
+            int32_t tokens_in = -1, tokens_out = -1;
+            bool upstream_sent = false;
+        };
+
+        bool parse_replay_record(std::string_view line, ReplayRecord& out) noexcept
+        {
+            bool ok = false;
+            const provider::json::Value root = provider::json::parse(line, ok);
+            if (!ok || !root.is_object()) return false;
+            int schema = 0;
+            int64_t wall_t0_ns = 0;
+            const provider::json::Value* recorded = root.find("recorded_at_ns");
+            if (!integer_member(root, "schema", schema) || schema != 1 ||
+                !integer_member(root, "request_seq", out.key.request_seq) ||
+                !integer_member(root, "attempt", out.key.attempt) ||
+                !integer_member(root, "wall_t0_ns", wall_t0_ns) || wall_t0_ns < 0 ||
+                !integer_member(root, "tokens_in", out.tokens_in) || out.tokens_in < -1 ||
+                !integer_member(root, "tokens_out", out.tokens_out) || out.tokens_out < -1 ||
+                !bool_member(root, "upstream_sent", out.upstream_sent)) return false;
+            out.accounted_at_ns = wall_t0_ns;
+            if (recorded)
+            {
+                if (!integer_member(root, "recorded_at_ns", out.accounted_at_ns) ||
+                    out.accounted_at_ns < 0) return false;
+            }
+            const provider::json::Value* instance = root.find("instance_id");
+            const provider::json::Value* tenant = root.find("tenant_id");
+            const provider::json::Value* user = root.find("user_id");
+            if (!instance || instance->type != provider::json::Value::Type::String ||
+                instance->sv.size() != 32 ||
+                !tenant || tenant->type != provider::json::Value::Type::String ||
+                tenant->sv.size() > 64 || tenant->sv.find('\\') != std::string_view::npos ||
+                !user || user->type != provider::json::Value::Type::String ||
+                user->sv.size() > 64 || user->sv.find('\\') != std::string_view::npos)
+                return false;
+            const auto parse_hex = [](std::string_view value, uint64_t& number) noexcept {
+                const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(),
+                                                       number, 16);
+                return ec == std::errc{} && end == value.data() + value.size();
+            };
+            if (!parse_hex(instance->sv.substr(0, 16), out.key.instance_hi) ||
+                !parse_hex(instance->sv.substr(16), out.key.instance_lo)) return false;
+            out.tenant = tenant->sv;
+            out.user = user->sv;
+            if (!out.upstream_sent && (out.tokens_in >= 0 || out.tokens_out >= 0)) return false;
+            return true;
+        }
+
+        struct UtcPeriod { int64_t day; int month; };
+
+        UtcPeriod period_at(int64_t value_ns) noexcept
+        {
+            using namespace std::chrono;
+            const sys_time<std::chrono::nanoseconds> time{std::chrono::nanoseconds{value_ns}};
+            const sys_days day = floor<days>(time);
+            const year_month_day ymd{day};
+            return {day.time_since_epoch().count(), int(ymd.year()) * 12 + int(unsigned(ymd.month()))};
+        }
+
+        uint32_t saturating_add(uint32_t current, uint32_t add) noexcept
+        {
+            constexpr uint32_t maximum = (uint32_t{1} << 31) - 1;
+            return static_cast<uint32_t>(std::min<uint64_t>(maximum,
+                                                            uint64_t{current} + add));
         }
 
         void json_string(std::string& out, std::string_view value)
@@ -141,6 +253,7 @@ namespace llmbridge::app
           users_(std::move(users))
     {
         if (path_.empty()) throw std::invalid_argument("audit ledger path is empty");
+        replayed_usage_.resize(users_.size());
         unsigned char random[16];
         size_t random_bytes = 0;
         while (random_bytes < sizeof random)
@@ -193,6 +306,10 @@ namespace llmbridge::app
         pending.reserve(8192);
         char block[8192];
         off_t offset = 0, valid_end = 0;
+        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch()).count();
+        const UtcPeriod current = period_at(now_ns);
+        std::unordered_set<ReplayKey, ReplayKeyHash> seen;
         while (offset < st.st_size)
         {
             const ssize_t n = ::pread(fd_, block, sizeof block, offset);
@@ -209,6 +326,39 @@ namespace llmbridge::app
                 if (newline > 65536) throw std::runtime_error("audit ledger record exceeds 64 KiB");
                 if (!valid_line(std::string_view(pending).substr(0, newline)))
                     throw std::runtime_error("audit ledger checksum mismatch");
+                ReplayRecord record;
+                if (!parse_replay_record(std::string_view(pending).substr(0, newline), record))
+                    throw std::runtime_error("audit ledger record is invalid");
+                const UtcPeriod period = period_at(record.accounted_at_ns);
+                if (period.month == current.month)
+                {
+                    if (!seen.insert(record.key).second)
+                        throw std::runtime_error("audit ledger contains a duplicate attempt");
+                    size_t user_index = users_.size();
+                    for (size_t i = 0; i < users_.size(); ++i)
+                        if (users_[i].tenant_id == record.tenant && users_[i].user_id == record.user)
+                        {
+                            user_index = i;
+                            break;
+                        }
+                    if (user_index < users_.size())
+                    {
+                        ReplayedUsage& usage = replayed_usage_[user_index];
+                        const bool known = record.tokens_in >= 0 && record.tokens_out >= 0;
+                        const bool unknown = record.upstream_sent && !known;
+                        const uint32_t tokens = known
+                            ? static_cast<uint32_t>(std::min<int64_t>((int64_t{1} << 31) - 1,
+                                  static_cast<int64_t>(record.tokens_in) + record.tokens_out))
+                            : 0;
+                        usage.monthly_tokens = saturating_add(usage.monthly_tokens, tokens);
+                        usage.monthly_unknown = usage.monthly_unknown || unknown;
+                        if (period.day == current.day)
+                        {
+                            usage.daily_tokens = saturating_add(usage.daily_tokens, tokens);
+                            usage.daily_unknown = usage.daily_unknown || unknown;
+                        }
+                    }
+                }
                 valid_end += static_cast<off_t>(newline + 1);
                 pending.erase(0, newline + 1);
             }
@@ -224,6 +374,8 @@ namespace llmbridge::app
         if (!healthy_.load(std::memory_order_acquire)) return;
         Entry entry;
         entry.record = r;
+        entry.recorded_at_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch()).count();
         const auto copy_text = []<size_t N>(Text<N>& out, std::string_view value) noexcept {
             const size_t n = std::min(value.size(), N - 1);
             if (n > 0) std::memcpy(out.data, value.data(), n);
@@ -293,6 +445,7 @@ namespace llmbridge::app
             json_string(line, instance_id_);
             field(line, "request_seq", r.request_seq);
             field(line, "wall_t0_ns", r.wall_t0_ns);
+            field(line, "recorded_at_ns", e.recorded_at_ns);
             field(line, "attempt", r.attempt);
             append_text(line, "tenant_id", e.tenant.data, e.tenant.size);
             append_text(line, "user_id", e.user.data, e.user.size);

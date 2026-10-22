@@ -141,6 +141,11 @@ TEST(Config, AuditLedgerRequiresAPathPricesAndStableProviderIds)
     Settings accepted;
     ASSERT_TRUE(parse_config(good, accepted, err)) << err;
     EXPECT_EQ(accepted.audit_ledger_path, "/tmp/audit.jsonl");
+
+    const std::string unstable_identity =
+        R"({"upstream":{"id":"primary"},"security":{"users":[{"id":"bad user","tenant":"tenant","key_env":"USER_KEY","models":["m"],"upstreams":[0]}]},"accounting":{"ledger_path":"/tmp/audit.jsonl","prices":[{"provider":"primary","model":"m","version":"v","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1,"output":2}}]}})";
+    EXPECT_FALSE(parse_config(unstable_identity, accepted, err));
+    EXPECT_NE(err.find("stable user and tenant ids"), std::string::npos) << err;
 }
 
 TEST(Config, UnreadablePathIsNotEchoed)

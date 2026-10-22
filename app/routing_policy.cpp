@@ -401,6 +401,17 @@ namespace llmbridge::app
             add_usage(user_states_[user - 1].monthly_usage, period.month, tokens, unknown);
     }
 
+    void RoutingPolicy::restore_usage(size_t user_index, uint32_t daily_tokens,
+                                      bool daily_unknown, uint32_t monthly_tokens,
+                                      bool monthly_unknown) noexcept
+    {
+        if (!config_.security_enabled || user_index >= config_.users.size()) return;
+        const UtcPeriod period = utc_period();
+        add_usage(user_states_[user_index].daily_usage, period.day, daily_tokens, daily_unknown);
+        add_usage(user_states_[user_index].monthly_usage, period.month, monthly_tokens,
+                  monthly_unknown);
+    }
+
     void RoutingPolicy::on_abandon(uint64_t tag, bool upstream_sent) noexcept
     {
         const uint64_t user = tag >> 32;

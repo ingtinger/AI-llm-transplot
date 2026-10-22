@@ -76,6 +76,9 @@ namespace llmbridge::app
         void complete(const RequestRecord& record) noexcept;
         /// 仅结算会继续重试的非最终尝试；最终腿仍由 complete() 结算，避免重复。
         void complete_attempt(const AttemptRecord& record) noexcept;
+        /// 启动线程在工作线程创建前恢复当前 UTC 周期的账本用量。
+        void restore_usage(size_t user_index, uint32_t daily_tokens, bool daily_unknown,
+                           uint32_t monthly_tokens, bool monthly_unknown) noexcept;
         bool wants_prefix_hash() const noexcept override;
         bool allows_unsafe_replay() const noexcept override { return config_.allow_unsafe_replay; }
         /// 供管理线程读取的原子快照；多个字段不保证来自同一时刻。

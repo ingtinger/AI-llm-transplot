@@ -250,6 +250,31 @@ TEST(RoutingPolicy, QuotaUsersFailClosedWhenTheAuditLedgerIsUnhealthy)
     policy.on_abandon(allowed.tag, false);
 }
 
+TEST(RoutingPolicy, RestoredLedgerUsageAppliesBeforeTheFirstRequest)
+{
+    auto c = config(1);
+    c.security_enabled = true;
+    c.server_credentials = {"provider-secret"};
+    c.users = {{"alice", "tenant", "gateway-key-alice-123456", {"chat"}, {0},
+                10, 1, 10, 20, 0, false}};
+    llmbridge::app::RoutingPolicy policy(std::move(c));
+    policy.restore_usage(0, 10, false, 10, false);
+    llmbridge::RequestFacts facts{};
+    facts.model = "chat";
+    facts.head = "POST / HTTP/1.1\r\nAuthorization: Bearer gateway-key-alice-123456\r\n\r\n";
+    EXPECT_EQ(policy.decide(facts).deny_status, 429);
+
+    auto unknown = config(1);
+    unknown.security_enabled = true;
+    unknown.server_credentials = {"provider-secret"};
+    unknown.users = {{"bob", "tenant", "gateway-key-bob-12345678", {"chat"}, {0},
+                      10, 1, 100, 100, 0, false}};
+    llmbridge::app::RoutingPolicy unknown_policy(std::move(unknown));
+    unknown_policy.restore_usage(0, 0, true, 0, true);
+    facts.head = "POST / HTTP/1.1\r\nAuthorization: Bearer gateway-key-bob-12345678\r\n\r\n";
+    EXPECT_EQ(unknown_policy.decide(facts).deny_status, 429);
+}
+
 TEST(RoutingPolicy, RetryAttemptsAreIncludedInTokenQuotaWithoutDoubleCountingTheFinalLeg)
 {
     auto c = config(1);

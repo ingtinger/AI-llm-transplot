@@ -776,6 +776,10 @@ namespace llmbridge::app
         }
         if (!s.audit_ledger_path.empty() && s.price_rules.empty())
             return fail(err, "config: accounting.ledger_path requires accounting.prices");
+        if (!s.audit_ledger_path.empty())
+            for (const UserSettings& user : s.users)
+                if (!stable_id_ok(user.id) || !stable_id_ok(user.tenant))
+                    return fail(err, "config: audit ledger requires stable user and tenant ids");
         return true;
     }
 

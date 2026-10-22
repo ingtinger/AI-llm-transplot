@@ -379,6 +379,15 @@ static int run(int argc, char** argv)
                 .server_credentials = std::move(server_credentials),
                 .users = std::move(users),
                 .accounting_healthy = audit_ledger ? audit_ledger->health_flag() : nullptr});
+    if (routing_policy && audit_ledger)
+    {
+        const auto replayed = audit_ledger->replayed_usage();
+        for (size_t i = 0; i < replayed.size(); ++i)
+            routing_policy->restore_usage(i, replayed[i].daily_tokens,
+                                          replayed[i].daily_unknown,
+                                          replayed[i].monthly_tokens,
+                                          replayed[i].monthly_unknown);
+    }
     std::vector<bool> initial_drained;
     if (!drained_mask(cfg, upstream_table.size(), initial_drained, err)) return refuse(err);
     if (routing_policy) routing_policy->set_drained(initial_drained);
