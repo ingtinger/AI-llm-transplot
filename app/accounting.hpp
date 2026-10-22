@@ -83,6 +83,9 @@ namespace llmbridge::app
         /// 否则不能审计按日期生效的价格。函数不分配内存且线程安全。
         [[nodiscard]] CostQuote quote(std::string_view provider,
                                       const RequestRecord& record) const noexcept;
+        /// 尝试事件使用相同的原始用量规则独立计价；重试腿不会被最终请求覆盖。
+        [[nodiscard]] CostQuote quote(std::string_view provider,
+                                      const AttemptRecord& record) const noexcept;
 
       private:
         [[nodiscard]] const PriceRule* find(std::string_view provider, std::string_view model,

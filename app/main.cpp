@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "options.hpp"
+#include "audit_ledger.hpp"
 #include "routing_policy.hpp"
 #include "observability.hpp"
 #include "management_server.hpp"
@@ -344,6 +345,21 @@ static int run(int argc, char** argv)
     const bool needs_policy = upstream_table.size() > 1 ||
                               routing_mode != llmbridge::app::RoutingMode::First ||
                               has_venue_overrides || has_model_pools || has_config_file;
+    std::unique_ptr<llmbridge::app::PriceTable> price_table;
+    std::unique_ptr<llmbridge::app::AuditLedger> audit_ledger;
+    if (!cfg.audit_ledger_path.empty())
+    {
+        price_table = std::make_unique<llmbridge::app::PriceTable>(cfg.price_rules);
+        std::vector<std::string> provider_ids;
+        provider_ids.reserve(upstream_table.size());
+        provider_ids.push_back(cfg.upstream_id);
+        for (const auto& venue : cfg.more_upstreams) provider_ids.push_back(venue.id);
+        std::vector<llmbridge::app::AuditUser> audit_users;
+        audit_users.reserve(cfg.users.size());
+        for (const auto& user : cfg.users) audit_users.push_back({user.tenant, user.id});
+        audit_ledger = std::make_unique<llmbridge::app::AuditLedger>(
+            cfg.audit_ledger_path, *price_table, std::move(provider_ids), std::move(audit_users));
+    }
     std::unique_ptr<llmbridge::app::RoutingPolicy> routing_policy;
     if (needs_policy || cfg.management_port > 0 || cfg.request_log || cfg.security_enabled)
         routing_policy = std::make_unique<llmbridge::app::RoutingPolicy>(
@@ -361,14 +377,16 @@ static int run(int argc, char** argv)
                 .security_enabled = cfg.security_enabled,
                 .allow_unsafe_replay = cfg.routing_allow_unsafe_replay,
                 .server_credentials = std::move(server_credentials),
-                .users = std::move(users)});
+                .users = std::move(users),
+                .accounting_healthy = audit_ledger ? audit_ledger->health_flag() : nullptr});
     std::vector<bool> initial_drained;
     if (!drained_mask(cfg, upstream_table.size(), initial_drained, err)) return refuse(err);
     if (routing_policy) routing_policy->set_drained(initial_drained);
     std::unique_ptr<llmbridge::app::Observability> observability;
-    if (cfg.management_port > 0 || cfg.request_log || cfg.security_enabled)
+    if (cfg.management_port > 0 || cfg.request_log || cfg.security_enabled || audit_ledger)
         observability = std::make_unique<llmbridge::app::Observability>(
-            upstream_table.size(), cfg.request_log || cfg.security_enabled, routing_policy.get());
+            upstream_table.size(), cfg.request_log || cfg.security_enabled, routing_policy.get(),
+            audit_ledger.get());
 
     std::signal(SIGPIPE, SIG_IGN);
 

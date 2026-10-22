@@ -58,6 +58,7 @@ namespace llmbridge::app
         bool allow_insecure_http = false; // 仅供本地 Mock 测试使用
         std::vector<UserSettings> users;
         std::vector<PriceRule> price_rules; // 文件中的版本化 Provider 价目表
+        std::string audit_ledger_path; // 逐尝试持久化账本；空表示关闭
         std::vector<std::string> strip_headers;                      // gateway-wide
         std::string routing_mode = "first", routing_sticky_header = "x-conversation-id";
         std::vector<std::string> routing_drained_upstreams; // SIGHUP 可热更新的索引列表

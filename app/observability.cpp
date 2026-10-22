@@ -1,19 +1,28 @@
 // AI-llm-transplot 扩展：工作线程只更新原子计数和尝试入队，日志写盘由专用线程执行。
 
 #include "observability.hpp"
+#include "audit_ledger.hpp"
 #include "routing_policy.hpp"
 
 #include <cstdio>
 
 namespace llmbridge::app
 {
-    Observability::Observability(size_t upstream_count, bool request_log, RoutingPolicy* policy)
+    Observability::Observability(size_t upstream_count, bool request_log, RoutingPolicy* policy,
+                                 AuditLedger* audit)
         : upstream_count_(upstream_count),
           policy_(policy),
+          audit_(audit),
           latencies_(std::make_unique<UpstreamLatency[]>(upstream_count)),
           request_log_(request_log)
     {
         if (request_log_) log_thread_ = std::thread([this] { log_loop(); });
+    }
+
+    void Observability::on_attempt(const AttemptRecord& r) noexcept
+    {
+        if (policy_) policy_->complete_attempt(r);
+        if (audit_) audit_->on_attempt(r);
     }
 
     Observability::~Observability()
@@ -78,6 +87,9 @@ namespace llmbridge::app
     {
         return dropped_logs_.load(std::memory_order_relaxed);
     }
+
+    bool Observability::audit_healthy() const noexcept { return !audit_ || audit_->healthy(); }
+    uint64_t Observability::audit_written() const noexcept { return audit_ ? audit_->written() : 0; }
 
     void Observability::log_loop() noexcept
     {

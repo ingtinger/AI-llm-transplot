@@ -286,6 +286,11 @@ namespace llmbridge::app
             if (!model_allowed)
                 return {.allow = false, .deny_status = 403, .reason = "model permission",
                         .message = "model not permitted"};
+            if ((user->daily_tokens > 0 || user->monthly_tokens > 0) &&
+                config_.accounting_healthy &&
+                !config_.accounting_healthy->load(std::memory_order_acquire))
+                return {.allow = false, .deny_status = 503, .reason = "accounting unavailable",
+                        .message = "accounting temporarily unavailable"};
             const UtcPeriod period = utc_period();
             const UserState& state = user_states_[user_index];
             if ((user->daily_tokens > 0 &&
@@ -373,6 +378,27 @@ namespace llmbridge::app
             if (rule.daily_tokens > 0) add_usage(user_states_[user - 1].daily_usage, period.day, tokens, unknown);
             if (rule.monthly_tokens > 0) add_usage(user_states_[user - 1].monthly_usage, period.month, tokens, unknown);
         }
+    }
+
+    void RoutingPolicy::complete_attempt(const AttemptRecord& record) noexcept
+    {
+        if (!record.retrying) return;
+        const uint64_t user = record.tag >> 32;
+        if (!config_.security_enabled || user == 0 || user > config_.users.size()) return;
+        const UserRule& rule = config_.users[user - 1];
+        if (rule.daily_tokens == 0 && rule.monthly_tokens == 0) return;
+        const bool complete_usage = record.tokens_in >= 0 && record.tokens_out >= 0;
+        const bool unknown = record.upstream_sent && !complete_usage;
+        const uint32_t tokens = complete_usage
+            ? static_cast<uint32_t>(std::min<int64_t>(kUsageUnknown - 1,
+                  static_cast<int64_t>(record.tokens_in) + record.tokens_out))
+            : 0;
+        if (!unknown && tokens == 0) return;
+        const UtcPeriod period = utc_period();
+        if (rule.daily_tokens > 0)
+            add_usage(user_states_[user - 1].daily_usage, period.day, tokens, unknown);
+        if (rule.monthly_tokens > 0)
+            add_usage(user_states_[user - 1].monthly_usage, period.month, tokens, unknown);
     }
 
     void RoutingPolicy::on_abandon(uint64_t tag, bool upstream_sent) noexcept

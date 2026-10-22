@@ -461,6 +461,15 @@ namespace llmbridge::app
             for (const auto& [key, value] : g.obj)
             {
                 if (is_comment(key)) continue;
+                if (key == "ledger_path")
+                {
+                    if (value.type != json::Value::Type::String || value.sv.empty() ||
+                        value.sv.size() > 4096 || value.sv.front() != '/' ||
+                        value.sv.find('\0') != std::string_view::npos)
+                        return fail(err, "config: accounting.ledger_path must be a nonempty absolute path");
+                    s.audit_ledger_path = value.sv;
+                    continue;
+                }
                 if (key != "prices") return fail(err, "config: unknown accounting field");
                 if (!value.is_array() || value.arr.size() > 1024)
                     return fail(err,
@@ -751,7 +760,7 @@ namespace llmbridge::app
                   k == "accounting" ? apply_accounting(v, s, err) : apply_group(k, v, s, err)))
                 return false;
         }
-        if (!s.price_rules.empty())
+        if (!s.price_rules.empty() || !s.audit_ledger_path.empty())
         {
             std::unordered_set<std::string_view> providers;
             if (!stable_id_ok(s.upstream_id) || !providers.insert(s.upstream_id).second)
@@ -765,6 +774,8 @@ namespace llmbridge::app
                 if (!providers.contains(rule.provider))
                     return fail(err, "config: accounting price refers to an unknown provider");
         }
+        if (!s.audit_ledger_path.empty() && s.price_rules.empty())
+            return fail(err, "config: accounting.ledger_path requires accounting.prices");
         return true;
     }
 

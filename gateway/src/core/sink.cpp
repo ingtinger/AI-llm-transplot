@@ -106,10 +106,14 @@ namespace llmbridge::detail
     }
 
     void Engine::sink_emit_attempt(ClientConn* c, int status, AttemptOutcome outcome,
-                                   bool response_received, bool retrying, bool streamed) noexcept
+                                   bool response_received, bool retrying, bool streamed,
+                                   std::string_view attempted_model) noexcept
     {
         if (!_sink || c->req.f.attempt_sunk || c->upstream_slot < 0) return;
         const ReqState& f = c->req.f;
+        // 认证、权限或额度在构建上游请求前拒绝时，upstream_slot 可能已有默认值，
+        // 但并不存在上游尝试，不能把本地拒绝写进 Provider 账本。
+        if (f.ts_req_built == 0 && f.ts_wire_ready == 0 && f.ts_up_sent == 0) return;
         const BodyUsage u = streamed ? stream_tokens(c) : f.tok;
         AttemptRecord a;
         a.request_seq = f.req_seq;
@@ -148,7 +152,10 @@ namespace llmbridge::detail
         a.prior_cached_tokens = static_cast<int32_t>(u.prior_cached);
         a.prior_cache_write_tokens = static_cast<int32_t>(u.prior_cache_write);
         a.prior_attempts = static_cast<int32_t>(u.prior_attempts);
-        a.model = f.model.view();
+        a.requested_model = f.model.view();
+        a.model = !attempted_model.empty() ? attempted_model
+                : !f.model_override.empty() ? f.model_override.view()
+                : f.model_substituted ? f.subst_model.view() : f.model.view();
         a.served_model = f.served_model.view();
         a.venue_req_id = f.venue_req_id.view();
         a.prior_model = u.prior_model.view();

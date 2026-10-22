@@ -19,6 +19,7 @@
 #include "scan.hpp"
 #include "stream.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <string_view>
 
@@ -429,11 +430,20 @@ namespace llmbridge::detail
     bool Engine::upstream_failed(ClientConn* client, int status, const char* why,
                                  bool response_received) noexcept
     {
+        const ReqState& before = client->req.f;
+        char attempted_model_storage[256];
+        const std::string_view effective_model =
+            !before.model_override.empty() ? before.model_override.view()
+            : before.model_substituted ? before.subst_model.view() : before.model.view();
+        const size_t attempted_model_size = std::min(effective_model.size(), sizeof attempted_model_storage);
+        if (attempted_model_size > 0)
+            std::memcpy(attempted_model_storage, effective_model.data(), attempted_model_size);
+        const std::string_view attempted_model(attempted_model_storage, attempted_model_size);
         const Retry r = failover_target(client, status, why, response_received);
         sink_emit_attempt(client, status,
                           response_received ? AttemptOutcome::Response
                                             : AttemptOutcome::TransportError,
-                          response_received, r.retry);
+                          response_received, r.retry, /*streamed=*/false, attempted_model);
         if (!r.retry) return false;
 
         LB_WARN(ReqId{client->req.f.req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),

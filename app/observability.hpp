@@ -15,6 +15,7 @@
 
 namespace llmbridge::app
 {
+    class AuditLedger;
     class RoutingPolicy;
     /// 多个 Gateway 共享的请求接收器；计数使用原子操作，日志入队不等待锁。
     /// 必须在所有 Gateway 工作线程结束后销毁，析构时排空已入队日志。
@@ -27,14 +28,18 @@ namespace llmbridge::app
             uint64_t total_ns = 0;
         };
 
-        Observability(size_t upstream_count, bool request_log, RoutingPolicy* policy = nullptr);
+        Observability(size_t upstream_count, bool request_log, RoutingPolicy* policy = nullptr,
+                      AuditLedger* audit = nullptr);
         ~Observability() override;
         Observability(const Observability&) = delete;
         Observability& operator=(const Observability&) = delete;
 
+        void on_attempt(const AttemptRecord& record) noexcept override;
         void on_request(const RequestRecord& record) noexcept override;
         [[nodiscard]] Latency latency(size_t index) const noexcept;
         [[nodiscard]] uint64_t dropped_logs() const noexcept;
+        [[nodiscard]] bool audit_healthy() const noexcept;
+        [[nodiscard]] uint64_t audit_written() const noexcept;
 
       private:
         struct UpstreamLatency
@@ -61,6 +66,7 @@ namespace llmbridge::app
 
         size_t upstream_count_;
         RoutingPolicy* policy_;
+        AuditLedger* audit_;
         std::unique_ptr<UpstreamLatency[]> latencies_;
         bool request_log_;
         static constexpr size_t kLogCapacity = 1024;

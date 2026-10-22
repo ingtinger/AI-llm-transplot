@@ -38,6 +38,10 @@
       }
     ]
   },
+  "accounting": {
+    "_说明": "生产环境配置 prices 后可设置 ledger_path（绝对路径）持久化逐尝试审计；账本文件必须由运行用户所有且权限为 0600。完整价目示例见 docs/accounting.md。",
+    "prices": []
+  },
   "routing": {
     "mode": "sticky",
     "max_attempts": 2,

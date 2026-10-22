@@ -256,7 +256,8 @@ namespace llmbridge::detail
         void sink_emit(ClientConn* c, int status, bool streamed) noexcept;
         void sink_emit_attempt(ClientConn* c, int status, AttemptOutcome outcome,
                                bool response_received, bool retrying,
-                               bool streamed = false) noexcept;
+                               bool streamed = false,
+                               std::string_view attempted_model = {}) noexcept;
         void sink_next_attempt(ClientConn* c) noexcept;
         void sweep_idle() noexcept; // heartbeat, pool reaping and every timeout, one walk
         void sweep_client(ClientConn* c, int64_t now, bool busy) noexcept;

@@ -44,6 +44,8 @@ namespace llmbridge::app
         bool allow_unsafe_replay = false;
         std::vector<std::string> server_credentials;
         std::vector<UserRule> users;
+        /// 由审计账本持有；账本必须晚于本策略销毁。false 时额度用户 fail-closed。
+        const std::atomic<bool>* accounting_healthy = nullptr;
     };
 
     /// 【线程安全】内置多上游策略，可由多个网关工作线程共享。
@@ -72,6 +74,8 @@ namespace llmbridge::app
         void on_abandon(uint64_t tag, bool upstream_sent) noexcept override;
         /// 每个已放行请求必须恰好调用一次；包括客户端断连。tag 上半部是用户索引。
         void complete(const RequestRecord& record) noexcept;
+        /// 仅结算会继续重试的非最终尝试；最终腿仍由 complete() 结算，避免重复。
+        void complete_attempt(const AttemptRecord& record) noexcept;
         bool wants_prefix_hash() const noexcept override;
         bool allows_unsafe_replay() const noexcept override { return config_.allow_unsafe_replay; }
         /// 供管理线程读取的原子快照；多个字段不保证来自同一时刻。

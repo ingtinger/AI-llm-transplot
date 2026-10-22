@@ -228,6 +228,78 @@ TEST(RoutingPolicy, SecureQuotaAccountsKnownUsageAndFailsClosedOnUnknownUsage)
     EXPECT_EQ(unknown_policy.decide(facts).deny_status, 429);
 }
 
+TEST(RoutingPolicy, QuotaUsersFailClosedWhenTheAuditLedgerIsUnhealthy)
+{
+    std::atomic<bool> accounting_healthy{false};
+    auto c = config(1);
+    c.security_enabled = true;
+    c.server_credentials = {"provider-secret"};
+    c.users = {{"alice", "tenant", "gateway-key-alice-123456", {"chat"}, {0},
+                10, 1, 5, 5, 0, false}};
+    c.accounting_healthy = &accounting_healthy;
+    llmbridge::app::RoutingPolicy policy(std::move(c));
+    llmbridge::RequestFacts facts{};
+    facts.model = "chat";
+    facts.head = "POST / HTTP/1.1\r\nAuthorization: Bearer gateway-key-alice-123456\r\n\r\n";
+    const auto denied = policy.decide(facts);
+    EXPECT_EQ(denied.deny_status, 503);
+    EXPECT_STREQ(denied.reason, "accounting unavailable");
+    accounting_healthy.store(true, std::memory_order_release);
+    const auto allowed = policy.decide(facts);
+    EXPECT_TRUE(allowed.allow);
+    policy.on_abandon(allowed.tag, false);
+}
+
+TEST(RoutingPolicy, RetryAttemptsAreIncludedInTokenQuotaWithoutDoubleCountingTheFinalLeg)
+{
+    auto c = config(1);
+    c.security_enabled = true;
+    c.server_credentials = {"provider-secret"};
+    c.users = {{"alice", "tenant", "gateway-key-alice-123456", {"chat"}, {0},
+                10, 1, 10, 10, 0, false}};
+    llmbridge::app::RoutingPolicy policy(std::move(c));
+    llmbridge::RequestFacts facts{};
+    facts.model = "chat";
+    facts.head = "POST / HTTP/1.1\r\nAuthorization: Bearer gateway-key-alice-123456\r\n\r\n";
+    const auto decision = policy.decide(facts);
+    ASSERT_TRUE(decision.allow);
+
+    llmbridge::AttemptRecord retry;
+    retry.tag = decision.tag;
+    retry.retrying = true;
+    retry.upstream_sent = true;
+    retry.tokens_in = 4;
+    retry.tokens_out = 3;
+    policy.complete_attempt(retry);
+    llmbridge::RequestRecord final_record;
+    final_record.tag = decision.tag;
+    final_record.tokens_in = 2;
+    final_record.tokens_out = 1;
+    policy.complete(final_record);
+    EXPECT_EQ(policy.decide(facts).deny_status, 429);
+
+    auto unknown = config(1);
+    unknown.security_enabled = true;
+    unknown.server_credentials = {"provider-secret"};
+    unknown.users = {{"bob", "tenant", "gateway-key-bob-12345678", {"chat"}, {0},
+                      10, 1, 100, 100, 0, false}};
+    llmbridge::app::RoutingPolicy unknown_policy(std::move(unknown));
+    facts.head = "POST / HTTP/1.1\r\nAuthorization: Bearer gateway-key-bob-12345678\r\n\r\n";
+    const auto bob = unknown_policy.decide(facts);
+    ASSERT_TRUE(bob.allow);
+    retry = {};
+    retry.tag = bob.tag;
+    retry.retrying = true;
+    retry.upstream_sent = true;
+    unknown_policy.complete_attempt(retry);
+    final_record = {};
+    final_record.tag = bob.tag;
+    final_record.tokens_in = 1;
+    final_record.tokens_out = 1;
+    unknown_policy.complete(final_record);
+    EXPECT_EQ(unknown_policy.decide(facts).deny_status, 429);
+}
+
 TEST(RoutingPolicy, DisabledAndExpiredUserKeysAreRejected)
 {
     auto c = config(1);

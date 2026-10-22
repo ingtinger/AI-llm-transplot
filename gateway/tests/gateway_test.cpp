@@ -6613,6 +6613,7 @@ namespace
             std::lock_guard<std::mutex> lk(_mu);
             AttemptCopy c;
             c.r = r;
+            c.requested_model.assign(r.requested_model);
             c.model.assign(r.model);
             c.served_model.assign(r.served_model);
             c.venue_req_id.assign(r.venue_req_id);
@@ -6658,7 +6659,7 @@ namespace
         struct AttemptCopy
         {
             llmbridge::AttemptRecord r;
-            std::string model, served_model, venue_req_id, prior_model;
+            std::string requested_model, model, served_model, venue_req_id, prior_model;
             std::string served_speed, served_geo, served_latency, asked_cache_ttl;
         };
         std::vector<Copy> records()
@@ -6795,6 +6796,7 @@ TEST_P(ProxyRoute, TheSinkSeesGatewayGeneratedErrorReplies)
     EXPECT_TRUE(recs[0].r.error_reply);
     EXPECT_EQ(recs[0].r.ts_up_sent, 0) << "a refused request has no upstream stamps";
     EXPECT_EQ(recs[0].cap[0], "");
+    EXPECT_TRUE(sink.attempts().empty()) << "本地拒绝不是上游尝试";
 }
 
 // After a failover the record must describe the venue that served, the attempts it

@@ -49,6 +49,7 @@
   },
 
   "accounting": {
+    "_ledger_path": "启用后将每次上游尝试追加到带 CRC 的持久化 JSONL。目录必须预先存在且进程可写；示例：/var/lib/llmbridge/audit.jsonl。空值不允许，关闭时省略此项。",
     "_prices": "版本化价目规则，默认空表示尚未配置费用计算。每条规则按 upstream.id、实际服务模型和 [valid_from_unix_s, valid_until_unix_s) 匹配；version 与 source 必填。Token 类 rates 单位为皮美元/Token，工具类为皮美元/次，0 表示明确免费；所有数值必须是非负整数。示例规则见 docs/accounting.md。",
     "prices": []
   },

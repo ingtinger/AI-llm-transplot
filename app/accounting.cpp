@@ -272,4 +272,39 @@ namespace llmbridge::app
         else quote.cost_pdollars = -1;
         return quote;
     }
+
+    CostQuote PriceTable::quote(std::string_view provider, const AttemptRecord& attempt) const noexcept
+    {
+        RequestRecord record;
+        record.wall_t0_ns = attempt.wall_t0_ns;
+        record.tokens_in = attempt.tokens_in;
+        record.tokens_out = attempt.tokens_out;
+        record.cached_tokens = attempt.cached_tokens;
+        record.cache_write_tokens = attempt.cache_write_tokens;
+        record.cache_write_5m_tokens = attempt.cache_write_5m_tokens;
+        record.cache_write_1h_tokens = attempt.cache_write_1h_tokens;
+        record.reasoning_tokens = attempt.reasoning_tokens;
+        record.audio_in_tokens = attempt.audio_in_tokens;
+        record.audio_out_tokens = attempt.audio_out_tokens;
+        record.accepted_prediction_tokens = attempt.accepted_prediction_tokens;
+        record.rejected_prediction_tokens = attempt.rejected_prediction_tokens;
+        record.tool_prompt_tokens = attempt.tool_prompt_tokens;
+        record.image_in_tokens = attempt.image_in_tokens;
+        record.web_search_requests = attempt.web_search_requests;
+        record.web_fetch_requests = attempt.web_fetch_requests;
+        record.code_exec_requests = attempt.code_exec_requests;
+        record.file_search_calls = attempt.file_search_calls;
+        record.compaction_in_tokens = attempt.compaction_in_tokens;
+        record.compaction_out_tokens = attempt.compaction_out_tokens;
+        record.compaction_cached_tokens = attempt.compaction_cached_tokens;
+        record.prior_in_tokens = attempt.prior_in_tokens;
+        record.prior_out_tokens = attempt.prior_out_tokens;
+        record.prior_cached_tokens = attempt.prior_cached_tokens;
+        record.prior_cache_write_tokens = attempt.prior_cache_write_tokens;
+        record.prior_attempts = attempt.prior_attempts;
+        record.model = attempt.model;
+        record.served_model = attempt.served_model;
+        record.prior_model = attempt.prior_model;
+        return quote(provider, record);
+    }
 } // namespace llmbridge::app

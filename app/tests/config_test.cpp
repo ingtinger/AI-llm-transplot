@@ -124,6 +124,25 @@ TEST(Config, AccountingRequiresStableUniqueKnownProviderIds)
     EXPECT_EQ(ordered_late.more_upstreams[0].id, "backup");
 }
 
+TEST(Config, AuditLedgerRequiresAPathPricesAndStableProviderIds)
+{
+    Settings s;
+    std::string err;
+    EXPECT_FALSE(parse_config(R"({"accounting":{"ledger_path":"/tmp/audit.jsonl"},
+                                  "upstream":{"id":"primary"}})", s, err));
+    EXPECT_NE(err.find("requires accounting.prices"), std::string::npos) << err;
+    EXPECT_FALSE(parse_config(R"({"accounting":{"ledger_path":""}})", s, err));
+    EXPECT_NE(err.find("absolute path"), std::string::npos) << err;
+    EXPECT_FALSE(parse_config(R"({"accounting":{"ledger_path":"relative.jsonl"}})", s, err));
+    EXPECT_NE(err.find("absolute path"), std::string::npos) << err;
+
+    const std::string good =
+        R"({"upstream":{"id":"primary"},"accounting":{"ledger_path":"/tmp/audit.jsonl","prices":[{"provider":"primary","model":"m","version":"v","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1,"output":2}}]}})";
+    Settings accepted;
+    ASSERT_TRUE(parse_config(good, accepted, err)) << err;
+    EXPECT_EQ(accepted.audit_ledger_path, "/tmp/audit.jsonl");
+}
+
 TEST(Config, UnreadablePathIsNotEchoed)
 {
     Settings s;

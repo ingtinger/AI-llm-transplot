@@ -68,7 +68,8 @@ namespace llmbridge
                 compaction_cached_tokens = -1;
         int32_t prior_in_tokens = -1, prior_out_tokens = -1, prior_cached_tokens = -1,
                 prior_cache_write_tokens = -1, prior_attempts = -1;
-        std::string_view model;
+        std::string_view requested_model; ///< 客户端请求模型
+        std::string_view model; ///< 本次尝试实际发送给 Provider 的模型
         std::string_view served_model;
         std::string_view venue_req_id;
         std::string_view prior_model;

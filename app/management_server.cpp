@@ -189,7 +189,11 @@ namespace llmbridge::app
             << "# HELP ai_gateway_upstream_response_latency_seconds Time to first upstream response byte for final attempts.\n"
             << "# TYPE ai_gateway_upstream_response_latency_seconds summary\n"
             << "# HELP ai_gateway_request_log_dropped_total Structured logs dropped by the bounded queue.\n"
-            << "# TYPE ai_gateway_request_log_dropped_total counter\n";
+            << "# TYPE ai_gateway_request_log_dropped_total counter\n"
+            << "# HELP ai_gateway_audit_ledger_healthy Whether persistent attempt auditing can accept records.\n"
+            << "# TYPE ai_gateway_audit_ledger_healthy gauge\n"
+            << "# HELP ai_gateway_audit_ledger_records_total Durable attempt records written.\n"
+            << "# TYPE ai_gateway_audit_ledger_records_total counter\n";
         for (size_t i = 0; i < policy_.upstream_count(); ++i)
         {
             const auto s = policy_.snapshot(i);
@@ -210,6 +214,8 @@ namespace llmbridge::app
                 << std::setprecision(9) << static_cast<double>(l.total_ns) / 1e9 << '\n';
         }
         out << "ai_gateway_request_log_dropped_total " << observability_.dropped_logs() << '\n';
+        out << "ai_gateway_audit_ledger_healthy " << (observability_.audit_healthy() ? 1 : 0) << '\n';
+        out << "ai_gateway_audit_ledger_records_total " << observability_.audit_written() << '\n';
         return out.str();
     }
 } // namespace llmbridge::app

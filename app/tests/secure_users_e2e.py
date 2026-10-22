@@ -31,6 +31,7 @@ class Mock(http.server.BaseHTTPRequestHandler):
         self.received.append((self.headers.get("Authorization", ""),
                               self.headers.get("X-Kottos-Key-Forged", ""), model))
         payload = json.dumps({"id": "secure-mock", "object": "chat.completion",
+                              "model": model,
                               "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
                                            "finish_reason": "stop"}],
                               "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}).encode()
@@ -143,8 +144,10 @@ def main(binary: Path) -> None:
     config = {
         "listen": {"port": port},
         "upstream": [
-            {"url": f"127.0.0.1:{dead}", "dialect": "openai", "credential_env": "PROVIDER_A", "model": "model-a"},
-            {"url": f"127.0.0.1:{live}", "dialect": "openai", "credential_env": "PROVIDER_B", "model": "model-b"},
+            {"id": "provider-a", "url": f"127.0.0.1:{dead}", "dialect": "openai",
+             "credential_env": "PROVIDER_A", "model": "model-a"},
+            {"id": "provider-b", "url": f"127.0.0.1:{live}", "dialect": "openai",
+             "credential_env": "PROVIDER_B", "model": "model-b"},
         ],
         "routing": {"mode": "first", "max_attempts": 2, "failure_threshold": 1, "cooldown_s": 30},
         "security": {"enabled": True, "allow_insecure_http": True, "users": [
@@ -160,6 +163,17 @@ def main(binary: Path) -> None:
     try:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.json"
+            ledger_path = Path(temp) / "audit.jsonl"
+            config["accounting"] = {
+                "ledger_path": str(ledger_path),
+                "prices": [
+                    {"provider": provider, "model": model, "version": "test-v1",
+                     "source": "mock price fixture", "valid_from_unix_s": 0,
+                     "valid_until_unix_s": 0, "rates": {"input": 2, "output": 5}}
+                    for provider, model in (("provider-a", "model-a"),
+                                            ("provider-b", "model-b"))
+                ],
+            }
             path.write_text(json.dumps(config), encoding="utf-8")
             env = {**os.environ, "PROVIDER_A": provider_a, "PROVIDER_B": provider_b,
                    "ALICE_KEY": alice, "BOB_KEY": bob}
@@ -185,6 +199,16 @@ def main(binary: Path) -> None:
             assert request(port, bob, "chat-b")[0] == 429
             assert Mock.received == [(f"Bearer {provider_b}", "", "model-b"),
                                      (f"Bearer {provider_b}", "", "model-b")], Mock.received
+            ledger_bytes = b""
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if ledger_path.exists():
+                    ledger_bytes = ledger_path.read_bytes()
+                    if len(ledger_bytes.splitlines()) == 3:
+                        break
+                time.sleep(0.01)
+            else:
+                raise AssertionError(f"audit records were not persisted: {ledger_bytes!r}")
     finally:
         if process is not None:
             process.terminate()
@@ -192,6 +216,24 @@ def main(binary: Path) -> None:
             for secret in (alice, bob, provider_a, provider_b, "private-prompt"):
                 assert secret.encode() not in stderr
             assert b'"tokens_in":3' in stderr and b'"tokens_out":2' in stderr, stderr
+            records = [json.loads(line) for line in ledger_bytes.decode().splitlines()]
+            assert len(records) == 3, records
+            retried = {}
+            for record in records:
+                retried.setdefault(record["request_seq"], []).append(record)
+                assert record["tenant_id"] in ("team-a", "team-b")
+                assert record["user_id"] in ("alice", "bob")
+                assert len(record["instance_id"]) == 32
+                assert len(record["crc32"]) == 8
+            pair = next(group for group in retried.values() if len(group) == 2)
+            pair.sort(key=lambda item: item["attempt"])
+            assert pair[0]["provider_id"] == "provider-a"
+            assert pair[0]["outcome"] == "transport_error" and pair[0]["retrying"]
+            assert pair[0]["cost_status"] == "usage_unknown", pair
+            assert pair[1]["provider_id"] == "provider-b" and pair[1]["status"] == 200
+            assert pair[1]["calculated_cost_pdollars"] == 16
+            for secret in (alice, bob, provider_a, provider_b, "private-prompt"):
+                assert secret.encode() not in ledger_bytes
         mock.shutdown()
         thread.join(timeout=3)
         mock.server_close()
