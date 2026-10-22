@@ -292,6 +292,10 @@ continuously fuzzed:
     `close` token closes, and `keep-alive` keeps an HTTP/1.0 message open, which
     otherwise closes. An HTTP/1.0 upstream reply that said nothing used to be pooled,
     and every reuse became a stale-connection retry.
+  - **Typed metadata uses token boundaries.** `Content-Encoding` is unencoded only
+    when every coding is exactly `identity`; a substring or another coding cannot
+    bypass compressed-request rejection. SSE requires the exact `text/event-stream`
+    media type before optional parameters, rather than a substring match.
   - **Quota and `Retry-After`.** A rate-limit family counts as exhausted only when its
     remaining value is a well-formed 0, since naming the wrong quota sends an
     operator to raise a limit that was not the one refusing. `Retry-After` accepts

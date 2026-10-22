@@ -980,6 +980,48 @@ TEST(HttpRequestEncoding, CaseInsensitive)
     EXPECT_TRUE(m.encoded);
 }
 
+TEST(HttpRequestEncoding, IdentityMustBeAWholeCodingAndCannotHideAnother)
+{
+    for (const std::string_view value : {"notidentity", "identityx", "gzip, identity",
+                                         "identity, gzip", "identity,,identity",
+                                         "identity;level=0"})
+    {
+        Message m;
+        ASSERT_EQ(parse_request("POST / HTTP/1.1\r\nContent-Encoding: " +
+                                    std::string(value) + "\r\nContent-Length: 0\r\n\r\n", m),
+                  FrameStatus::Complete) << value;
+        EXPECT_TRUE(m.encoded) << value;
+    }
+
+    Message identities;
+    ASSERT_EQ(parse_request("POST / HTTP/1.1\r\nContent-Encoding: IDENTITY, identity\r\n"
+                            "Content-Length: 0\r\n\r\n", identities),
+              FrameStatus::Complete);
+    EXPECT_FALSE(identities.encoded);
+
+    Message repeated;
+    ASSERT_EQ(parse_request("POST / HTTP/1.1\r\nContent-Encoding: gzip\r\n"
+                            "Content-Encoding: identity\r\nContent-Length: 0\r\n\r\n", repeated),
+              FrameStatus::Complete);
+    EXPECT_TRUE(repeated.encoded);
+}
+
+TEST(HttpResponseEncoding, IdentityMustBeAWholeCodingAndCannotHideAnother)
+{
+    llmbridge::net::http::ResponseHead h;
+    ASSERT_EQ(llmbridge::net::http::parse_response_head(
+                  "HTTP/1.1 200 OK\r\nContent-Encoding: notidentity\r\n"
+                  "Content-Length: 0\r\n\r\n", h),
+              FrameStatus::Complete);
+    EXPECT_TRUE(h.encoded);
+
+    ASSERT_EQ(llmbridge::net::http::parse_response_head(
+                  "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n"
+                  "Content-Encoding: identity\r\nContent-Length: 0\r\n\r\n", h),
+              FrameStatus::Complete);
+    EXPECT_TRUE(h.encoded);
+}
+
 TEST(HttpOutputState, ReusedRequestResultDoesNotKeepPriorFlags)
 {
     Message m;

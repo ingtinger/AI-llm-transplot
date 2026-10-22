@@ -88,6 +88,19 @@ TEST(RespHead, EventStreamWithCharsetParam)
     EXPECT_TRUE(h.event_stream);
 }
 
+TEST(RespHead, EventStreamMediaTypeMustMatchExactly)
+{
+    for (const std::string_view value : {"application/x-text/event-stream",
+                                         "text/event-streamx", "xtext/event-stream"})
+    {
+        ResponseHead h;
+        ASSERT_EQ(parse_response_head("HTTP/1.1 200 OK\r\nContent-Type: " +
+                                          std::string(value) + "\r\nContent-Length: 0\r\n\r\n", h),
+                  FrameStatus::Complete) << value;
+        EXPECT_FALSE(h.event_stream) << value;
+    }
+}
+
 TEST(RespHead, PlainJsonResponseIsNotStreaming)
 {
     ResponseHead h;

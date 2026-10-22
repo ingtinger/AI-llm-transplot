@@ -125,6 +125,27 @@ namespace llmbridge::net::http
             return v.substr(b, e - b);
         }
 
+        // A non-empty comma list containing only `token`, in any case. Empty members
+        // are malformed and therefore do not describe the identity coding.
+        inline bool only_token_ci(std::string_view list, std::string_view token) noexcept
+        {
+            for (;;)
+            {
+                const size_t comma = list.find(',');
+                const std::string_view item = trim_ows(list.substr(0, comma));
+                if (item.empty() || !same_ci(item, token)) return false;
+                if (comma == std::string_view::npos) return true;
+                list.remove_prefix(comma + 1);
+            }
+        }
+
+        inline bool media_type_is(std::string_view value, std::string_view type) noexcept
+        {
+            value = trim_ows(value);
+            const size_t semi = value.find(';');
+            return same_ci(trim_ows(value.substr(0, semi)), type);
+        }
+
         // RFC 9112 §8.6: 1*DIGIT and nothing else, unlike a bare from_chars.
         inline bool parse_strict_length(std::string_view v, size_t& out) noexcept
         {
@@ -353,8 +374,8 @@ namespace llmbridge::net::http
                     return false; // Content-Length framing only
                 case Field::ContentEncoding:
                 {
-                    const std::string_view v = detail::ltrim(h.value);
-                    out.encoded = !v.empty() && !detail::contains_ci(v, "identity");
+                    const std::string_view v = detail::trim_ows(h.value);
+                    if (!v.empty() && !detail::only_token_ci(v, "identity")) out.encoded = true;
                     break;
                 }
                 case Field::Connection:
@@ -513,12 +534,12 @@ namespace llmbridge::net::http
                     return true;
                 case Field::ContentEncoding:
                 {
-                    const std::string_view v = detail::ltrim(h.value);
-                    out.encoded = !v.empty() && !detail::contains_ci(v, "identity");
+                    const std::string_view v = detail::trim_ows(h.value);
+                    if (!v.empty() && !detail::only_token_ci(v, "identity")) out.encoded = true;
                     return true;
                 }
                 case Field::ContentType:
-                    if (detail::contains_ci(h.value, "text/event-stream")) out.event_stream = true;
+                    if (detail::media_type_is(h.value, "text/event-stream")) out.event_stream = true;
                     return true;
                 case Field::Connection:
                     close |= has_token(h.value, "close");

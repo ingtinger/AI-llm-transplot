@@ -8,8 +8,8 @@
 // Differential target: net/http.hpp against the v0.70.0 framer frozen in
 // http_legacy.hpp. The framer may refuse more than the old one did, never less, and
 // whatever both accept frames the same way. The deliberate differences: keep-alive
-// (version default and Connection tokens) and bodyless responses (1xx, 204, 304),
-// which end at the head. Kept for one release.
+// (version default and Connection tokens), bodyless responses (1xx, 204, 304), and
+// exact token/media-type recognition for metadata flags. Kept for one release.
 
 #include "http_legacy.hpp"
 #include "net/http.hpp"
@@ -32,8 +32,7 @@ namespace
     bool same(const now::ResponseHead& a, const old::ResponseHead& b)
     {
         return a.header_len == b.header_len && a.status == b.status && a.chunked == b.chunked &&
-               a.event_stream == b.event_stream && a.has_content_length == b.has_content_length &&
-               a.encoded == b.encoded && a.content_length == b.content_length &&
+               a.has_content_length == b.has_content_length && a.content_length == b.content_length &&
                static_cast<int>(a.quota_exhausted) == static_cast<int>(b.quota_exhausted) &&
                a.retry_after_s == b.retry_after_s;
     }
@@ -51,7 +50,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     assert(r1 == kError || same(r1, r2));
     if (r1 != kError)
         assert(m1.header_len == m2.header_len && m1.body_len == m2.body_len &&
-               m1.total_len == m2.total_len && m1.encoded == m2.encoded && m1.http_1_1 == m2.http_1_1);
+               m1.total_len == m2.total_len && m1.http_1_1 == m2.http_1_1);
 
     now::ResponseHead h1;
     old::ResponseHead h2;
