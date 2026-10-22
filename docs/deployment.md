@@ -67,6 +67,6 @@ sudo systemctl status ai-llm-transplot
 sudo systemctl reload ai-llm-transplot
 ```
 
-执行 `enable --now` 前必须先准备配置、凭据和证书。服务单元以 `SIGTERM` 停止、以 `SIGHUP` 仅热更新 `routing.drained_upstreams`；修改其他配置或轮换环境变量中的密钥须重启。标准输出和错误进入 journald；在宿主机的 journald 配置中设定容量上限与保留策略，避免日志无限增长。数据端口需由 TLS 保护，并配合防火墙或反向代理限制入口；反向代理不应转发仅监听 `127.0.0.1` 的管理端口。
+执行 `enable --now` 前必须先准备配置、凭据和证书。服务单元以 `SIGTERM` 停止、以 `SIGHUP` 仅热更新 `routing.drained_upstreams`；修改其他配置或轮换环境变量中的密钥须重启。轮换虚拟 Key 时同时递增对应用户的 `key_version`，便于账本追溯，但任何日志都不得记录 Key 本身。标准输出和错误进入 journald；在宿主机的 journald 配置中设定容量上限与保留策略，避免日志无限增长。数据端口需由 TLS 保护，并配合防火墙或反向代理限制入口；反向代理不应转发仅监听 `127.0.0.1` 的管理端口。
 
 这些示例不提供持久化额度、完整审计或跨实例共享状态，相关限制见 [用量与审计边界](accounting.md)。

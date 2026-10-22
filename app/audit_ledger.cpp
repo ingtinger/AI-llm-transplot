@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <stdexcept>
 #include <string_view>
+#include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <unordered_set>
@@ -87,9 +88,12 @@ namespace llmbridge::app
             }
         };
 
+        enum class ReplayKind { Attempt, SessionStart, SessionEnd };
+
         struct ReplayRecord
         {
             ReplayKey key;
+            ReplayKind kind = ReplayKind::Attempt;
             std::string_view tenant, user;
             int64_t accounted_at_ns = 0;
             int32_t tokens_in = -1, tokens_out = -1;
@@ -104,29 +108,10 @@ namespace llmbridge::app
             int schema = 0;
             int64_t wall_t0_ns = 0;
             const provider::json::Value* recorded = root.find("recorded_at_ns");
-            if (!integer_member(root, "schema", schema) || schema != 1 ||
-                !integer_member(root, "request_seq", out.key.request_seq) ||
-                !integer_member(root, "attempt", out.key.attempt) ||
-                !integer_member(root, "wall_t0_ns", wall_t0_ns) || wall_t0_ns < 0 ||
-                !integer_member(root, "tokens_in", out.tokens_in) || out.tokens_in < -1 ||
-                !integer_member(root, "tokens_out", out.tokens_out) || out.tokens_out < -1 ||
-                !bool_member(root, "upstream_sent", out.upstream_sent)) return false;
-            out.accounted_at_ns = wall_t0_ns;
-            if (recorded)
-            {
-                if (!integer_member(root, "recorded_at_ns", out.accounted_at_ns) ||
-                    out.accounted_at_ns < 0) return false;
-            }
+            if (!integer_member(root, "schema", schema) || schema != 1) return false;
             const provider::json::Value* instance = root.find("instance_id");
-            const provider::json::Value* tenant = root.find("tenant_id");
-            const provider::json::Value* user = root.find("user_id");
             if (!instance || instance->type != provider::json::Value::Type::String ||
-                instance->sv.size() != 32 ||
-                !tenant || tenant->type != provider::json::Value::Type::String ||
-                tenant->sv.size() > 64 || tenant->sv.find('\\') != std::string_view::npos ||
-                !user || user->type != provider::json::Value::Type::String ||
-                user->sv.size() > 64 || user->sv.find('\\') != std::string_view::npos)
-                return false;
+                instance->sv.size() != 32) return false;
             const auto parse_hex = [](std::string_view value, uint64_t& number) noexcept {
                 const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(),
                                                        number, 16);
@@ -134,6 +119,33 @@ namespace llmbridge::app
             };
             if (!parse_hex(instance->sv.substr(0, 16), out.key.instance_hi) ||
                 !parse_hex(instance->sv.substr(16), out.key.instance_lo)) return false;
+            const provider::json::Value* kind = root.find("kind");
+            if (kind)
+            {
+                if (kind->type != provider::json::Value::Type::String || !recorded ||
+                    !integer_member(root, "recorded_at_ns", out.accounted_at_ns) ||
+                    out.accounted_at_ns < 0) return false;
+                if (kind->sv == "session_start") out.kind = ReplayKind::SessionStart;
+                else if (kind->sv == "session_end") out.kind = ReplayKind::SessionEnd;
+                else return false;
+                return true;
+            }
+            if (!integer_member(root, "request_seq", out.key.request_seq) ||
+                !integer_member(root, "attempt", out.key.attempt) ||
+                !integer_member(root, "wall_t0_ns", wall_t0_ns) || wall_t0_ns < 0 ||
+                !integer_member(root, "tokens_in", out.tokens_in) || out.tokens_in < -1 ||
+                !integer_member(root, "tokens_out", out.tokens_out) || out.tokens_out < -1 ||
+                !bool_member(root, "upstream_sent", out.upstream_sent)) return false;
+            out.accounted_at_ns = wall_t0_ns;
+            if (recorded && (!integer_member(root, "recorded_at_ns", out.accounted_at_ns) ||
+                             out.accounted_at_ns < 0)) return false;
+            const provider::json::Value* tenant = root.find("tenant_id");
+            const provider::json::Value* user = root.find("user_id");
+            if (!tenant || tenant->type != provider::json::Value::Type::String ||
+                tenant->sv.size() > 64 || tenant->sv.find('\\') != std::string_view::npos ||
+                !user || user->type != provider::json::Value::Type::String ||
+                user->sv.size() > 64 || user->sv.find('\\') != std::string_view::npos)
+                return false;
             out.tenant = tenant->sv;
             out.user = user->sv;
             if (!out.upstream_sent && (out.tokens_in >= 0 || out.tokens_out >= 0)) return false;
@@ -272,15 +284,26 @@ namespace llmbridge::app
         }
         fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (fd_ < 0) throw std::runtime_error("cannot open audit ledger: " + std::string(std::strerror(errno)));
+        if (::flock(fd_, LOCK_EX | LOCK_NB) != 0)
+        {
+            ::close(fd_);
+            fd_ = -1;
+            throw std::runtime_error("audit ledger is already open by another process");
+        }
+        bool session_started = false;
         try
         {
             recover();
             for (size_t i = 0; i < kCapacity; ++i)
                 queue_[i].sequence.store(i, std::memory_order_relaxed);
+            if (!append_control("session_start"))
+                throw std::runtime_error("cannot persist audit ledger session start");
+            session_started = true;
             thread_ = std::thread([this] { writer_loop(); });
         }
         catch (...)
         {
+            if (session_started) (void)append_control("session_end");
             ::close(fd_);
             fd_ = -1;
             throw;
@@ -292,6 +315,8 @@ namespace llmbridge::app
         stopping_.store(true, std::memory_order_release);
         cv_.notify_one();
         if (thread_.joinable()) thread_.join();
+        if (healthy_.load(std::memory_order_acquire) && !append_control("session_end"))
+            healthy_.store(false, std::memory_order_release);
         if (fd_ >= 0) ::close(fd_);
     }
 
@@ -310,6 +335,16 @@ namespace llmbridge::app
                                    std::chrono::system_clock::now().time_since_epoch()).count();
         const UtcPeriod current = period_at(now_ns);
         std::unordered_set<ReplayKey, ReplayKeyHash> seen;
+        bool session_open = false;
+        ReplayKey open_session;
+        const auto mark_unclean = [&](int64_t detected_at_ns) {
+            const UtcPeriod period = period_at(detected_at_ns);
+            for (ReplayedUsage& usage : replayed_usage_)
+            {
+                if (period.month == current.month) usage.monthly_unknown = true;
+                if (period.day == current.day) usage.daily_unknown = true;
+            }
+        };
         while (offset < st.st_size)
         {
             const ssize_t n = ::pread(fd_, block, sizeof block, offset);
@@ -329,6 +364,25 @@ namespace llmbridge::app
                 ReplayRecord record;
                 if (!parse_replay_record(std::string_view(pending).substr(0, newline), record))
                     throw std::runtime_error("audit ledger record is invalid");
+                if (record.kind == ReplayKind::SessionStart)
+                {
+                    if (session_open) mark_unclean(record.accounted_at_ns);
+                    session_open = true;
+                    open_session = record.key;
+                    valid_end += static_cast<off_t>(newline + 1);
+                    pending.erase(0, newline + 1);
+                    continue;
+                }
+                if (record.kind == ReplayKind::SessionEnd)
+                {
+                    if (!session_open || open_session.instance_hi != record.key.instance_hi ||
+                        open_session.instance_lo != record.key.instance_lo)
+                        throw std::runtime_error("audit ledger session markers do not match");
+                    session_open = false;
+                    valid_end += static_cast<off_t>(newline + 1);
+                    pending.erase(0, newline + 1);
+                    continue;
+                }
                 const UtcPeriod period = period_at(record.accounted_at_ns);
                 if (period.month == current.month)
                 {
@@ -366,6 +420,7 @@ namespace llmbridge::app
         // 进程可能死在一次追加中间；只有无换行的尾部可安全丢弃，完整坏记录拒绝启动。
         if (!pending.empty() && ::ftruncate(fd_, valid_end) != 0)
             throw std::runtime_error("cannot truncate partial audit ledger tail");
+        if (session_open) mark_unclean(now_ns);
         if (::lseek(fd_, 0, SEEK_END) < 0) throw std::runtime_error("cannot seek audit ledger");
     }
 
@@ -388,6 +443,7 @@ namespace llmbridge::app
         {
             copy_text(entry.tenant, users_[tagged_user - 1].tenant_id);
             copy_text(entry.user, users_[tagged_user - 1].user_id);
+            copy_text(entry.key_version, users_[tagged_user - 1].key_version);
         }
         copy_text(entry.requested_model, r.requested_model);
         copy_text(entry.model, r.model);
@@ -449,6 +505,7 @@ namespace llmbridge::app
             field(line, "attempt", r.attempt);
             append_text(line, "tenant_id", e.tenant.data, e.tenant.size);
             append_text(line, "user_id", e.user.data, e.user.size);
+            append_text(line, "key_version", e.key_version.data, e.key_version.size);
             append_text(line, "provider_id", e.provider.data, e.provider.size);
             field(line, "upstream_index", r.upstream_index);
             field(line, "status", r.status);
@@ -504,6 +561,32 @@ namespace llmbridge::app
             line.pop_back();
             char suffix[32];
             const int n = std::snprintf(suffix, sizeof suffix, ",\"crc32\":\"%08x\"}\n", checksum);
+            line.append(suffix, static_cast<size_t>(n));
+            return write_all(fd_, line) && ::fdatasync(fd_) == 0;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool AuditLedger::append_control(std::string_view kind) noexcept
+    {
+        try
+        {
+            std::string line = "{\"schema\":1,\"kind\":";
+            json_string(line, kind);
+            line += ",\"instance_id\":";
+            json_string(line, instance_id_);
+            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch()).count();
+            field(line, "recorded_at_ns", now_ns);
+            line.push_back('}');
+            const uint32_t checksum = crc32(line);
+            line.pop_back();
+            char suffix[32];
+            const int n = std::snprintf(suffix, sizeof suffix, ",\"crc32\":\"%08x\"}\n",
+                                        checksum);
             line.append(suffix, static_cast<size_t>(n));
             return write_all(fd_, line) && ::fdatasync(fd_) == 0;
         }

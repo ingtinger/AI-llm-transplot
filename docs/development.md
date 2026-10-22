@@ -81,4 +81,4 @@ ctest --test-dir build-wsl -R '^(AppMultiUpstreamFailover|AppStatusRetry)$' --ou
 
 ## 6. 当前完成情况与下一步
 
-已完成多上游路由、边界测试、管理端点、阶段三的静态安全模式，以及阶段四的完整错误响应切换、秒数/日期 `Retry-After` 限流、普通故障的有界退避、每模型独立上游池和 `SIGHUP` 原子摘除。`app/tests/model_pools_e2e.py` 验证跨模型隔离，`app/tests/hot_reload_e2e.py` 验证并发摘除与非法变更回退。逐尝试审计账本可在重启时恢复当前日/月额度，但尚无尝试开始记录，进程在事件落盘前崩溃仍可能留下无法识别的未结算调用；修改上游地址、密钥或用户仍须重启。TLS 已通过独立构建与测试，仓库也提供 Docker Compose 和 systemd 样例，但当前环境没有 Docker，容器启动与故障切换演示尚未实测；详情见[用量与审计边界](accounting.md)、[可靠性验证](reliability.md)和[部署说明](deployment.md)。Redis 共享状态尚未实现。
+已完成多上游路由、边界测试、管理端点、阶段三的静态安全模式与单机保守审计闭环，以及阶段四的完整错误响应切换、秒数/日期 `Retry-After` 限流、普通故障的有界退避、每模型独立上游池和 `SIGHUP` 原子摘除。`app/tests/model_pools_e2e.py` 验证跨模型隔离，`app/tests/hot_reload_e2e.py` 验证并发摘除与非法变更回退。逐尝试账本可在重启时恢复当前日/月额度；异常退出缺少 clean end 时把额度标为 unknown，防止异步尾部丢失被误计为零。修改上游地址、密钥或用户仍须重启。TLS 已通过独立构建与测试，仓库也提供 Docker Compose 和 systemd 样例，但当前环境没有 Docker，容器启动与故障切换演示尚未实测；详情见[用量与审计边界](accounting.md)、[可靠性验证](reliability.md)和[部署说明](deployment.md)。Redis 共享状态尚未实现。

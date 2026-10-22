@@ -30,7 +30,7 @@ namespace llmbridge::app
 
     struct UserSettings
     {
-        std::string id, tenant, key_env;
+        std::string id, tenant, key_env, key_version;
         std::vector<std::string> models;
         std::vector<int> upstreams;
         int requests_per_minute = 60;

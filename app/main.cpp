@@ -356,7 +356,8 @@ static int run(int argc, char** argv)
         for (const auto& venue : cfg.more_upstreams) provider_ids.push_back(venue.id);
         std::vector<llmbridge::app::AuditUser> audit_users;
         audit_users.reserve(cfg.users.size());
-        for (const auto& user : cfg.users) audit_users.push_back({user.tenant, user.id});
+        for (const auto& user : cfg.users)
+            audit_users.push_back({user.tenant, user.id, user.key_version});
         audit_ledger = std::make_unique<llmbridge::app::AuditLedger>(
             cfg.audit_ledger_path, *price_table, std::move(provider_ids), std::move(audit_users));
     }

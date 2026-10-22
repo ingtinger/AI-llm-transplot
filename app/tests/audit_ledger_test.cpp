@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <fcntl.h>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -65,6 +68,17 @@ namespace
         std::ifstream in(path, std::ios::binary);
         return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     }
+
+    size_t count_text(std::string_view text, std::string_view needle)
+    {
+        size_t count = 0, at = 0;
+        while ((at = text.find(needle, at)) != std::string_view::npos)
+        {
+            ++count;
+            at += needle.size();
+        }
+        return count;
+    }
 }
 
 TEST(AuditLedger, PersistsStableIdentitiesUsagePriceAndChecksumWithoutContent)
@@ -72,13 +86,15 @@ TEST(AuditLedger, PersistsStableIdentitiesUsagePriceAndChecksumWithoutContent)
     const std::string path = temporary_path();
     const auto table = prices();
     {
-        llmbridge::app::AuditLedger ledger(path, table, {"provider-a"}, {{"tenant-a", "alice"}});
+        llmbridge::app::AuditLedger ledger(path, table, {"provider-a"},
+                                           {{"tenant-a", "alice", "alice-v1"}});
         ledger.on_attempt(attempt(7));
     }
     const std::string text = read_all(path);
     EXPECT_NE(text.find("\"request_seq\":7"), std::string::npos);
     EXPECT_NE(text.find("\"tenant_id\":\"tenant-a\""), std::string::npos);
     EXPECT_NE(text.find("\"user_id\":\"alice\""), std::string::npos);
+    EXPECT_NE(text.find("\"key_version\":\"alice-v1\""), std::string::npos);
     EXPECT_NE(text.find("\"provider_id\":\"provider-a\""), std::string::npos);
     EXPECT_NE(text.find("\"provider_request_id\":\"provider-request-42\""), std::string::npos);
     EXPECT_NE(text.find("\"calculated_cost_pdollars\":40"), std::string::npos);
@@ -110,7 +126,7 @@ TEST(AuditLedger, RecoversOnlyAnIncompleteCrashTailAndKeepsEarlierRecords)
     EXPECT_EQ(text.find("partial-crash-tail"), std::string::npos);
     EXPECT_NE(text.find("\"request_seq\":1"), std::string::npos);
     EXPECT_NE(text.find("\"request_seq\":2"), std::string::npos);
-    EXPECT_EQ(static_cast<size_t>(std::count(text.begin(), text.end(), '\n')), 2u);
+    EXPECT_EQ(count_text(text, "\"request_seq\":"), 2u);
     ::unlink(path.c_str());
 }
 
@@ -161,7 +177,7 @@ TEST(AuditLedger, DrainsConcurrentProducersWithoutLosingRecords)
         EXPECT_TRUE(ledger.healthy());
     }
     const std::string text = read_all(path);
-    EXPECT_EQ(static_cast<size_t>(std::count(text.begin(), text.end(), '\n')), 400u);
+    EXPECT_EQ(count_text(text, "\"request_seq\":"), 400u);
     ::unlink(path.c_str());
 }
 
@@ -212,13 +228,106 @@ TEST(AuditLedger, RefusesDuplicateAttemptIdentityInTheCurrentMonth)
         ledger.on_attempt(current);
     }
     const std::string original = read_all(path);
+    const size_t request = original.find("\"request_seq\":601");
+    ASSERT_NE(request, std::string::npos);
+    const size_t begin = original.rfind('\n', request);
+    const size_t end = original.find('\n', request);
+    ASSERT_NE(end, std::string::npos);
+    const std::string duplicate = original.substr(begin == std::string::npos ? 0 : begin + 1,
+                                                   end - (begin == std::string::npos ? 0 : begin + 1) + 1);
     const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND);
     ASSERT_GE(fd, 0);
-    ASSERT_EQ(::write(fd, original.data(), original.size()),
-              static_cast<ssize_t>(original.size()));
+    ASSERT_EQ(::write(fd, duplicate.data(), duplicate.size()),
+              static_cast<ssize_t>(duplicate.size()));
     ::close(fd);
     EXPECT_THROW((llmbridge::app::AuditLedger(path, table, {"provider-a"},
                                                {{"tenant-a", "alice"}})),
                  std::runtime_error);
+    ::unlink(path.c_str());
+}
+
+TEST(AuditLedger, RefusesASecondWriterForTheSameLedger)
+{
+    const std::string path = temporary_path();
+    const auto table = prices();
+    {
+        llmbridge::app::AuditLedger first(path, table, {"provider-a"},
+                                          {{"tenant-a", "alice"}});
+        EXPECT_THROW((llmbridge::app::AuditLedger(path, table, {"provider-a"},
+                                                   {{"tenant-a", "alice"}})),
+                     std::runtime_error);
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(AuditLedger, UncleanSessionRestoresQuotaAsUnknown)
+{
+    const std::string path = temporary_path();
+    const auto table = prices();
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0)
+    {
+        try
+        {
+            llmbridge::app::AuditLedger ledger(path, table, {"provider-a"},
+                                               {{"tenant-a", "alice"}, {"tenant-b", "bob"}});
+            ::_exit(0); // 模拟 SIGKILL：不运行析构，账本只有已同步的 session_start。
+        }
+        catch (...)
+        {
+            ::_exit(2);
+        }
+    }
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    {
+        llmbridge::app::AuditLedger recovered(path, table, {"provider-a"},
+                                               {{"tenant-a", "alice"}, {"tenant-b", "bob"}});
+        const auto usage = recovered.replayed_usage();
+        ASSERT_EQ(usage.size(), 2u);
+        EXPECT_TRUE(usage[0].daily_unknown);
+        EXPECT_TRUE(usage[0].monthly_unknown);
+        EXPECT_TRUE(usage[1].daily_unknown);
+        EXPECT_TRUE(usage[1].monthly_unknown);
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(AuditLedger, WriteFailurePermanentlyLowersTheHealthFlag)
+{
+    const std::string path = temporary_path();
+    const auto table = prices();
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0)
+    {
+        try
+        {
+            llmbridge::app::AuditLedger ledger(path, table, {"provider-a"},
+                                               {{"tenant-a", "alice", "alice-v1"}});
+            struct stat st{};
+            if (::stat(path.c_str(), &st) != 0) ::_exit(2);
+            const rlimit limit{static_cast<rlim_t>(st.st_size), static_cast<rlim_t>(st.st_size)};
+            if (::setrlimit(RLIMIT_FSIZE, &limit) != 0) ::_exit(3);
+            std::signal(SIGXFSZ, SIG_IGN);
+            auto record = attempt(701);
+            record.wall_t0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count();
+            ledger.on_attempt(record);
+            for (int i = 0; i < 200 && ledger.healthy(); ++i) ::usleep(10'000);
+            ::_exit(ledger.healthy() ? 4 : 0);
+        }
+        catch (...)
+        {
+            ::_exit(5);
+        }
+    }
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
     ::unlink(path.c_str());
 }

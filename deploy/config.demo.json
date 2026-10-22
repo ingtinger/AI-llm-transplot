@@ -29,6 +29,7 @@
         "id": "alice",
         "tenant": "demo",
         "key_env": "GATEWAY_ALICE_KEY",
+        "key_version": "alice-v1",
         "models": ["chat-default"],
         "upstreams": [0, 1],
         "requests_per_minute": 60,

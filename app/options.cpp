@@ -572,12 +572,16 @@ namespace llmbridge::app
                         for (const auto& [field, value] : item.obj)
                         {
                             if (is_comment(field)) continue;
-                            if (field == "id" || field == "tenant" || field == "key_env")
+                            if (field == "id" || field == "tenant" || field == "key_env" ||
+                                field == "key_version")
                             {
                                 if (value.type != json::Value::Type::String || value.sv.empty() ||
                                     value.sv.size() > 64 || value.sv.find('\\') != std::string_view::npos)
                                     return fail(err, "config: security.users identity fields must be plain strings (1..64)");
-                                (field == "id" ? user.id : field == "tenant" ? user.tenant : user.key_env) = value.sv;
+                                (field == "id" ? user.id
+                                 : field == "tenant" ? user.tenant
+                                 : field == "key_env" ? user.key_env
+                                                      : user.key_version) = value.sv;
                             }
                             else if (field == "models")
                             {
@@ -778,8 +782,10 @@ namespace llmbridge::app
             return fail(err, "config: accounting.ledger_path requires accounting.prices");
         if (!s.audit_ledger_path.empty())
             for (const UserSettings& user : s.users)
-                if (!stable_id_ok(user.id) || !stable_id_ok(user.tenant))
-                    return fail(err, "config: audit ledger requires stable user and tenant ids");
+                if (!stable_id_ok(user.id) || !stable_id_ok(user.tenant) ||
+                    !stable_id_ok(user.key_version))
+                    return fail(err,
+                                "config: audit ledger requires stable user, tenant and key version ids");
         return true;
     }
 

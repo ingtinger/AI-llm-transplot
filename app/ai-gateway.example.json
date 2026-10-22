@@ -27,10 +27,10 @@
   "security": {
     "enabled": true,
     "allow_insecure_http": false,
-    "_users_constraint": "每个用户的 id 和 key_env 必须全局唯一；models 与 upstreams 列表内部不得重复。",
+    "_users_constraint": "每个用户的 id 和 key_env 必须全局唯一；启用审计账本时还必须设置稳定 key_version，轮换虚拟 Key 时递增；models 与 upstreams 列表内部不得重复。",
     "users": [
       {
-        "id": "alice", "tenant": "team-a", "key_env": "GATEWAY_ALICE_KEY",
+        "id": "alice", "tenant": "team-a", "key_env": "GATEWAY_ALICE_KEY", "key_version": "alice-v1",
         "models": ["chat-default"], "upstreams": [0, 1],
         "requests_per_minute": 60, "max_concurrent": 4,
         "daily_tokens": 100000, "monthly_tokens": 1000000,

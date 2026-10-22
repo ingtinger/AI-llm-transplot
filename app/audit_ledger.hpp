@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace llmbridge::app
@@ -22,6 +23,13 @@ namespace llmbridge::app
     {
         std::string tenant_id;
         std::string user_id;
+        std::string key_version;
+
+        AuditUser(std::string tenant, std::string user, std::string version = {})
+            : tenant_id(std::move(tenant)), user_id(std::move(user)),
+              key_version(std::move(version))
+        {
+        }
     };
 
     struct ReplayedUsage
@@ -66,7 +74,7 @@ namespace llmbridge::app
         {
             AttemptRecord record;
             int64_t recorded_at_ns = 0;
-            Text<65> tenant, user, provider, price_version, prior_price_version;
+            Text<65> tenant, user, key_version, provider, price_version, prior_price_version;
             Text<513> price_source, prior_price_source;
             Text<65> requested_model;
             Text<256> model;
@@ -84,6 +92,7 @@ namespace llmbridge::app
         void recover();
         void writer_loop() noexcept;
         bool append(const Entry& entry) noexcept;
+        bool append_control(std::string_view kind) noexcept;
 
         std::string path_;
         const PriceTable& prices_;

@@ -145,7 +145,12 @@ TEST(Config, AuditLedgerRequiresAPathPricesAndStableProviderIds)
     const std::string unstable_identity =
         R"({"upstream":{"id":"primary"},"security":{"users":[{"id":"bad user","tenant":"tenant","key_env":"USER_KEY","models":["m"],"upstreams":[0]}]},"accounting":{"ledger_path":"/tmp/audit.jsonl","prices":[{"provider":"primary","model":"m","version":"v","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1,"output":2}}]}})";
     EXPECT_FALSE(parse_config(unstable_identity, accepted, err));
-    EXPECT_NE(err.find("stable user and tenant ids"), std::string::npos) << err;
+    EXPECT_NE(err.find("stable user, tenant and key version ids"), std::string::npos) << err;
+
+    const std::string missing_key_version =
+        R"({"upstream":{"id":"primary"},"security":{"users":[{"id":"alice","tenant":"tenant","key_env":"USER_KEY","models":["m"],"upstreams":[0]}]},"accounting":{"ledger_path":"/tmp/audit.jsonl","prices":[{"provider":"primary","model":"m","version":"v","source":"s","valid_from_unix_s":0,"valid_until_unix_s":0,"rates":{"input":1,"output":2}}]}})";
+    EXPECT_FALSE(parse_config(missing_key_version, accepted, err));
+    EXPECT_NE(err.find("key version ids"), std::string::npos) << err;
 }
 
 TEST(Config, UnreadablePathIsNotEchoed)

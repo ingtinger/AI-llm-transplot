@@ -151,9 +151,12 @@ def main(binary: Path) -> None:
         ],
         "routing": {"mode": "first", "max_attempts": 2, "failure_threshold": 1, "cooldown_s": 30},
         "security": {"enabled": True, "allow_insecure_http": True, "users": [
-            {"id": "alice", "tenant": "team-a", "key_env": "ALICE_KEY", "models": ["chat-a"],
-             "upstreams": [0, 1], "requests_per_minute": 1, "max_concurrent": 1},
-            {"id": "bob", "tenant": "team-b", "key_env": "BOB_KEY", "models": ["chat-b"],
+            {"id": "alice", "tenant": "team-a", "key_env": "ALICE_KEY",
+             "key_version": "alice-v1", "models": ["chat-a"],
+             "upstreams": [0, 1], "requests_per_minute": 1, "max_concurrent": 1,
+             "daily_tokens": 100, "monthly_tokens": 100},
+            {"id": "bob", "tenant": "team-b", "key_env": "BOB_KEY",
+             "key_version": "bob-v1", "models": ["chat-b"],
              "upstreams": [1], "requests_per_minute": 2, "max_concurrent": 1,
              "daily_tokens": 5, "monthly_tokens": 5},
         ]},
@@ -205,7 +208,11 @@ def main(binary: Path) -> None:
             while time.monotonic() < deadline:
                 if ledger_path.exists():
                     ledger_bytes = ledger_path.read_bytes()
-                    if len(ledger_bytes.splitlines()) == 3:
+                    try:
+                        persisted = [json.loads(line) for line in ledger_bytes.splitlines()]
+                    except json.JSONDecodeError:
+                        persisted = []
+                    if len([record for record in persisted if "kind" not in record]) == 3:
                         break
                 time.sleep(0.01)
             else:
@@ -230,6 +237,26 @@ def main(binary: Path) -> None:
             assert request(port, bob, "chat-b")[0] == 429
             assert Mock.received == [(f"Bearer {provider_b}", "", "model-b"),
                                      (f"Bearer {provider_b}", "", "model-b")], Mock.received
+            process.kill()
+            _, killed_stderr = process.communicate(timeout=5)
+            stderr_parts.append(killed_stderr)
+            process = subprocess.Popen([str(binary), "--config", str(path)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise AssertionError(process.stderr.read().decode(errors="replace"))
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                        break
+                except OSError:
+                    time.sleep(0.02)
+            else:
+                raise AssertionError("gateway after unclean shutdown did not listen")
+            # 上一进程没有 session_end，潜在未落盘调用使所有额度用户保守关闭。
+            assert request(port, alice, "chat-a")[0] == 429
+            assert Mock.received == [(f"Bearer {provider_b}", "", "model-b"),
+                                     (f"Bearer {provider_b}", "", "model-b")], Mock.received
     finally:
         if process is not None:
             process.terminate()
@@ -240,13 +267,16 @@ def main(binary: Path) -> None:
             for secret in (alice, bob, provider_a, provider_b, "private-prompt"):
                 assert secret.encode() not in stderr
             assert b'"tokens_in":3' in stderr and b'"tokens_out":2' in stderr, stderr
-            records = [json.loads(line) for line in ledger_bytes.decode().splitlines()]
+            all_records = [json.loads(line) for line in ledger_bytes.decode().splitlines()]
+            assert any(record.get("kind") == "session_start" for record in all_records)
+            records = [record for record in all_records if "kind" not in record]
             assert len(records) == 3, records
             retried = {}
             for record in records:
                 retried.setdefault(record["request_seq"], []).append(record)
                 assert record["tenant_id"] in ("team-a", "team-b")
                 assert record["user_id"] in ("alice", "bob")
+                assert record["key_version"] in ("alice-v1", "bob-v1")
                 assert len(record["instance_id"]) == 32
                 assert len(record["crc32"]) == 8
             pair = next(group for group in retried.values() if len(group) == 2)
