@@ -77,13 +77,13 @@ CI 使用 Clang/libFuzzer 配合 ASan/UBSan，分别覆盖 JSON、HTTP、HTTP �
 - `LLMBRIDGE_WERROR=ON` 构建通过只说明当前编译器没有警告，不说明逻辑正确。
 - TLS 测试使用本地证书与 Mock，仍需在部署环境验证证书来源、有效期、权限和轮换。
 - 单机内存限额不提供多实例精确计费；显式开启不安全重放可能重复执行上游请求。
-- Docker/Compose、systemd、压力基准和生产网络限制属于阶段五后续任务。
+- Docker/Compose、systemd 和本机压力基准已完成阶段五可复现验收；生产网络、证书来源、容量和多实例状态仍须在实际部署环境单独验证。
 
 ## 2026-10-20 续开发验证
 
 修复管理端点的请求头长度判定和慢速请求头占用问题后，普通 Release / `LLMBRIDGE_WERROR=ON` 构建通过，完整 CTest **2216/2216 通过**。`AppManagement` 新增短请求头与大请求体同批到达、慢速请求头两种真实进程场景。独立的 `LLMBRIDGE_TLS=ON` / `LLMBRIDGE_BUILD_TESTS=OFF` / `LLMBRIDGE_WERROR=ON` 构建也通过，网关二进制可执行 `--help`。
 
-新增的 Docker Compose、镜像与 systemd 样例已完成 JSON/YAML 语法及配置解析检查；本机无 Docker，未执行容器启动或故障切换演示。systemd 静态检查只提示示例路径 `/usr/local/bin/llmbridge` 尚未在本机安装，部署时须先安装二进制、配置与证书。
+新增的 Docker Compose、镜像与 systemd 样例已完成 JSON/YAML 语法及配置解析检查。当前 WSL 主机没有 Docker；GitHub Actions `39789558369` 在 Ubuntu Docker runner 中实际构建镜像，并由 `deploy/smoke_test.sh` 验证 TLS 请求、停止主 Mock 后转移到备用上游以及清理流程，job 用时 2 分 57 秒并通过。systemd 静态检查只提示示例路径 `/usr/local/bin/llmbridge` 尚未在本机安装，部署时须先安装二进制、配置与证书。
 
 旧基准脚本在网关默认要求显式选择安全模式后无法启动进程；本轮为仅连接本地 Mock 的脚本加上 `--legacy-mode`，并让主延迟及饱和度脚本只停止自己启动的子进程。以下低负载命令用于冒烟验证，不作为性能结论：
 

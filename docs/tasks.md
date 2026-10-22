@@ -4,7 +4,7 @@
 
 ## 当前起点
 
-工程已基于 `llmbridge` 实现多上游路由、故障切换、阶段二管理端点，以及阶段三的静态安全模式。**无认证兼容模式必须显式开启；额度仅在单进程内存中，不适合直接作为公网多租户计费服务。**
+工程已基于 `llmbridge` 完成计划中的多上游数据面、可观测、安全用户、单机保守账务、可靠性和交付材料。**无认证兼容模式必须显式开启；账本与额度仍限定为单进程，不适合直接作为公网多实例精确计费服务。**
 
 依赖顺序：**阶段一收尾 → 阶段二可观测 → 阶段三多用户最小闭环 → 阶段四可靠性 → 阶段五交付**。优先做出可验证的单机服务，再考虑 Redis、多实例或复杂调度。
 
@@ -134,17 +134,19 @@ ctest --test-dir build-wsl -R '^AppStatusRetry$' \
 
 **目标：**从“能在开发机运行”走到“别人能复现、能评估”。
 
-**当前进度（2026-10-20）：**已在 WSL2 Ubuntu 24.04 / GCC 13.3 / OpenSSL 3.0.13 的独立 TLS 构建中通过 `LLMBRIDGE_WERROR=ON` 编译、TLS 专项 **114/114** 和全量 CTest **2345/2345**。构建方法与边界记录在 `docs/reliability.md`；这只完成阶段五的 TLS 验证，不等于容器部署、消毒器或性能验收完成。
+**TLS 进度（2026-10-20）：**已在 WSL2 Ubuntu 24.04 / GCC 13.3 / OpenSSL 3.0.13 的独立 TLS 构建中通过 `LLMBRIDGE_WERROR=ON` 编译、TLS 专项 **114/114** 和全量 CTest **2345/2345**。构建方法与边界记录在 `docs/reliability.md`。
 
-**可靠性补充验收（2026-10-20）：**独立 Debug ASan/UBSan 构建及选定测试 **48/48 通过**；WSL2 下以 `setarch x86_64 -R` 运行 TSan，路由策略 **21/21** 和真实进程热加载 **1/1** 通过，未报告数据竞争。普通启动 TSan 会因 WSL 内存映射布局在测试前失败，原生 Linux/CI 仍需复测。sanitizer 结果仅覆盖选定路径，不是全量消毒器验收；Fuzz、部署与性能任务保持未完成。
+**可靠性补充验收（2026-10-20）：**独立 Debug ASan/UBSan 构建及选定测试 **48/48 通过**；WSL2 下以 `setarch x86_64 -R` 运行 TSan，路由策略 **21/21** 和真实进程热加载 **1/1** 通过，未报告数据竞争。普通启动 TSan 会因 WSL 内存映射布局在测试前失败；原生 Linux CI 已覆盖 TLS ASan/UBSan、TSan 和九类 Fuzz 目标。
 
-- [ ] 提供可复现的 Dockerfile、Compose 和 systemd 示例；明确 TLS 终止、管理端点绑定、日志轮转、密钥注入和优雅停止方式。已提交本机双 Mock TLS Compose、Dockerfile、systemd 单元及操作文档；当前环境无 Docker，尚未完成容器实际启动验收。
+- [x] 提供可复现的 Dockerfile、Compose 和 systemd 示例；明确 TLS 终止、管理端点绑定、日志轮转、密钥注入和优雅停止方式。GitHub Actions `39789558369` 的 Docker job 在 Ubuntu runner 实际构建镜像并通过 TLS 双 Mock 故障切换；systemd 单元与操作边界记录在部署文档。
 - [x] 增加 AddressSanitizer、ThreadSanitizer 验证；针对网络解析和配置输入考虑 Fuzz 测试。CI 全量运行 TLS ASan/UBSan、TSan，并对九类外部输入执行带种子的 Clang/libFuzzer；本机还完成关键路由、热加载、安全用户和账本路径的定向验证。
 - [x] 建立固定硬件/编译参数/Mock 行为的吞吐、P50/P99、SSE 并发与故障注入基准；同时报告失败率和资源占用，不只报告最高 QPS。当前分支的命令、CPU、峰值 RSS、完成/错误数、容量拐点及 Mock 饱和边界记录在 `docs/performance-2026-10-22.md`。
 - [x] 整理架构图、配置示例、演示脚本及“一个上游失效后请求转移”的可复现录像/操作步骤。`docs/architecture.md` 记录线程、所有权和重试边界；`deploy/smoke_test.sh` 自动完成 TLS 双 Mock 故障切换，手工步骤保留在部署文档。
 - [x] 在 README 中写清楚上游项目贡献与本分支新增内容，保留 Apache-2.0 的 `LICENSE`、`NOTICE` 和归属信息。
 
 **验收：**新机器按中文 README 能构建、运行测试、启动两个 Mock 上游并重现故障切换；性能数字有测试命令和环境，不能引用上游基准冒充本分支实测。
+
+**阶段五完成记录（2026-10-22）：**本机 Release/Werror 全量 CTest **2264/2264** 通过；四组真实进程故障用例各重复 5 次，共 20 次无失败；Docker Compose TLS 故障切换在 GitHub Ubuntu runner 通过。架构、部署、性能、许可证归属和剩余生产边界均已落档。至此本文件定义的五阶段开发流程全部完成；Redis、多实例精确额度、严格预授权、自动 Provider 对账和完整配置热替换属于明确列出的未来扩展，不作为本轮流程未完成项。
 
 ## 每阶段统一完成标准
 
