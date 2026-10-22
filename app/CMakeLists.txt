@@ -3,7 +3,8 @@
 
 # The option table (flags, config file, --help) as a library, so it is tested
 # without running main().
-add_library(llmbridge_options STATIC options.cpp routing_policy.cpp observability.cpp management_server.cpp)
+add_library(llmbridge_options STATIC options.cpp routing_policy.cpp observability.cpp
+        management_server.cpp accounting.cpp)
 target_link_libraries(llmbridge_options PUBLIC gateway provider)
 target_include_directories(llmbridge_options PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -92,7 +93,8 @@ endif ()
 
 if (LLMBRIDGE_BUILD_TESTS)
     include(GoogleTest)
-    add_executable(app_options_test tests/config_test.cpp tests/cli_test.cpp tests/routing_policy_test.cpp)
+    add_executable(app_options_test tests/config_test.cpp tests/cli_test.cpp
+            tests/routing_policy_test.cpp tests/accounting_test.cpp)
     target_link_libraries(app_options_test PRIVATE llmbridge_options GTest::gtest_main)
     target_compile_definitions(app_options_test PRIVATE
             LLMBRIDGE_EXAMPLE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/llmbridge.example.json"
