@@ -254,6 +254,10 @@ namespace llmbridge::detail
         [[nodiscard]] const char* capture_model(ClientConn* c) noexcept; // why to refuse, or null
         [[nodiscard]] static uint64_t prefix_hash_of(std::string_view lead) noexcept; // RequestFacts::prefix_hash
         void sink_emit(ClientConn* c, int status, bool streamed) noexcept;
+        void sink_emit_attempt(ClientConn* c, int status, AttemptOutcome outcome,
+                               bool response_received, bool retrying,
+                               bool streamed = false) noexcept;
+        void sink_next_attempt(ClientConn* c) noexcept;
         void sweep_idle() noexcept; // heartbeat, pool reaping and every timeout, one walk
         void sweep_client(ClientConn* c, int64_t now, bool busy) noexcept;
 

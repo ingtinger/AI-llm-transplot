@@ -301,6 +301,8 @@ namespace llmbridge::detail
         ++_stats.streamed_body_refusals;
         LB_WARN(ReqId{c->req.f.req_seq}, " streamed body refused (", why, ") after ",
                 static_cast<uint64_t>(c->req.f.body_sent), " bytes went upstream; resetting it");
+        sink_emit_attempt(c, 0, AttemptOutcome::PolicyCut,
+                          /*response_received=*/false, /*retrying=*/false);
         cut_body(c);
         end_body_stream(c, nullptr);
         const bool keys = std::string_view(why).find("key") != std::string_view::npos;

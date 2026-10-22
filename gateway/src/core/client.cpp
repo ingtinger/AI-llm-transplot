@@ -287,6 +287,9 @@ namespace llmbridge::detail
             const Decision r = checked_refusal(c, d);
             LB_WARN(ReqId{f.req_seq}, " confirm refused (", r.reason, ") after ",
                     static_cast<uint64_t>(f.body_sent), " bytes went upstream");
+            if (!f.body_parked)
+                sink_emit_attempt(c, 0, AttemptOutcome::PolicyCut,
+                                  /*response_received=*/false, /*retrying=*/false);
             cut_body(c);
             end_body_stream(c, nullptr);
             error_respond(c, r.deny_status, r.reason, r.message);
@@ -341,12 +344,19 @@ namespace llmbridge::detail
         {
             // The venue holds part of a body it will never get the rest of: reset.
             f.confirm_outcome = ConfirmOutcome::Redone;
+            const bool had_attempt = !f.body_parked;
             if (c->up)
             {
                 ++_stats.streamed_body_redone;
                 if (f.splice && f.member_overrides()) ++_stats.streamed_override_redone;
                 LB_WARN(ReqId{f.req_seq}, " confirm redid the request after ",
                         static_cast<uint64_t>(f.body_sent), " bytes went upstream; resetting it");
+            }
+            if (had_attempt)
+            {
+                sink_emit_attempt(c, 0, AttemptOutcome::PolicyCut,
+                                  /*response_received=*/false, /*retrying=*/true);
+                sink_next_attempt(c);
             }
             cut_body(c);
             if (!apply_decision(c, d)) return false;
@@ -580,6 +590,12 @@ namespace llmbridge::detail
 
     ConnBase* Engine::forget(ClientConn* c) noexcept
     {
+        if (_sink && !c->req.f.sunk && c->req.f.phase != Phase::Idle)
+            sink_emit_attempt(c, c->req.f.streaming ? 200 : 0,
+                              AttemptOutcome::ClientAbandoned,
+                              /*response_received=*/c->req.f.ts_up_recvd > 0,
+                              /*retrying=*/false,
+                              c->req.f.streaming);
         if (_policy && !c->req.f.sunk && c->req.f.phase != Phase::Idle)
             _policy->on_abandon(c->req.f.policy_tag, c->req.f.ts_up_sent > 0);
         if (c->req.f.body_streaming && c->up) reset_venue(c->up);

@@ -30,6 +30,54 @@ namespace llmbridge
         Refused, ///< refused at the last byte, a venue holding part of the body reset
     };
 
+    enum class AttemptOutcome : uint8_t
+    {
+        Response,        ///< 收到完整上游响应，包括会触发重试的错误状态
+        TransportError,  ///< 未收到完整响应的连接、TLS、读写或超时故障
+        ClientAbandoned, ///< 客户端在尝试结束前断开
+        StreamTruncated, ///< SSE 已开始，但没有完整结束
+        HedgeCut,        ///< 另一条并发腿胜出，本腿被主动终止
+        PolicyCut,       ///< 请求体确认改变或拒绝了已开始的上游尝试
+    };
+
+    /// 一次上游尝试的独立审计事件。request_seq 与 wall_t0_ns 标识网关请求，
+    /// attempt 从 0 递增；三者共同组成进程内唯一且可持久化的尝试标识。
+    /// 字符串视图只在 on_attempt() 调用期间有效。所有字段均为元数据，不能含凭据或正文。
+    struct AttemptRecord
+    {
+        uint64_t request_seq = 0;
+        int64_t wall_t0_ns = 0;
+        uint32_t attempt = 0;
+        uint64_t tag = 0;
+        int upstream_index = -1;
+        int status = 0; ///< 上游状态；没有完整上游响应时为 0
+        AttemptOutcome outcome = AttemptOutcome::TransportError;
+        bool upstream_sent = false;
+        bool response_received = false;
+        bool retrying = false;
+        int32_t tokens_in = -1, tokens_out = -1, cached_tokens = -1;
+        int32_t cache_write_tokens = -1, cache_write_5m_tokens = -1,
+                cache_write_1h_tokens = -1;
+        int32_t reasoning_tokens = -1, audio_in_tokens = -1, audio_out_tokens = -1;
+        int32_t accepted_prediction_tokens = -1, rejected_prediction_tokens = -1;
+        int32_t tool_prompt_tokens = -1, image_in_tokens = -1;
+        int32_t web_search_requests = -1, web_fetch_requests = -1,
+                code_exec_requests = -1, file_search_calls = -1;
+        int64_t venue_cost_pdollars = -1;
+        int32_t compaction_in_tokens = -1, compaction_out_tokens = -1,
+                compaction_cached_tokens = -1;
+        int32_t prior_in_tokens = -1, prior_out_tokens = -1, prior_cached_tokens = -1,
+                prior_cache_write_tokens = -1, prior_attempts = -1;
+        std::string_view model;
+        std::string_view served_model;
+        std::string_view venue_req_id;
+        std::string_view prior_model;
+        std::string_view served_speed;
+        std::string_view served_geo;
+        std::string_view served_latency;
+        std::string_view asked_cache_ttl;
+    };
+
     /// Metadata only, like RequestFacts: no body, no credential, no header beyond
     /// the ones the integrator asked to capture. Timestamps are the gateway's
     /// monotonic stamps and 0 when never stamped,
@@ -188,12 +236,15 @@ namespace llmbridge
         bool hedge_cut = false;
     };
 
-    /// Called on the loop thread once per completed request, streams included.
-    /// noexcept and allocation-free expected: it sits after every reply.
+    /// 两个回调都在事件循环线程调用；on_attempt 每次上游尝试一次，on_request
+    /// 每个客户端请求一次（包括流式请求）。实现必须 noexcept 且不阻塞，字符串视图
+    /// 只能在回调期间读取；需要跨回调保存时由接收器自行复制。
     class RequestSink
     {
       public:
         virtual ~RequestSink() = default;
+        /// 每次上游尝试恰好一次；默认空实现保持现有接收器兼容。
+        virtual void on_attempt(const AttemptRecord&) noexcept {}
         virtual void on_request(const RequestRecord&) noexcept = 0;
 
       protected:

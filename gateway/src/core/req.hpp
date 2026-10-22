@@ -144,6 +144,8 @@ namespace llmbridge
         uint32_t upstream_srtt_us = 0;
         uint32_t upstream_min_rtt_us = 0;
         int failover_attempts = 0; ///< venues already tried
+        uint32_t attempt_ordinal = 0; ///< 每次实际上游尝试递增，包含同上游重发
+        bool attempt_sunk = false; ///< 当前尝试已经交给 RequestSink
         /// The translation resolved for the venue in flight; `effective_dialect` only
         /// means something when `translate_body`.
         UpstreamDialect effective_dialect = UpstreamDialect::OpenAI;

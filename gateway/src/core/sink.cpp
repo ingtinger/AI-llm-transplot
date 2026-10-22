@@ -105,8 +105,92 @@ namespace llmbridge::detail
         return net::Sha256::truncated(net::Sha256::hash(lead));
     }
 
+    void Engine::sink_emit_attempt(ClientConn* c, int status, AttemptOutcome outcome,
+                                   bool response_received, bool retrying, bool streamed) noexcept
+    {
+        if (!_sink || c->req.f.attempt_sunk || c->upstream_slot < 0) return;
+        const ReqState& f = c->req.f;
+        const BodyUsage u = streamed ? stream_tokens(c) : f.tok;
+        AttemptRecord a;
+        a.request_seq = f.req_seq;
+        a.wall_t0_ns = f.wall_t0;
+        a.attempt = f.attempt_ordinal;
+        a.tag = f.policy_tag;
+        a.upstream_index = c->upstream_slot;
+        a.status = response_received ? status : 0;
+        a.outcome = outcome;
+        a.upstream_sent = f.ts_up_sent > 0;
+        a.response_received = response_received;
+        a.retrying = retrying;
+        a.tokens_in = static_cast<int32_t>(u.in);
+        a.tokens_out = static_cast<int32_t>(u.out);
+        a.cached_tokens = static_cast<int32_t>(u.cached);
+        a.cache_write_tokens = static_cast<int32_t>(u.cache_write);
+        a.cache_write_5m_tokens = static_cast<int32_t>(u.cache_write_5m);
+        a.cache_write_1h_tokens = static_cast<int32_t>(u.cache_write_1h);
+        a.reasoning_tokens = static_cast<int32_t>(u.reasoning);
+        a.audio_in_tokens = static_cast<int32_t>(u.audio_in);
+        a.audio_out_tokens = static_cast<int32_t>(u.audio_out);
+        a.accepted_prediction_tokens = static_cast<int32_t>(u.accepted_prediction);
+        a.rejected_prediction_tokens = static_cast<int32_t>(u.rejected_prediction);
+        a.tool_prompt_tokens = static_cast<int32_t>(u.tool_prompt);
+        a.image_in_tokens = static_cast<int32_t>(u.image_in);
+        a.web_search_requests = static_cast<int32_t>(u.web_search);
+        a.web_fetch_requests = static_cast<int32_t>(u.web_fetch);
+        a.code_exec_requests = static_cast<int32_t>(u.code_exec);
+        a.file_search_calls = static_cast<int32_t>(u.file_search);
+        a.venue_cost_pdollars = u.venue_cost_pdollars;
+        a.compaction_in_tokens = static_cast<int32_t>(u.compaction_in);
+        a.compaction_out_tokens = static_cast<int32_t>(u.compaction_out);
+        a.compaction_cached_tokens = static_cast<int32_t>(u.compaction_cached);
+        a.prior_in_tokens = static_cast<int32_t>(u.prior_in);
+        a.prior_out_tokens = static_cast<int32_t>(u.prior_out);
+        a.prior_cached_tokens = static_cast<int32_t>(u.prior_cached);
+        a.prior_cache_write_tokens = static_cast<int32_t>(u.prior_cache_write);
+        a.prior_attempts = static_cast<int32_t>(u.prior_attempts);
+        a.model = f.model.view();
+        a.served_model = f.served_model.view();
+        a.venue_req_id = f.venue_req_id.view();
+        a.prior_model = u.prior_model.view();
+        a.served_speed = u.speed.view();
+        a.served_geo = u.inference_geo.view();
+        a.served_latency = f.served_latency.view();
+        a.asked_cache_ttl = f.asked_cache_ttl.view();
+        c->req.f.attempt_sunk = true;
+        _sink->on_attempt(a);
+    }
+
+    void Engine::sink_next_attempt(ClientConn* c) noexcept
+    {
+        ReqState& f = c->req.f;
+        ++f.attempt_ordinal;
+        f.attempt_sunk = false;
+        f.ts_req_built = f.ts_wire_ready = f.ts_up_sent = f.ts_up_recvd = 0;
+        f.ts_first_token = f.ts_first_thinking = f.ts_last_chunk = f.max_chunk_gap_ns = 0;
+        f.ts_body_sent = 0;
+        f.body_work_ns = 0;
+        f.first_send_len = f.first_send_end = 0;
+        f.tok = provider::openai::Usage{};
+        f.upstream_ip = f.upstream_srtt_us = f.upstream_min_rtt_us = 0;
+        f.quota_exhausted = 0;
+        f.retry_after_s = 0;
+        f.served_tier_tries = f.served_model_tries = 0;
+        f.upstream_pooled = false;
+        f.upstream_error.set({});
+        f.venue_req_id.set({});
+        f.served_tier.set({});
+        f.served_latency.set({});
+        f.served_model.set({});
+    }
+
     void Engine::sink_emit(ClientConn* c, int status, bool streamed) noexcept
     {
+        const AttemptOutcome outcome = c->req.f.hedge_cut ? AttemptOutcome::HedgeCut
+            : streamed && c->close_after_resp ? AttemptOutcome::StreamTruncated
+            : c->req.f.ts_up_recvd > 0 ? AttemptOutcome::Response
+                                       : AttemptOutcome::TransportError;
+        sink_emit_attempt(c, status, outcome, c->req.f.ts_up_recvd > 0,
+                          /*retrying=*/false, streamed);
         RequestRecord r;
         r.seq = c->req.f.req_seq;
         r.wall_t0_ns = c->req.f.wall_t0;

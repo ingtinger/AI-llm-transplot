@@ -6608,6 +6608,21 @@ namespace
     class RecordingSink final : public llmbridge::RequestSink
     {
       public:
+        void on_attempt(const llmbridge::AttemptRecord& r) noexcept override
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            AttemptCopy c;
+            c.r = r;
+            c.model.assign(r.model);
+            c.served_model.assign(r.served_model);
+            c.venue_req_id.assign(r.venue_req_id);
+            c.prior_model.assign(r.prior_model);
+            c.served_speed.assign(r.served_speed);
+            c.served_geo.assign(r.served_geo);
+            c.served_latency.assign(r.served_latency);
+            c.asked_cache_ttl.assign(r.asked_cache_ttl);
+            _attempts.push_back(std::move(c));
+        }
         void on_request(const llmbridge::RequestRecord& r) noexcept override
         {
             std::lock_guard<std::mutex> lk(_mu);
@@ -6640,15 +6655,27 @@ namespace
             std::string venue_req_id;
             std::string served_latency, served_speed, served_geo, prior_model, asked_cache_ttl;
         };
+        struct AttemptCopy
+        {
+            llmbridge::AttemptRecord r;
+            std::string model, served_model, venue_req_id, prior_model;
+            std::string served_speed, served_geo, served_latency, asked_cache_ttl;
+        };
         std::vector<Copy> records()
         {
             std::lock_guard<std::mutex> lk(_mu);
             return _records;
         }
+        std::vector<AttemptCopy> attempts()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _attempts;
+        }
 
       private:
         std::mutex _mu; // records() is read from the test thread after shutdown
         std::vector<Copy> _records;
+        std::vector<AttemptCopy> _attempts;
     };
 } // namespace
 
@@ -6723,6 +6750,16 @@ TEST_P(ProxyRoute, TheSinkSeesACompletedRequestWithItsCapturedHeaders)
     EXPECT_EQ(r.backend, GetParam() == llmbridge::IoBackend::Uring ? 2 : 1);
     EXPECT_EQ(recs[0].cap[0], "run-42");
     EXPECT_EQ(recs[0].cap[1], "extract");
+    const auto attempts = sink.attempts();
+    ASSERT_EQ(attempts.size(), 1u);
+    EXPECT_EQ(attempts[0].r.request_seq, r.seq);
+    EXPECT_EQ(attempts[0].r.wall_t0_ns, r.wall_t0_ns);
+    EXPECT_EQ(attempts[0].r.attempt, 0u);
+    EXPECT_EQ(attempts[0].r.status, 200);
+    EXPECT_EQ(attempts[0].r.outcome, llmbridge::AttemptOutcome::Response);
+    EXPECT_TRUE(attempts[0].r.upstream_sent);
+    EXPECT_TRUE(attempts[0].r.response_received);
+    EXPECT_FALSE(attempts[0].r.retrying);
 }
 
 // The reply the gateway itself generates is a completion too: a tape that only
@@ -6785,7 +6822,73 @@ TEST_P(ProxyRoute, TheSinkRecordsTheServingVenueAfterFailover)
     EXPECT_EQ(recs[0].r.upstream_index, 1) << "the record blames the dead venue";
     EXPECT_EQ(recs[0].r.attempts, 1);
     EXPECT_EQ(recs[0].r.tag, TaggingPolicy::kTagBase + 0);
+    const auto attempts = sink.attempts();
+    ASSERT_EQ(attempts.size(), 2U);
+    EXPECT_EQ(attempts[0].r.attempt, 0U);
+    EXPECT_EQ(attempts[0].r.upstream_index, 0);
+    EXPECT_EQ(attempts[0].r.outcome, llmbridge::AttemptOutcome::TransportError);
+    EXPECT_TRUE(attempts[0].r.retrying);
+    EXPECT_EQ(attempts[1].r.attempt, 1U);
+    EXPECT_EQ(attempts[1].r.upstream_index, 1);
+    EXPECT_EQ(attempts[1].r.status, 200);
+    EXPECT_EQ(attempts[1].r.outcome, llmbridge::AttemptOutcome::Response);
+    EXPECT_FALSE(attempts[1].r.retrying);
+    EXPECT_EQ(attempts[0].r.request_seq, attempts[1].r.request_seq);
+    EXPECT_EQ(attempts[0].r.wall_t0_ns, attempts[1].r.wall_t0_ns);
     good.stop();
+}
+
+// 一个完整 5xx 可能已经产生 Provider 费用。即使策略随后切换成功，也必须保留
+// 失败响应自己的状态和用量，不能只留下最终成功腿。
+TEST_P(ProxyRoute, TheSinkKeepsUsageFromARetryableProviderResponse)
+{
+    TestBackend busy;
+    const std::string body =
+        R"({"error":{"type":"overloaded"},"usage":{"prompt_tokens":11,"completion_tokens":7}})";
+    busy.set_response("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                      "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body);
+    busy.start();
+    NamedBackend good;
+    good.start("bravo");
+    RecordingSink sink;
+    class StatusRetryPolicy final : public llmbridge::Policy
+    {
+      public:
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = 0, .tag = 93};
+        }
+        llmbridge::Retry on_status_retry(const llmbridge::FailureFacts&) noexcept override
+        {
+            return {.retry = true, .upstream_index = 1};
+        }
+    } pol;
+    start({{"127.0.0.1", busy.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+    busy.stop();
+    good.stop();
+
+    const auto attempts = sink.attempts();
+    ASSERT_EQ(attempts.size(), 2u);
+    EXPECT_EQ(attempts[0].r.attempt, 0u);
+    EXPECT_EQ(attempts[0].r.upstream_index, 0);
+    EXPECT_EQ(attempts[0].r.status, 503);
+    EXPECT_EQ(attempts[0].r.outcome, llmbridge::AttemptOutcome::Response);
+    EXPECT_TRUE(attempts[0].r.response_received);
+    EXPECT_TRUE(attempts[0].r.retrying);
+    EXPECT_EQ(attempts[0].r.tokens_in, 11);
+    EXPECT_EQ(attempts[0].r.tokens_out, 7);
+    EXPECT_EQ(attempts[1].r.attempt, 1u);
+    EXPECT_EQ(attempts[1].r.upstream_index, 1);
+    EXPECT_EQ(attempts[1].r.status, 200);
+    EXPECT_FALSE(attempts[1].r.retrying);
 }
 
 // The arrival stamp is re-armed per request. Without that, the second request on a
@@ -14147,6 +14250,16 @@ TEST_P(ProxyBodyStream, AStaleRetryOfAStreamedBodyStampsTheFreshAttempt)
     EXPECT_GE(r.ts_body_end - r.ts_up_sent, 100'000'000);
     EXPECT_GE(r.ts_body_sent, r.ts_body_end);
     EXPECT_LE(r.ts_body_sent, r.ts_up_recvd);
+    const auto attempts = sink.attempts();
+    ASSERT_EQ(attempts.size(), 3u) << "首个请求一次，第二个请求包含陈旧连接与新连接两次";
+    EXPECT_EQ(attempts[1].r.attempt, 0u);
+    EXPECT_EQ(attempts[1].r.outcome, llmbridge::AttemptOutcome::TransportError);
+    EXPECT_TRUE(attempts[1].r.retrying);
+    EXPECT_EQ(attempts[2].r.attempt, 1u);
+    EXPECT_EQ(attempts[2].r.outcome, llmbridge::AttemptOutcome::Response);
+    EXPECT_FALSE(attempts[2].r.retrying);
+    EXPECT_EQ(attempts[1].r.upstream_index, attempts[2].r.upstream_index);
+    EXPECT_EQ(attempts[1].r.request_seq, attempts[2].r.request_seq);
 }
 
 // An upload runs from the head's first byte to the body's last, and no further: a
@@ -15607,6 +15720,15 @@ TEST_P(ProxyHeadDecide, ARedoIsTimedAsAFreshAttempt)
     EXPECT_GE(r.ts_up_sent, r.ts_req_built);
     EXPECT_GE(r.ts_up_recvd, r.ts_up_sent);
     EXPECT_LT(req_path_of(r), kUploadNs / 10);
+    const auto attempts = sink.attempts();
+    ASSERT_EQ(attempts.size(), 2u);
+    EXPECT_EQ(attempts[0].r.attempt, 0u);
+    EXPECT_EQ(attempts[0].r.outcome, llmbridge::AttemptOutcome::PolicyCut);
+    EXPECT_TRUE(attempts[0].r.retrying);
+    EXPECT_TRUE(attempts[0].r.upstream_sent);
+    EXPECT_EQ(attempts[1].r.attempt, 1u);
+    EXPECT_EQ(attempts[1].r.outcome, llmbridge::AttemptOutcome::Response);
+    EXPECT_FALSE(attempts[1].r.retrying);
     ASSERT_EQ(pol.confirms().size(), 1u);
     EXPECT_GE(pol.confirms()[0].at, r.ts_req_recvd);
     EXPECT_LE(pol.confirms()[0].at, r.ts_req_built);

@@ -247,8 +247,11 @@ namespace llmbridge::detail
             error_respond(client, 503, local_connect_why(err));
             return true;
         }
+        sink_emit_attempt(client, 0, AttemptOutcome::TransportError,
+                          /*response_received=*/false, /*retrying=*/true);
+        sink_next_attempt(client);
         client->req.f.upstream_ip = uf->up_addr.sin_addr.s_addr;
-        client->req.f.ts_up_sent = client->req.f.ts_body_sent = 0; // this attempt's own send
+        client->req.f.ts_req_built = client->req.f.ts_progress = now_ns();
         // Plaintext, re-pushed through the new session; a send still reading it gets a copy.
         if (!client->req.f.body_parts) uf->out.stage() = u->out.take();
         _upconns->add(uf);
@@ -354,9 +357,13 @@ namespace llmbridge::detail
         note_served_model(client, r.body, /*streamed=*/false);
         note_reply(client, h.status, /*streamed=*/false);
         // 仅完整错误响应可替换；半截响应可能对应已执行的请求，不允许重放。
-        if ((h.status == 408 || h.status == 429 || (h.status >= 500 && h.status < 600)) &&
-            upstream_failed(client, h.status, "upstream retryable status", true))
-            return;
+        if (h.status == 408 || h.status == 429 || (h.status >= 500 && h.status < 600))
+        {
+            client->req.f.tok = scan_usage(r.body);
+            if (client->req.f.responses_api)
+                provider::openai::count_search_calls(r.body, false, client->req.f.tok);
+            if (upstream_failed(client, h.status, "upstream retryable status", true)) return;
+        }
         on_response(u, h, r.body, r.total_len);
     }
 
@@ -380,6 +387,8 @@ namespace llmbridge::detail
         {
             if (!xlate_resp(client->req.f.effective_dialect, body, client->xlate_scratch, client->req.f.tok))
             {
+                sink_emit_attempt(client, h.status, AttemptOutcome::Response,
+                                  /*response_received=*/true, /*retrying=*/false);
                 unpair(u);
                 u->rbuf.erase(0, total_len); // framing was valid; the connection is reusable
                 release_upstream(u, h.keep_alive, true);
@@ -405,6 +414,10 @@ namespace llmbridge::detail
             client->req.f.tok = scan_usage(body); // a byte-forward reports its counts too
             if (client->req.f.responses_api) provider::openai::count_search_calls(body, false, client->req.f.tok);
         }
+        // 上游尝试在完整响应解析后即已结束；不能等到下游刷新完毕，否则客户端此时
+        // 断开会把已经完成且可能已计费的上游调用误记为 ClientAbandoned。
+        sink_emit_attempt(client, h.status, AttemptOutcome::Response,
+                          /*response_received=*/true, /*retrying=*/false);
         client->req.f.phase = Phase::Replying;
         unpair(u);
         // Anything past the message is a second response, and keeps it out of the pool.
@@ -417,6 +430,10 @@ namespace llmbridge::detail
                                  bool response_received) noexcept
     {
         const Retry r = failover_target(client, status, why, response_received);
+        sink_emit_attempt(client, status,
+                          response_received ? AttemptOutcome::Response
+                                            : AttemptOutcome::TransportError,
+                          response_received, r.retry);
         if (!r.retry) return false;
 
         LB_WARN(ReqId{client->req.f.req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),
@@ -427,6 +444,7 @@ namespace llmbridge::detail
             if (f.body_streaming) reset_venue(u); // it holds part of a body it will not finish
             _ops->close(*u);
         }
+        sink_next_attempt(client);
         ++f.failover_attempts;
         client->upstream_slot = r.upstream_index;
         ++_stats.upstream_failovers;
