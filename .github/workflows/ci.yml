@@ -34,6 +34,15 @@ jobs:
       - name: Check every documented path exists
         run: python3 scripts/check_docs_data.py
 
+  deploy-smoke:
+    name: deploy · Docker Compose failover
+    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image and verify TLS failover
+        run: deploy/smoke_test.sh
+
   # Pinned compiler versions, not bare `gcc`/`clang`. DESIGN.md and the README state a
   # GCC 13+ / Clang 16+ floor; testing whatever the runner image happens to ship proves
   # only that one version works, and silently drifts as the image updates. These are the

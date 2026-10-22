@@ -135,9 +135,10 @@ TEST(AuditLedger, RefusesACompleteRecordWhoseChecksumDoesNotMatch)
     const std::string path = temporary_path();
     const int fd = ::open(path.c_str(), O_WRONLY | O_TRUNC);
     ASSERT_GE(fd, 0);
-    constexpr std::string_view corrupt = R"({"crc32":"00000000"}
+    constexpr std::string_view kCorrupt = R"({"crc32":"00000000"}
 )";
-    ASSERT_EQ(::write(fd, corrupt.data(), corrupt.size()), static_cast<ssize_t>(corrupt.size()));
+    ASSERT_EQ(::write(fd, kCorrupt.data(), kCorrupt.size()),
+              static_cast<ssize_t>(kCorrupt.size()));
     ::close(fd);
     const auto table = prices();
     EXPECT_THROW((llmbridge::app::AuditLedger(path, table, {"provider-a"}, {})),

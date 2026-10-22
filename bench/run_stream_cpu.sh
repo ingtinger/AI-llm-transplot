@@ -23,12 +23,21 @@
 #           inside the provider's capacity, isolating connection scaling
 #
 #   ./bench/run_stream_cpu.sh [duration] [warmup]
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DUR="${1:-20}"
 WARMUP="${2:-5}"
-BIN=build-linux/bin
+BIN="${BIN:-build-linux/bin}"
+if [ ! -x "$BIN/llmbridge" ]; then
+  for candidate in build/bin cmake-build-release/bin; do
+    if [ -x "$candidate/llmbridge" ]; then BIN="$candidate"; break; fi
+  done
+fi
+[ -x "$BIN/llmbridge" ] && [ -x "$BIN/faststream" ] && [ -x "$BIN/streamgen" ] || {
+  echo "缺少基准二进制；请先构建或设置 BIN" >&2
+  exit 1
+}
 RESDIR=bench/results
 mkdir -p "$RESDIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -42,6 +51,7 @@ trap cleanup EXIT
 ticks_per_s=$(getconf CLK_TCK)
 # process-wide CPU (all threads) in clock ticks: utime+stime from /proc/PID/stat
 cpu_ticks(){ awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
+peak_rss_kb(){ awk '$1 == "VmHWM:" {print $2}' "/proc/$1/status" 2>/dev/null || echo 0; }
 
 # This reference box is a mobile i7-9750H that reaches TjMax under sustained load and
 # throttles. That is not a transient to wait out; it cannot be held cool while
@@ -51,7 +61,7 @@ pkg_temp_c(){ local t; t=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null
 throttles(){ cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null || echo 0; }
 max_mhz(){ awk '/cpu MHz/{if($4>m)m=$4} END{printf "%.0f", m}' /proc/cpuinfo; }
 
-echo "backend,streams,tok_per_stream,offered_tok_s,delivered_tok_s,delivery_pct,p50_us,p99_us,cpu_s,cpu_us_per_tok,cpu_s_per_Mtok,temp_c,throttle_delta,max_mhz" > "$CSV"
+echo "backend,streams,tok_per_stream,offered_tok_s,delivered_tok_s,delivery_pct,p50_us,p99_us,completed,failures,cpu_s,cpu_us_per_tok,peak_rss_kb,temp_c,throttle_delta,max_mhz" > "$CSV"
 
 start_all(){
   local interval_us="$1"
@@ -80,25 +90,33 @@ measure(){
   [ -n "$pid" ] && c1=$(cpu_ticks "$pid")
   th1=$(throttles); tc=$(pkg_temp_c); mhz=$(max_mhz)
 
-  local rate p50 p99 chunks
+  local rate p50 p99 chunks completed failures rss
   rate=$(sed -n 's/.*chunk_rate=\([0-9]*\)\/s.*/\1/p' <<<"$out"); rate=${rate:-0}
   p50=$(sed -n 's/.*p50=\([0-9]*\).*/\1/p' <<<"$out" | head -1); p50=${p50:-0}
   p99=$(sed -n 's/.* p99=\([0-9]*\).*/\1/p' <<<"$out" | head -1); p99=${p99:-0}
   chunks=$(sed -n 's/.*chunks=\([0-9]*\).*/\1/p' <<<"$out" | head -1); chunks=${chunks:-0}
+  completed=$(sed -n 's/.*completed_streams=\([0-9]*\).*/\1/p' <<<"$out" | head -1); completed=${completed:-0}
+  failures=$(sed -n 's/.*failures=\([0-9]*\).*/\1/p' <<<"$out" | head -1); failures=${failures:-0}
+  rss=0; [ -n "$pid" ] && rss=$(peak_rss_kb "$pid")
   grep -qi overflow <<<"$out" && p99="OVERFLOW"
+  if [ "$chunks" = 0 ] || [ "$completed" = 0 ] || [ "$failures" != 0 ]; then
+    echo "流式基准没有有效样本或出现失败：$lbl streams=$streams completed=$completed failures=$failures" >&2
+    return 1
+  fi
 
   local offered=$((streams * tps))
   awk -v lbl="$lbl" -v s="$streams" -v tps="$tps" -v off="$offered" -v r="$rate" \
       -v p50="$p50" -v p99="$p99" -v dt="$((c1-c0))" -v tk="$ticks_per_s" \
       -v ch="$chunks" -v w="$((w1-w0))" -v csv="$CSV" \
+      -v done="$completed" -v fail="$failures" -v rss="$rss" \
       -v tc="$tc" -v thd="$((th1-th0))" -v mhz="$mhz" '
   BEGIN{
     cpu = (tk>0 ? dt/tk : 0);
     pct = (off>0 ? 100.0*r/off : 0);
     upt = (ch>0 ? cpu*1e6/ch : 0);
-    printf "  %-8s streams=%-5s offered=%-7s delivered=%-7s (%5.1f%%)  p50=%-6s p99=%-8s cpu=%5.2fs  %5.2f us/tok  [%sC %sMHz thr+%s]\n",
-           lbl, s, off, r, pct, p50, p99, cpu, upt, tc, mhz, thd;
-    printf "%s,%s,%s,%s,%s,%.1f,%s,%s,%.2f,%.3f,%.1f,%s,%s,%s\n", lbl,s,tps,off,r,pct,p50,p99,cpu,upt,upt,tc,thd,mhz >> csv;
+    printf "  %-8s streams=%-5s offered=%-7s delivered=%-7s (%5.1f%%)  p50=%-6s p99=%-8s completed=%s failures=%s cpu=%5.2fs rss=%sKiB\n",
+           lbl, s, off, r, pct, p50, p99, done, fail, cpu, rss;
+    printf "%s,%s,%s,%s,%s,%.1f,%s,%s,%s,%s,%.2f,%.3f,%s,%s,%s,%s\n", lbl,s,tps,off,r,pct,p50,p99,done,fail,cpu,upt,rss,tc,thd,mhz >> csv;
   }'
 }
 
@@ -120,15 +138,27 @@ phase(){
 }
 
 echo "llmbridge streaming CPU-efficiency + saturation, $STAMP"
-echo "host: $(uname -r), idle states: $(paste -d/ <(cat /sys/devices/system/cpu/cpu0/cpuidle/state*/name | tr '\n' ' ') <(cat /sys/devices/system/cpu/cpu0/cpuidle/state*/disable | tr '\n' ' '))"
+idle_states=unavailable
+if compgen -G '/sys/devices/system/cpu/cpu0/cpuidle/state*/name' >/dev/null; then
+  idle_states=$(paste -d/ \
+    <(cat /sys/devices/system/cpu/cpu0/cpuidle/state*/name | tr '\n' ' ') \
+    <(cat /sys/devices/system/cpu/cpu0/cpuidle/state*/disable | tr '\n' ' '))
+fi
+echo "host: $(uname -r), idle states: $idle_states"
 echo "NOTE: cpu is process-wide utime+stime over the whole run (incl. warmup), divided by"
 echo "      total chunks; identical treatment for both backends, so the RATIO is the result."
 
-phase "PHASE 1: tokens/s scaling (stream count and token rate rise together)" \
-      20000 50 64 256 512 1024 2048 2560 3072 3584 4096
+if [ "${RUN_PHASE1:-1}" = 1 ]; then
+  read -r -a phase1_levels <<< "${PHASE1_LEVELS:-64 256 512 1024 2048 2560 3072 3584 4096}"
+  phase "PHASE 1: tokens/s scaling (stream count and token rate rise together)" \
+        20000 50 "${phase1_levels[@]}"
+fi
 
-phase "PHASE 2: connection scaling (token rate kept inside provider capacity)" \
-      100000 10 1024 2048 4096 6144 8192
+if [ "${RUN_PHASE2:-1}" = 1 ]; then
+  read -r -a phase2_levels <<< "${PHASE2_LEVELS:-1024 2048 4096 6144 8192}"
+  phase "PHASE 2: connection scaling (token rate kept inside provider capacity)" \
+        100000 10 "${phase2_levels[@]}"
+fi
 
 echo
 echo "CSV: $CSV"

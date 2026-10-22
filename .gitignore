@@ -32,6 +32,7 @@ bench/.litellm-venv-current/
 bench/results/*.log
 bench/results/*.txt
 bench/results/*.yaml
+bench/results/stream-cpu-*.csv
 
 # Python bytecode
 __pycache__/

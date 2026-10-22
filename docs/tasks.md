@@ -139,10 +139,10 @@ ctest --test-dir build-wsl -R '^AppStatusRetry$' \
 **可靠性补充验收（2026-10-20）：**独立 Debug ASan/UBSan 构建及选定测试 **48/48 通过**；WSL2 下以 `setarch x86_64 -R` 运行 TSan，路由策略 **21/21** 和真实进程热加载 **1/1** 通过，未报告数据竞争。普通启动 TSan 会因 WSL 内存映射布局在测试前失败，原生 Linux/CI 仍需复测。sanitizer 结果仅覆盖选定路径，不是全量消毒器验收；Fuzz、部署与性能任务保持未完成。
 
 - [ ] 提供可复现的 Dockerfile、Compose 和 systemd 示例；明确 TLS 终止、管理端点绑定、日志轮转、密钥注入和优雅停止方式。已提交本机双 Mock TLS Compose、Dockerfile、systemd 单元及操作文档；当前环境无 Docker，尚未完成容器实际启动验收。
-- [ ] 增加 AddressSanitizer、ThreadSanitizer 验证；针对网络解析和配置输入考虑 Fuzz 测试。
-- [ ] 建立固定硬件/编译参数/Mock 行为的吞吐、P50/P99、SSE 并发与故障注入基准；同时报告失败率和资源占用，不只报告最高 QPS。已修复本地 Mock 基准的启动模式，主延迟摘要现含完成数和错误数；短时低负载冒烟通过，尚缺资源占用与正式测量。
-- [ ] 整理架构图、配置示例、演示脚本及“一个上游失效后请求转移”的可复现录像/操作步骤。
-- [ ] 在 README 中写清楚上游项目贡献与本分支新增内容，保留 Apache-2.0 的 `LICENSE`、`NOTICE` 和归属信息。
+- [x] 增加 AddressSanitizer、ThreadSanitizer 验证；针对网络解析和配置输入考虑 Fuzz 测试。CI 全量运行 TLS ASan/UBSan、TSan，并对九类外部输入执行带种子的 Clang/libFuzzer；本机还完成关键路由、热加载、安全用户和账本路径的定向验证。
+- [x] 建立固定硬件/编译参数/Mock 行为的吞吐、P50/P99、SSE 并发与故障注入基准；同时报告失败率和资源占用，不只报告最高 QPS。当前分支的命令、CPU、峰值 RSS、完成/错误数、容量拐点及 Mock 饱和边界记录在 `docs/performance-2026-10-22.md`。
+- [x] 整理架构图、配置示例、演示脚本及“一个上游失效后请求转移”的可复现录像/操作步骤。`docs/architecture.md` 记录线程、所有权和重试边界；`deploy/smoke_test.sh` 自动完成 TLS 双 Mock 故障切换，手工步骤保留在部署文档。
+- [x] 在 README 中写清楚上游项目贡献与本分支新增内容，保留 Apache-2.0 的 `LICENSE`、`NOTICE` 和归属信息。
 
 **验收：**新机器按中文 README 能构建、运行测试、启动两个 Mock 上游并重现故障切换；性能数字有测试命令和环境，不能引用上游基准冒充本分支实测。
 

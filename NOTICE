@@ -17,7 +17,9 @@ artifact and impose no obligations on downstream consumers.
 AI-llm-transplot modifications
 Copyright 2026 AI-llm-transplot contributors.
 
-The AI-llm-transplot branch adds built-in multi-upstream routing, failover,
-circuit cooldown, conversation affinity, per-upstream model mapping,
-Chinese documentation, and related tests.
+The AI-llm-transplot branch adds built-in multi-upstream routing and failover,
+model pools, circuit cooldown, conversation affinity, virtual-key user isolation,
+single-process quotas, observability, hot upstream drain, versioned per-attempt
+accounting, a crash-conservative audit ledger, Chinese documentation, deployment
+examples, and related tests.
 

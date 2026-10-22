@@ -15,6 +15,7 @@
 - 每个上游独立的模型名称映射。
 - 安全模式下的虚拟网关 Key、用户模型/上游权限、服务端 Provider Key 注入。
 - 单机每用户请求速率、并发和基于上游报告用量的 UTC 日/月 Token 配额。
+- 可选的版本化价目表与单写者审计账本：逐尝试记录、CRC 校验、正常重启额度重放和异常退出保守关闭。
 - 原版 `X-Kottos-Key-*` 客户端传密钥方式只在显式 `security.legacy_mode=true` 或 `--legacy-mode` 时启用，不适合公网多用户部署。
 - 多工作线程共享同一套路由健康状态。
 - `SIGHUP` 热更新上游摘除列表；在途请求继续使用旧连接和不可变配置。
@@ -70,6 +71,7 @@ ctest --test-dir build --output-on-failure
     "enabled": true,
     "users": [{
       "id": "alice", "tenant": "team-a", "key_env": "GATEWAY_ALICE_KEY",
+      "key_version": "alice-v1",
       "models": ["chat-default"], "upstreams": [0, 1],
       "requests_per_minute": 60, "max_concurrent": 4,
       "daily_tokens": 100000, "monthly_tokens": 1000000
@@ -122,7 +124,7 @@ curl --cacert /path/to/ca.pem https://127.0.0.1:8088/v1/chat/completions \
 
 默认不启动无认证服务：必须配置 `security.enabled=true`，或仅做本地兼容测试时显式启用 `security.legacy_mode=true` / `--legacy-mode`；两者不能同时开启。安全模式还默认要求数据端口启用 TLS，并拒绝非回环地址的明文上游。仅隔离的本地 Mock 测试可显式设置 `security.allow_insecure_http=true`；此开关仍会监听所有网卡，**不能用于公网部署**。虚拟 Key 至少 16 个可打印 ASCII 字符。创建时生成随机 Key 并通过环境变量注入；撤销可把用户设为 `disabled: true`，轮换可更换对应环境变量值，均需重启进程。`expires_unix_s` 可设置 UTC Unix 秒时间戳。不要把真实 Key 写入 JSON、仓库或日志。
 
-速率为固定 60 秒窗口，超限立即拒绝、不排队。当前认证在完整请求体到达后执行，因此限额不能约束尚在上传请求体的未认证连接；公网部署还需要前置连接/上传限额。Token 配额按上游返回的输入/输出用量在响应完成时累计；已发往上游但没有完整用量的请求会使有配额用户在本 UTC 日/月剩余时间拒绝。重试只结算最终记录，无法可靠还原前次尝试的账单；单个在途请求可能越过额度。所有计数仅在当前进程内，重启清零，多实例不共享，**不可用于精确扣费**。
+速率为固定 60 秒窗口，超限立即拒绝、不排队。当前认证在完整请求体到达后执行，因此限额不能约束尚在上传请求体的未认证连接；公网部署还需要前置连接/上传限额。Token 配额按每次上游尝试报告的用量在响应完成时累计；已发往上游但没有完整用量的尝试会使有配额用户在本 UTC 日/月剩余时间拒绝。配置版本化价目表和 `accounting.ledger_path` 后，专用线程持久化带 CRC 的逐尝试记录，正常重启会重放当前周期额度；异常退出则把相关周期保守恢复为 unknown。未启用账本时重启仍会清零。额度在响应后结算，单个在途请求可能越额，多个实例不共享，CRC 也不防恶意篡改，因此这仍不是多实例精确扣费系统。完整配置与恢复边界见[用量与审计边界](docs/accounting.md)。
 
 兼容模式也仍监听所有网卡；即使只用于本地开发，也必须通过防火墙或隔离网络限制访问。
 
@@ -154,10 +156,10 @@ curl http://127.0.0.1:9091/metrics
 
 目前仍需要继续实现：
 
-- 持久化/跨实例共享额度、运行时密钥轮换与可靠账单。
-- 按 Provider/模型价格核算费用、处理重试中先前尝试的费用。
-- 跨 Provider 的请求幂等与每次尝试的可靠计费；显式开启不安全重放后仍可能重复执行。
+- 跨实例共享额度、严格预授权和运行时密钥轮换。
+- 可与 Provider 正式账单自动对账、具备防篡改认证的中心化账务。
+- 跨 Provider 的请求幂等；显式开启不安全重放后仍可能重复执行和计费。
 - Redis 共享的多实例限流、会话粘性和健康状态。
-- 完整配置热替换、持久化审计日志和经过容器实测的生产部署方案；当前仅上游摘除列表可热加载，仓库提供本机部署示例。
+- 完整配置热替换和经过具体生产网络、证书与容量验证的部署方案；当前仅上游摘除列表可热加载。
 
-第一次阅读代码可从 [开发者导读](docs/development.md) 开始；详细设计见 [docs/design.md](docs/design.md)，测试方法见 [可靠性验证](docs/reliability.md)，本机双 Mock 与 systemd 示例见 [部署说明](docs/deployment.md)，任务进度见 [docs/tasks.md](docs/tasks.md)。上游原始设计资料仍保留在 `DESIGN.md`、`GATEWAY-INTERNALS.md` 和 `LATENCY.md` 中。
+第一次阅读代码可从 [开发者导读](docs/development.md) 开始；整体关系见[架构与请求路径](docs/architecture.md)，详细设计见 [docs/design.md](docs/design.md)，测试方法见 [可靠性验证](docs/reliability.md)，本机双 Mock 与 systemd 示例见 [部署说明](docs/deployment.md)，任务进度见 [docs/tasks.md](docs/tasks.md)。上游原始设计资料仍保留在 `DESIGN.md`、`GATEWAY-INTERNALS.md` 和 `LATENCY.md` 中。

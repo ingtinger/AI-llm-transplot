@@ -2,6 +2,14 @@
 
 > AI-llm-transplot 分支的中文说明、配置方法与开发路线见 [README.zh-CN.md](README.zh-CN.md)。
 
+> **Branch attribution.** Kottos AI's upstream `llmbridge` supplies the C++20
+> HTTP/SSE proxy, protocol translators, epoll/io_uring transports, TLS, tests and
+> original English documentation. AI-llm-transplot adds multi-upstream routing and
+> failover, per-model pools, virtual-key user isolation, quotas, observability,
+> hot drain/reload, versioned per-attempt accounting, a crash-conservative audit
+> ledger, Chinese documentation and deployment examples. See
+> [NOTICE](NOTICE) and the [branch architecture](docs/architecture.md).
+
 > A sub-millisecond, drop-in OpenAI-compatible **LLM gateway** in C++. Microsecond translation overhead, dependency-free default build (TLS uses OpenSSL), p99 < 1 ms at 1,000 RPS.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)

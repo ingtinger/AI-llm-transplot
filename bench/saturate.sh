@@ -75,6 +75,9 @@ done
 extract() { sed -n 's/.*achieved=\([0-9]*\) .*p50_us=\([0-9]*\) p99_us=\([0-9]*\) p999_us=\([0-9]*\) max_us=\([0-9]*\).*/\1 \2 \3 \4 \5/p'; }
 extract_counts() { sed -n 's/.*completed=\([0-9]*\) errors=\([0-9]*\) .*/\1 \2/p'; }
 backlog_of() { sed -n 's/.*max_backlog=\([0-9]*\).*/\1/p' "$1" | tail -1; }
+cpu_ticks() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
+peak_rss_kb() { awk '$1 == "VmHWM:" {print $2}' "/proc/$1/status" 2>/dev/null || echo 0; }
+ticks_per_s=$(getconf CLK_TCK)
 
 {
   echo "llmbridge single-thread saturation, $STAMP  (instant C++ backend, ${DUR}s/level, ${WARMUP}s warmup, body=${BODY}B, io=${IO}, workers=${WORKERS}, backends=${BACKENDS})"
@@ -99,8 +102,11 @@ for RPS in "${RPS_LIST[@]}"; do
     echo "网关启动失败或端口 $PROXY_PORT 已占用" >&2
     exit 1
   fi
+  proxy_cpu_start=$(cpu_ticks "$PP")
   PLOG="$RESDIR/sat-loadgen-$RPS-$STAMP.log"
   P=$($BIN/loadgen --target 127.0.0.1:$PROXY_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --conns "$CONNS" --body-bytes "$BODY" 2>"$PLOG")
+  proxy_cpu_end=$(cpu_ticks "$PP")
+  proxy_rss=$(peak_rss_kb "$PP")
   read -r pa p_p50 p_p99 p_p999 p_max <<< "$(echo "$P" | extract)"
   read -r p_completed p_errors <<< "$(echo "$P" | extract_counts)"
   bl=$(backlog_of "$PLOG")
@@ -123,5 +129,8 @@ for RPS in "${RPS_LIST[@]}"; do
     "$bl" | tee -a "$OUT"
   printf "          completed/errors: direct=%s/%s proxy=%s/%s\n" \
     "$d_completed" "$d_errors" "$p_completed" "$p_errors" | tee -a "$OUT"
+  awk -v ticks="$((proxy_cpu_end-proxy_cpu_start))" -v hz="$ticks_per_s" \
+      -v rss="$proxy_rss" 'BEGIN {printf "          gateway resources: cpu=%.2fs peak_rss=%sKiB\n", ticks/hz, rss}' \
+      | tee -a "$OUT"
 done
 echo "Logs in $RESDIR/ (stamp $STAMP)" | tee -a "$OUT"

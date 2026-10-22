@@ -36,12 +36,12 @@ namespace llmbridge::app
 
         bool valid_line(std::string_view line) noexcept
         {
-            constexpr std::string_view marker = ",\"crc32\":\"";
-            const size_t at = line.rfind(marker);
-            if (at == std::string_view::npos || line.size() - at != marker.size() + 10 ||
+            constexpr std::string_view kMarker = ",\"crc32\":\"";
+            const size_t at = line.rfind(kMarker);
+            if (at == std::string_view::npos || line.size() - at != kMarker.size() + 10 ||
                 !line.ends_with("\"}")) return false;
             uint32_t expected = 0;
-            const char* first = line.data() + at + marker.size();
+            const char* first = line.data() + at + kMarker.size();
             const auto [end, ec] = std::from_chars(first, first + 8, expected, 16);
             if (ec != std::errc{} || end != first + 8) return false;
             std::string original(line.substr(0, at));
@@ -165,15 +165,15 @@ namespace llmbridge::app
 
         uint32_t saturating_add(uint32_t current, uint32_t add) noexcept
         {
-            constexpr uint32_t maximum = (uint32_t{1} << 31) - 1;
-            return static_cast<uint32_t>(std::min<uint64_t>(maximum,
+            constexpr uint32_t kMaximum = (uint32_t{1} << 31) - 1;
+            return static_cast<uint32_t>(std::min<uint64_t>(kMaximum,
                                                             uint64_t{current} + add));
         }
 
         void json_string(std::string& out, std::string_view value)
         {
             out.push_back('"');
-            constexpr char hex[] = "0123456789abcdef";
+            constexpr char kHex[] = "0123456789abcdef";
             for (const unsigned char ch : value)
             {
                 if (ch == '"' || ch == '\\')
@@ -185,8 +185,8 @@ namespace llmbridge::app
                 else
                 {
                     out += "\\u00";
-                    out.push_back(hex[ch >> 4]);
-                    out.push_back(hex[ch & 15]);
+                    out.push_back(kHex[ch >> 4]);
+                    out.push_back(kHex[ch & 15]);
                 }
             }
             out.push_back('"');
@@ -275,12 +275,12 @@ namespace llmbridge::app
             else if (n < 0 && errno == EINTR) continue;
             else throw std::runtime_error("cannot generate audit ledger instance id");
         }
-        constexpr char hex[] = "0123456789abcdef";
+        constexpr char kHex[] = "0123456789abcdef";
         instance_id_.resize(sizeof random * 2);
         for (size_t i = 0; i < sizeof random; ++i)
         {
-            instance_id_[i * 2] = hex[random[i] >> 4];
-            instance_id_[i * 2 + 1] = hex[random[i] & 15];
+            instance_id_[i * 2] = kHex[random[i] >> 4];
+            instance_id_[i * 2 + 1] = kHex[random[i] & 15];
         }
         fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (fd_ < 0) throw std::runtime_error("cannot open audit ledger: " + std::string(std::strerror(errno)));

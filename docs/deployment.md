@@ -27,6 +27,8 @@ chmod 600 certs/key.pem
 docker compose --env-file .env up --build -d
 ```
 
+也可以直接运行 `deploy/smoke_test.sh`：脚本生成一次性证书与演示环境文件，构建 Compose 镜像，验证 TLS 请求，停止主 Mock 并通过指标确认请求转移到备用上游，最后清理容器和临时凭据。CI 在 Ubuntu Docker runner 上执行同一脚本。
+
 首次启动时两个 Mock 可能在网关之后数秒内才就绪。用网关虚拟 Key 发请求，再停止主 Mock 验证备用上游：
 
 ```bash

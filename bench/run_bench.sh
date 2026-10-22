@@ -89,6 +89,9 @@ fi
 extract_us() { sed -n 's/.*p50_us=\([0-9]*\) p99_us=\([0-9]*\) p999_us=\([0-9]*\) max_us=\([0-9]*\).*/\1 \2 \3 \4/p'; }
 extract_counts() { sed -n 's/.*completed=\([0-9]*\) errors=\([0-9]*\) .*/\1 \2/p'; }
 ms() { awk -v u="$1" 'BEGIN{printf "%.3f", u/1000.0}'; }
+cpu_ticks() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
+peak_rss_kb() { awk '$1 == "VmHWM:" {print $2}' "/proc/$1/status" 2>/dev/null || echo 0; }
+ticks_per_s=$(getconf CLK_TCK)
 
 for RPS in "${RPS_LIST[@]}"; do
   echo ">>> RPS=$RPS" >&2
@@ -107,7 +110,10 @@ for RPS in "${RPS_LIST[@]}"; do
     echo "网关启动失败或端口 $PROXY_PORT 已占用" >&2
     exit 1
   fi
+  proxy_cpu_start=$(cpu_ticks "$PROXY_PID")
   PROXIED=$($BIN/loadgen --target 127.0.0.1:$PROXY_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" 2>>"$RESDIR/loadgen-proxy-$RPS-$STAMP.log")
+  proxy_cpu_end=$(cpu_ticks "$PROXY_PID")
+  proxy_rss=$(peak_rss_kb "$PROXY_PID")
   read -r p50 p99 p999 pmax <<< "$(echo "$PROXIED" | extract_us)"
   read -r p_completed p_errors <<< "$(echo "$PROXIED" | extract_counts)"
   if [ -z "$d50" ] || [ -z "$d99" ] || [ -z "$d999" ] || [ -z "$dmax" ] ||
@@ -140,6 +146,9 @@ for RPS in "${RPS_LIST[@]}"; do
     | tee -a "$SUMMARY"
   printf "        completed/errors: direct=%s/%s proxy=%s/%s\n" \
     "$d_completed" "$d_errors" "$p_completed" "$p_errors" | tee -a "$SUMMARY"
+  awk -v ticks="$((proxy_cpu_end-proxy_cpu_start))" -v hz="$ticks_per_s" \
+      -v rss="$proxy_rss" 'BEGIN {printf "        gateway resources: cpu=%.2fs peak_rss=%sKiB\n", ticks/hz, rss}' \
+      | tee -a "$SUMMARY"
 done
 
 echo | tee -a "$SUMMARY"

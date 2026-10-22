@@ -418,7 +418,7 @@ namespace llmbridge::app
                 std::string_view name;
                 int64_t PriceRates::*member;
             };
-            constexpr RateField fields[] = {
+            constexpr RateField kFields[] = {
                 {"input", &PriceRates::input},
                 {"output", &PriceRates::output},
                 {"cached_input", &PriceRates::cached_input},
@@ -441,7 +441,7 @@ namespace llmbridge::app
             {
                 if (is_comment(name)) continue;
                 const RateField* found = nullptr;
-                for (const RateField& field : fields)
+                for (const RateField& field : kFields)
                     if (field.name == name) found = &field;
                 if (!found)
                     return fail(err, "config: unknown accounting.prices.rates field");
