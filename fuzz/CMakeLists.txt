@@ -57,7 +57,9 @@ target_include_directories(fuzz_upstream PRIVATE ${PROJECT_SOURCE_DIR}/net/inclu
 
 # The `--config` file parser. options.cpp is compiled in, not linked from the app's
 # library, so libFuzzer sees its coverage.
-add_executable(fuzz_config fuzz_config.cpp ${PROJECT_SOURCE_DIR}/app/options.cpp)
+add_executable(fuzz_config fuzz_config.cpp
+    ${PROJECT_SOURCE_DIR}/app/options.cpp
+    ${PROJECT_SOURCE_DIR}/app/accounting.cpp)
 target_compile_options(fuzz_config PRIVATE -g -O1 -UNDEBUG -fsanitize=fuzzer,address,undefined)
 target_link_options(fuzz_config PRIVATE -fsanitize=fuzzer,address,undefined)
 target_include_directories(fuzz_config PRIVATE ${PROJECT_SOURCE_DIR}/app)
